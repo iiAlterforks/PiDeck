@@ -3927,7 +3927,7 @@ ${goalTextRef.current}
               >
                 <Sliders size={17} />
               </button>
-              <button
+              {/* <button
                 className="icon-button feedback-icon"
                 title={t("feedback.title")}
                 onClick={() => setFeedbackOpen(true)}
@@ -3940,7 +3940,7 @@ ${goalTextRef.current}
                 onClick={() => api.app.openExternal("https://ayuayue.github.io/PiDeck/")}
               >
                 <Globe size={17} />
-              </button>
+              </button> */}
             </div>
             <button
               className="icon-button sidebar-collapse-logo"
