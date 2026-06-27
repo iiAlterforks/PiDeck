@@ -3548,7 +3548,14 @@ ${goalTextRef.current}
       }
     >
       {!settings.useNativeTitleBar && (
-        <div className="window-drag-layer" aria-hidden="true" />
+        <div className="window-drag-layer">
+          <div className="app-badge">
+            <LogoMark />
+            <span className="brand-wordmark" aria-label="PiDeck">
+              PiDeck
+            </span>
+          </div>
+        </div>
       )}
       {!settings.useNativeTitleBar && (
         <div className="window-controls" aria-label={t("app.windowControls")}>
@@ -3603,14 +3610,18 @@ ${goalTextRef.current}
           if (listHoverRevealSuppressed) setListHoverRevealSuppressed(false);
         }}
       >
-        <div className="list-toolbar">
-          <div className="app-badge">
-            <LogoMark />
-            <span className="brand-wordmark" aria-label="PiDeck">
-              PiDeck
-            </span>
+        {/* 自定义标题栏模式下品牌已移至顶部 window-drag-layer，此处不再渲染 list-toolbar；
+            原生标题栏模式下仍需在左侧栏顶部展示品牌 */}
+        {settings.useNativeTitleBar && (
+          <div className="list-toolbar">
+            <div className="app-badge">
+              <LogoMark />
+              <span className="brand-wordmark" aria-label="PiDeck">
+                PiDeck
+              </span>
+            </div>
           </div>
-        </div>
+        )}
         <button
           className="collapse-button list-collapse"
           title={listCollapsed ? t("app.expandList") : t("app.collapseList")}

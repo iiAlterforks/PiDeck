@@ -789,17 +789,14 @@ export function BranchSelector(props: {
 	);
 }
 
+// 应用内品牌 logo 资源：与 build/icon.png 同源（npm run make-icon 生成），
+// 复制到 renderer assets 以便 Vite 处理。换图标只需重新 make-icon 并覆盖此文件。
+const appIconUrl = new URL("../../assets/app-icon.png", import.meta.url).href;
+
 export function LogoMark() {
 	return (
 		<div className="logo-mark" aria-label={t("app.logoLabel")}>
-			<svg viewBox="140 140 520 520" width="22" height="22" aria-hidden="true">
-				<path
-					fill="#fff"
-					fillRule="evenodd"
-					d="M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65Z"
-				/>
-				<path fill="#fff" d="M517.36 400H634.72V634.72H517.36Z" />
-			</svg>
+			<img src={appIconUrl} alt="" aria-hidden="true" />
 		</div>
 	);
 }
@@ -822,14 +819,7 @@ export function ProjectAvatar(props: { name: string; kind?: "chat" | "project" }
 export function AgentAvatar(props: { status: string }) {
 	return (
 		<div className={`conversation-avatar agent-avatar ${props.status}`}>
-			<svg viewBox="140 140 520 520" width="28" height="28" aria-hidden="true">
-				<path
-					fill="#fff"
-					fillRule="evenodd"
-					d="M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65Z"
-				/>
-				<path fill="#fff" d="M517.36 400H634.72V634.72H517.36Z" />
-			</svg>
+			<img src={appIconUrl} alt="" aria-hidden="true" />
 		</div>
 	);
 }
@@ -862,19 +852,7 @@ export function EmptyState(props: { hasProject: boolean; onCreate: () => void })
 	return (
 		<div className="empty-state">
 			<div className="empty-logo">
-				<svg
-					viewBox="140 140 520 520"
-					width="40"
-					height="40"
-					aria-hidden="true"
-				>
-					<path
-						fill="#fff"
-						fillRule="evenodd"
-						d="M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65Z"
-					/>
-					<path fill="#fff" d="M517.36 400H634.72V634.72H517.36Z" />
-				</svg>
+				<img src={appIconUrl} alt="" aria-hidden="true" />
 			</div>
 			<h2>{t("app.startAgent")}</h2>
 			<p>{t("app.emptyGuide")}</p>
