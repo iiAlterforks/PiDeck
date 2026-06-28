@@ -75,6 +75,7 @@ import { SkillManager } from "./skills/SkillManager";
 import { ExtensionManager } from "./extensions/ExtensionManager";
 import { WebServiceManager } from "./web/WebServiceManager";
 import { AppLogger } from "./logging/AppLogger";
+import { RpcLogger } from "./logging/RpcLogger";
 import {
 	detectExternalEditors,
 	listConfiguredExternalEditors,
@@ -117,6 +118,7 @@ let webServiceManager: WebServiceManager;
 let terminalManager: TerminalSessionManager;
 let petSystem: PetSystem | null = null;
 let appLogger: AppLogger;
+let rpcLogger: RpcLogger;
 let feishuBridge: FeishuBridge | null = null;
 
 const RELEASES_URL = "https://github.com/ayuayue/pi-desktop/releases";
@@ -850,7 +852,15 @@ function registerFeishuIpc() {
 	// 移除绑定
 	ipcMain.handle(ipcChannels.feishuBindingRemove, async (_event, chatId: string) => {
 		if (feishuBridge) {
-			return feishuBridge.removeBinding(chatId);
+			// 先查 binding 拿到 sessionId，移除后清理 session-bot 映射，
+			// 使 FeishuLinkIndicator 等 UI 同步更新断开状态。
+			const bindings = feishuBridge.listBindings();
+			const binding = bindings.find((b) => b.chatId === chatId);
+			const result = feishuBridge.removeBinding(chatId);
+			if (result && binding) {
+				setSessionBotId(binding.sessionId, undefined);
+			}
+			return result;
 		}
 		return false;
 	});
@@ -889,9 +899,17 @@ function registerFeishuIpc() {
 	});
 
 	// 设置 Agent 使用的飞书 Bot ID；非空表示用户手动连接当前会话，需要立即创建/复用飞书群绑定。
+	// 传入 null 时取消关联：仅移除绑定（不终止 Agent），同时清理配置映射。
 	ipcMain.handle(ipcChannels.feishuSessionBotSet, async (_event, agentId: string, botId: string | null) => {
 		setSessionBotId(agentId, botId ?? undefined);
-		if (!botId || !feishuBridge || feishuBridge.getStatus().status !== "connected") return;
+		if (!botId) {
+			// 取消当前会话的飞书关联：移除绑定但不停止 Agent 进程
+			if (feishuBridge && feishuBridge.getStatus().status === "connected") {
+				feishuBridge.removeBindingBySessionId(agentId);
+			}
+			return;
+		}
+		if (!feishuBridge || feishuBridge.getStatus().status !== "connected") return;
 		const tab = agentManager.list().find((item) => item.id === agentId);
 		if (!tab) return;
 		await feishuBridge.ensureSessionMirror(tab.id, tab.title, tab.sessionPath);
@@ -1209,6 +1227,28 @@ function registerIpc() {
 	);
 	ipcMain.handle(ipcChannels.logsClear, async () => appLogger.clear());
 	ipcMain.handle(ipcChannels.logsOpenFolder, async () => appLogger.openFolder());
+	/** 获取 app 日志文件总大小 */
+	ipcMain.handle(ipcChannels.logsSize, async () => appLogger.getSize());
+	/** 获取 RPC 日志文件总大小，可选按 agentId 过滤 */
+	ipcMain.handle(ipcChannels.rpcLogsGetSize, async (_event, agentId?: string) => rpcLogger.getSize(agentId));
+	/** 从文件读取 RPC 日志，可选按 agentId/日期范围过滤 */
+	ipcMain.handle(ipcChannels.rpcLogsGet, async (_event, options?: { agentId?: string; days?: number; limit?: number }) => rpcLogger.getFromFile(options));
+	/** 清空 RPC 日志文件，可选按 agentId 过滤 */
+	ipcMain.handle(ipcChannels.rpcLogsClear, async (_event, agentId?: string) => rpcLogger.clear(agentId));
+	/** 开关某 agent 的 RPC 日志记录 */
+	ipcMain.handle(ipcChannels.rpcLoggingSet, async (_event, agentId: string, enabled: boolean) => {
+		agentManager.setRpcLogging(agentId, enabled);
+		return enabled;
+	});
+	/** 查询某 agent 的 RPC 日志记录状态 */
+	ipcMain.handle(ipcChannels.rpcLoggingGet, async (_event, agentId: string) => agentManager.isRpcLogging(agentId));
+	/** 用默认编辑器打开某 agent 的 RPC 日志文件 */
+	ipcMain.handle(ipcChannels.rpcLogsOpenFile, async (_event, agentId: string) => {
+		const { shell } = require("electron");
+		const { join } = require("path");
+		const dir = join(app.getPath("userData"), "logs", "rpc");
+		await shell.openPath(dir);
+	});
 	ipcMain.handle(ipcChannels.appFeedbackEnvironment, async () => {
 		// 反馈报告只包含诊断必需的运行时版本与 pi 检测结果，不读取配置密钥或会话内容。
 		const pi = await piLocator.check();
@@ -1660,6 +1700,7 @@ app.whenReady().then(async () => {
 	openCodeSessionImporter = new OpenCodeSessionImporter();
 	settingsStore = new SettingsStore();
 	appLogger = new AppLogger();
+	rpcLogger = new RpcLogger();
 	gitService = new GitService();
 	piLocator = new PiLocator();
 	configManager = new ConfigManager();
@@ -1670,6 +1711,8 @@ app.whenReady().then(async () => {
 		() => mainWindow,
 		settingsStore,
 		configManager,
+		rpcLogger,
+		appLogger,
 	);
 	webServiceManager = new WebServiceManager({
 		listProjects: () => projectStore.list(),

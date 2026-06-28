@@ -412,8 +412,23 @@ export function SessionStatus(props: {
 					% / {formatCompact(props.state.contextWindow)}
 				</span>
 			)}
+			{props.state.inputTokens != null && (
+				<span className="token-chip token-input">
+					↑ {formatCompact(props.state.inputTokens)}
+				</span>
+			)}
+			{props.state.outputTokens != null && (
+				<span className="token-chip token-output">
+					↓ {formatCompact(props.state.outputTokens)}
+				</span>
+			)}
+			{props.state.cacheHitPercent != null && (
+				<span className="cache-chip">
+					{t("app.cacheHit")}: {props.state.cacheHitPercent?.toFixed?.(0) ?? props.state.cacheHitPercent}%
+				</span>
+			)}
 			{props.state.cacheTotal != null && (
-				<span className="cache-chip">{t("app.cache")}: {formatCompact(props.state.cacheTotal)}</span>
+				<span className="cache-chip cache-total">{t("app.cache")}: {formatCompact(props.state.cacheTotal)}</span>
 			)}
 		</div>
 	);
@@ -1359,6 +1374,8 @@ export const ThinkingBlock = memo(function ThinkingBlock(props: {
 export function ThinkingIndicator(props: {
 	thinking?: string;
 	showThinking?: boolean;
+	isExecutingTool?: boolean;
+	executingToolName?: string;
 }) {
 	const hasThinking =
 		props.showThinking && props.thinking && props.thinking.length > 0;
@@ -2446,6 +2463,7 @@ export function DrawerContent(props: {
 	project?: Project;
 	files: FileTreeNode[];
 	sessions: SessionSummary[];
+	sessionsLoading?: boolean;
 	/** Git 工作区中对比 HEAD 有变更的文件列表 */
 	gitChangedFiles: { path: string; status: string }[];
 	expandedDirs: Set<string>;
@@ -2915,6 +2933,11 @@ function SessionsPanel(props: {
 							>
 								<div className="session-card-title">
 									<strong>{session.name || t("common.untitled")}</strong>
+									{session.source && session.source !== "pi" && (
+										<span className={`session-source-badge ${session.source}`}>
+											{t(`sessionSource.${session.source}` as any)}
+										</span>
+									)}
 									<small>
 										{new Date(session.updatedAt).toLocaleString()} ·{" "}
 										{t("drawer.sessionMessages", {
@@ -3464,6 +3487,7 @@ export function ProjectContextMenu(props: {
 	onImportCodexSessions: () => void;
 	onImportClaudeSessions: () => void;
 	onImportOpenCodeSessions: () => void;
+	onFilterSessions: () => void;
 	onRemoveProject: () => void;
 }) {
 	return (
@@ -3483,6 +3507,9 @@ export function ProjectContextMenu(props: {
 				<button onClick={props.onImportOpenCodeSessions}>
 					{t("menu.importOpenCode")}
 				</button>
+				<hr className="context-separator" />
+				<button onClick={props.onFilterSessions}>{t("menu.filterSessions")}</button>
+				<hr className="context-separator" />
 				<button onClick={props.onRemoveProject}>{t("menu.removeProject")}</button>
 			</div>
 		</div>
@@ -3496,7 +3523,9 @@ export function AgentContextMenu(props: {
 	onRename: () => void;
 	onExport: () => void;
 	onCopySession: () => void;
-	onShowLogs: () => void;
+	onToggleRpcLogging?: () => void;
+	isRpcLogging?: boolean;
+	onOpenLogFile?: () => void;
 	onCloseAgent: () => void;
 }) {
 	return (
@@ -3515,7 +3544,14 @@ export function AgentContextMenu(props: {
 					{props.actionLoading === "export" && <span className="mini-loader" />}
 					{props.actionLoading === "export" ? t("menu.exporting") : t("menu.exportHtml")}
 				</button>
-				<button disabled={Boolean(props.actionLoading)} onClick={props.onShowLogs}>{t("menu.rpcLogs")}</button>
+				<button disabled={Boolean(props.actionLoading)} onClick={props.onToggleRpcLogging}>
+					{props.isRpcLogging ? `✓ ${t("menu.rpcLoggingOn")}` : t("menu.rpcLogging")}
+				</button>
+				{props.isRpcLogging && (
+					<button disabled={Boolean(props.actionLoading)} onClick={props.onOpenLogFile}>
+						{t("menu.rpcLogFile")}
+					</button>
+				)}
 				<button className="danger" onClick={props.onCloseAgent}>{t("menu.closeAgent")}</button>
 			</div>
 		</div>
@@ -3529,7 +3565,7 @@ export function SessionContextMenu(props: {
 	onRename: () => void;
 	onExport: () => void;
 	onCopySession: () => void;
-	onShowLogs: () => void;
+	onShowLogs?: () => void;
 	onDeleteSession: () => void;
 }) {
 	return (

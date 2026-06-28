@@ -18,6 +18,8 @@ import { PiProcess } from "./PiProcess";
 import { formatBashToolMessage } from "./bashResult";
 import type { SettingsStore } from "../settings/SettingsStore";
 import type { ConfigManager } from "../config/ConfigManager";
+import type { RpcLogger } from "../logging/RpcLogger";
+import type { AppLogger } from "../logging/AppLogger";
 
 export class AgentManager {
 	private readonly agents = new Map<string, AgentRuntime>();
@@ -33,16 +35,33 @@ export class AgentManager {
 	private readonly retryStatusMessageIds = new Map<string, string>();
 	/** 同一历史会话正在创建 Agent 时共享同一个 Promise，避免快速重复点击/IPC 竞态创建多个进程。 */
 	private readonly creatingSessionAgents = new Map<string, Promise<AgentTab>>();
+	/** 记录每个 agent 当前执行的工具名称，无工具时为 null */
+	private readonly toolExecutingByAgent = new Map<string, string | null>();
+	/** 流式消息 emit 节流状态。 */
+	private readonly messageFlushTimers = new Map<string, NodeJS.Timeout>();
+	private readonly pendingMessageAgents = new Set<string>();
+	/** 流式 emit 合并窗口（毫秒）。50ms 兼顾流畅度与传输量，肉眼几乎无延迟。 */
+	private static readonly MESSAGE_FLUSH_INTERVAL_MS = 50;
+	/**
+	 * 工具结果文本截断阈值（字符数）。工具结果（如 bash 输出、文件读取）可能达数十 KB，
+	 * 若完整存入 ChatMessage.meta 并随流式 emit 反复全量传输，会显著放大 IPC payload
+	 * 并推高渲染进程内存，是大会话白屏的重要诱因。超长结果保留首尾各一部分，中间省略。
+	 */
+	private static readonly MAX_TOOL_RESULT_CHARS = 8000;
 	/** 本地事件监听器（用于 FeishuBridge 等主进程内部订阅） */
 	private readonly localEventListeners = new Set<(agentId: string, event: unknown) => void>();
 	/** 状态变更监听器（用于 PetStateBridge 等主进程内部模块订阅 AgentTab[] 聚合状态） */
 	private readonly stateListeners = new Set<(tabs: AgentTab[]) => void>();
+	/** 开启了 RPC 日志记录的 agent id 集合 */
+	private readonly rpcLoggingAgents = new Set<string>();
 
 	constructor(
 		private readonly getProject: (id: string) => Project | undefined,
 		private readonly getWindow: () => BrowserWindow | null,
 		private readonly settingsStore: SettingsStore,
 		private readonly configManager: ConfigManager,
+		private readonly rpcLogger?: RpcLogger,
+		private readonly appLogger?: AppLogger,
 	) {}
 
 	list() {
@@ -64,13 +83,12 @@ export class AgentManager {
 		const response = await runtime.process.client.request({
 			type: "get_messages",
 		});
-		const messages = this.convertAgentMessages(
-			agentId,
-			(response.data as { messages?: unknown[] } | undefined)?.messages ?? [],
-		);
+		const rawMessages = (response.data as { messages?: unknown[] } | undefined)?.messages ?? [];
+		const trimmed = this.trimHistoryMessages(rawMessages);
+		const messages = this.convertAgentMessages(agentId, trimmed);
 		this.messages.set(agentId, messages);
 		this.refreshAutoTitle(agentId);
-		this.emit(ipcChannels.agentsMessage, { agentId, messages });
+		this.scheduleMessageEmit(agentId, true);
 		return messages;
 	}
 
@@ -192,12 +210,16 @@ export class AgentManager {
 		process.on("stderr", (text) =>
 			this.emit(ipcChannels.agentsLog, { agentId: id, text }),
 		);
-		process.on("protocol-error", (line) =>
+		process.on("protocol-error", (line) => {
 			this.emit(ipcChannels.agentsLog, {
 				agentId: id,
 				text: `Protocol error: ${line}`,
-			}),
-		);
+			});
+			this.appLogger?.error("agent", `Protocol error: ${(line as string)?.slice(0, 200)}`, {
+				agentId: id,
+				project: project.path,
+			});
+		});
 		// 转发 RPC 日志到前端，用于调试面板展示请求/响应/事件
 		process.on("rpc-log", (entry: { direction: string; data: unknown }) => {
 			const data = entry.data as Record<string, any>;
@@ -224,12 +246,19 @@ export class AgentManager {
 					summary = `← message_update.${evt}`;
 				} else summary = `← ${type}`;
 			}
-			this.emit(ipcChannels.agentsRpcLog, {
+			const logEntry = {
+				id: randomUUID(),
 				agentId: id,
 				direction: entry.direction,
 				summary,
 				data,
-			});
+				time: Date.now(),
+			};
+			this.emit(ipcChannels.agentsRpcLog, logEntry);
+			// 只有用户手动开启 RPC 日志记录的 agent 才落盘
+			if (this.rpcLoggingAgents.has(id)) {
+				this.rpcLogger?.push(logEntry);
+			}
 		});
 		process.on("exit", () => {
 			tab.status = "closed";
@@ -238,6 +267,10 @@ export class AgentManager {
 		process.on("error", (error) => {
 			tab.status = "error";
 			this.addMessage(id, "error", error.message);
+			this.appLogger?.error("agent", "Pi process error", {
+				agentId: id,
+				error: error instanceof Error ? error.message : String(error),
+			});
 			this.emitState();
 		});
 
@@ -262,11 +295,53 @@ export class AgentManager {
 				.catch(() => undefined);
 		} catch (error) {
 			tab.status = "error";
-			this.addMessage(
-				id,
-				"error",
-				error instanceof Error ? error.message : String(error),
-			);
+			const rawMessage = error instanceof Error ? error.message : String(error);
+			// 构建丰富的错误诊断信息
+			const diag = process.getDiagnostics();
+			let enriched = rawMessage;
+			if (diag) {
+				const lines: string[] = [];
+				// 退出码
+				if (diag.exitCode !== null) {
+					lines.push(`退出码: ${diag.exitCode}${diag.exitSignal ? ` (signal: ${diag.exitSignal})` : ""}`);
+				}
+				// stderr 输出（截取末尾最有用的部分）
+				const stderrText = diag.stderr.join("").trim();
+				if (stderrText) {
+					// 只保留末尾 600 字符，避免刷屏
+					const snippet = stderrText.length > 600 ? "…" + stderrText.slice(-600) : stderrText;
+					lines.push(`进程错误输出:\n${snippet}`);
+				}
+				// pi 路径与版本检测
+				lines.push(`pi 路径: ${diag.command}`);
+				if (diag.customPiPath) {
+					lines.push(`自定义路径: ${diag.customPiPath}`);
+				}
+				lines.push(`工作目录: ${diag.cwd}`);
+				lines.push(`版本检测: ${diag.versionCheck ? "✓ 通过" : "✗ 失败"}`);
+
+				// 诊断与指引
+				lines.push("");
+				lines.push("━━━ 排查步骤 ━━━");
+				if (!diag.versionCheck) {
+					lines.push("1. 在终端执行 pi --version，确认 pi 是否已安装且路径正确");
+					lines.push("2. 如未安装，执行 npm install -g @earendil-works/pi-coding-agent");
+					lines.push("3. 安装后再次在终端执行 pi --version 验证");
+				} else if (diag.exitCode !== 0) {
+					lines.push("1. 在终端执行 pi --mode rpc 看是否能正常启动");
+					lines.push("2. 注意终端中的错误信息，根据异常信息修复");
+				} else if (!stderrText && diag.exitCode === null) {
+					lines.push("1. pi 进程可能尚未完成初始化，可在设置页增加 RPC 超时时间");
+				} else {
+					lines.push("1. 在终端执行 pi --mode rpc 确认 pi 能否正常启动");
+					lines.push("2. 检查设置中的 pi 路径是否正确");
+				}
+				lines.push("");
+				lines.push("如问题持续，可在 GitHub 提交 Issue 并附上以上信息。");
+
+				enriched = `⚠️ Pi RPC 启动失败\n\n${rawMessage}\n\n${lines.join("\n")}`;
+			}
+			this.addMessage(id, "error", enriched);
 		}
 
 		this.emitState();
@@ -554,6 +629,55 @@ export class AgentManager {
 		const stats = statsResponse.data as any;
 		const model = state?.model;
 		const tokens = stats?.tokens;
+		const inputTokens = this.pickNumber(
+			tokens?.input,
+			tokens?.inputTokens,
+			tokens?.prompt,
+			tokens?.promptTokens,
+			stats?.inputTokens,
+			stats?.usage?.input,
+		);
+		const outputTokens = this.pickNumber(
+			tokens?.output,
+			tokens?.outputTokens,
+			tokens?.completion,
+			tokens?.completionTokens,
+			stats?.outputTokens,
+			stats?.usage?.output,
+		);
+		const cacheRead = this.pickNumber(
+			tokens?.cacheRead,
+			tokens?.cache?.read,
+			stats?.cacheRead,
+			stats?.usage?.cacheRead,
+		);
+		const cacheWrite = this.pickNumber(
+			tokens?.cacheWrite,
+			tokens?.cache?.write,
+			stats?.cacheWrite,
+			stats?.usage?.cacheWrite,
+		);
+		const directCacheHitPercent = this.pickNumber(
+			tokens?.cacheHitPercent,
+			tokens?.cacheHitRate != null ? tokens.cacheHitRate * 100 : undefined,
+			stats?.cacheHitPercent,
+			stats?.cacheHitRate != null ? stats.cacheHitRate * 100 : undefined,
+		);
+		/**
+		 * 缓存命中率 = cacheRead / (cacheRead + cacheWrite) × 100%
+		 * 使用 Anthropic 标准公式：仅统计可缓存 token 的命中比例。
+		 * 和 pi CLI 计算方式一致（pi 不直接返回 hitPercent，我们自行推导）。
+		 * 如果 pi RPC 直接返回了 cacheHitPercent，优先信任。
+		 */
+		const computedCacheHitPercent =
+			cacheRead != null && cacheWrite != null && (cacheRead + cacheWrite) > 0
+				? (cacheRead / (cacheRead + cacheWrite)) * 100
+				: cacheRead != null && cacheRead > 0
+					? 100
+					: undefined;
+		const cacheHitPercent = this.clampPercent(
+			directCacheHitPercent ?? computedCacheHitPercent,
+		);
 		return {
 			modelName: model?.name ?? model?.id,
 			provider: model?.provider,
@@ -561,14 +685,55 @@ export class AgentManager {
 			thinkingLevel: state?.thinkingLevel,
 			isStreaming: state?.isStreaming,
 			isCompacting: state?.isCompacting,
+			/** 工具执行状态从本地追踪，无需 Pi 进程查询 */
+			isExecutingTool: !!(this.toolExecutingByAgent.get(agentId)),
+			executingToolName: this.toolExecutingByAgent.get(agentId) ?? undefined,
 			contextTokens: stats?.contextUsage?.tokens,
 			contextWindow: stats?.contextUsage?.contextWindow ?? model?.contextWindow,
 			contextPercent: stats?.contextUsage?.percent,
-			cacheRead: tokens?.cacheRead,
-			cacheWrite: tokens?.cacheWrite,
-			cacheTotal: (tokens?.cacheRead ?? 0) + (tokens?.cacheWrite ?? 0),
+			inputTokens,
+			outputTokens,
+			cacheRead,
+			cacheWrite,
+			cacheTotal:
+				cacheRead != null || cacheWrite != null
+					? (cacheRead ?? 0) + (cacheWrite ?? 0)
+					: undefined,
+			cacheHitPercent,
 			cost: stats?.cost,
 		};
+	}
+
+	private pickNumber(...values: unknown[]) {
+		for (const value of values) {
+			if (typeof value === "number" && Number.isFinite(value)) return value;
+			if (typeof value === "string" && value.trim()) {
+				const parsed = Number(value);
+				if (Number.isFinite(parsed)) return parsed;
+			}
+		}
+		return undefined;
+	}
+
+	private clampPercent(value: number | undefined) {
+		if (value == null || !Number.isFinite(value)) return undefined;
+		return Math.max(0, Math.min(100, value));
+	}
+
+	private trimHistoryMessages(rawMessages: unknown[], maxMessages = 200) {
+		if (rawMessages.length <= maxMessages) return rawMessages;
+		const cutoff = rawMessages.length - maxMessages;
+		let start = cutoff;
+		for (let index = cutoff; index >= 0; index -= 1) {
+			const message = rawMessages[index] as { role?: unknown } | undefined;
+			if (message?.role === "user") {
+				start = index;
+				break;
+			}
+		}
+		// 历史恢复不能直接从固定条数截断：一轮会话里工具消息很多时，
+		// slice(-N) 会丢掉本轮用户提问，导致右侧定位缺失且列表从 AI 消息开始。
+		return rawMessages.slice(start);
 	}
 
 	async cycleModel(agentId: string) {
@@ -767,12 +932,28 @@ export class AgentManager {
 		);
 	}
 
+	/** 设置某 agent 的 RPC 日志记录开关 */
+	setRpcLogging(agentId: string, enabled: boolean) {
+		if (enabled) {
+			this.rpcLoggingAgents.add(agentId);
+		} else {
+			this.rpcLoggingAgents.delete(agentId);
+		}
+	}
+
+	/** 查询某 agent 是否开启了 RPC 日志记录 */
+	isRpcLogging(agentId: string): boolean {
+		return this.rpcLoggingAgents.has(agentId);
+	}
+
 	async stop(agentId: string) {
 		const runtime = this.agents.get(agentId);
 		if (!runtime) return;
 		const process = runtime.process;
 		this.agents.delete(agentId);
 		this.messages.delete(agentId);
+		// agent 关闭时自动关闭 RPC 日志记录
+		this.rpcLoggingAgents.delete(agentId);
 		process.stop();
 		this.emitState();
 	}
@@ -945,15 +1126,25 @@ export class AgentManager {
 		) {
 			this.upsertAssistantMessage(agentId, typed.message);
 			this.activeAssistantMessageIds.delete(agentId);
+			// message_end 是本轮回答的最终状态，立即 flush 确保完整消息及时可见
+			this.flushMessageEmit(agentId);
 		}
 
 		if (typed.type === "tool_execution_start") {
 			this.upsertToolMessage(agentId, typed, "running");
-			// 工具调用开始时确保 agent 状态为 running，保持 thinking bubble 显示
+			// 记录当前正在执行的工具名，用于前端准确展示“执行中”而非泛泛的“响应中”
+			this.toolExecutingByAgent.set(agentId, typed.toolName ?? "tool");
+			// 工具调用开始时确保 agent 状态为 running
 			if (runtime) {
 				runtime.tab.status = "running";
 				this.emitState();
 			}
+			// 推送运行时状态更新，使前端能立即知道工具正在执行
+			void this.getRuntimeState(agentId)
+				.then((state) =>
+					this.emit(ipcChannels.agentsRuntimeState, { agentId, state }),
+				)
+				.catch(() => undefined);
 		}
 
 		if (typed.type === "tool_execution_end") {
@@ -962,12 +1153,22 @@ export class AgentManager {
 				typed,
 				typed.isError ? "error" : "done",
 			);
+			// 工具执行结束是终态，立即 flush 把最终结果推给渲染进程，避免节流窗口内用户看不到完成状态。
+			this.flushMessageEmit(agentId);
+			// 清除工具执行状态
+			this.toolExecutingByAgent.set(agentId, null);
 			// 工具调用完成后保持 agent 状态为 running，等待后续的 agent_end 事件
 			// 这样在工具完成到 agent 生成回复之间，thinking bubble 仍然会显示
 			if (runtime) {
 				runtime.tab.status = "running";
 				this.emitState();
 			}
+			// 推送运行时状态更新
+			void this.getRuntimeState(agentId)
+				.then((state) =>
+					this.emit(ipcChannels.agentsRuntimeState, { agentId, state }),
+				)
+				.catch(() => undefined);
 		}
 
 		if (typed.type === "tool_execution_update") {
@@ -1029,11 +1230,15 @@ export class AgentManager {
 				this.streamingThinking.set(agentId, finalThinking);
 			}
 			this.upsertAssistantMessage(agentId, partialMessage);
+			// thinking_end 是阶段性终态，立即 flush 让思考块完整落盘显示。
+			this.flushMessageEmit(agentId);
 			return;
 		}
 
 		if (eventType === "message_end" || eventType === "done" || eventType === "error") {
 			this.upsertAssistantMessage(agentId, partialMessage);
+			// message_end/done/error 是本轮回答的最终状态，立即 flush 确保完整消息及时可见。
+			this.flushMessageEmit(agentId);
 			this.activeAssistantMessageIds.delete(agentId);
 		}
 	}
@@ -1091,7 +1296,9 @@ export class AgentManager {
 		}
 
 		this.messages.set(agentId, list);
-		this.emit(ipcChannels.agentsMessage, { agentId, messages: list });
+		// upsertAssistantMessage 被 text_delta/thinking_delta 高频调用，走节流合并；
+		// message_end/thinking_end 等终态调用方会在调用后显式 flush，保证最终状态及时。
+		this.scheduleMessageEmit(agentId);
 	}
 
 	private upsertToolMessage(
@@ -1155,10 +1362,7 @@ export class AgentManager {
 								: message,
 						);
 						this.messages.set(agentId, nextList);
-						this.emit(ipcChannels.agentsMessage, {
-							agentId,
-							messages: nextList,
-						});
+						this.scheduleMessageEmit(agentId, true);
 					})
 					.catch(() => {
 						// 文件不存在或被删除，跳过
@@ -1195,8 +1399,8 @@ export class AgentManager {
 			status,
 			toolName,
 			toolCallId,
-			args,
-			result,
+			args: this.truncateForDetail(this.safeJson(args)),
+			result: this.truncateForDetail(this.extractToolResultText(result) || this.safeJson(result)),
 			isError,
 			detailText,
 			originalContent,
@@ -1218,7 +1422,7 @@ export class AgentManager {
 		}
 
 		this.messages.set(agentId, list);
-		this.emit(ipcChannels.agentsMessage, { agentId, messages: list });
+		this.scheduleMessageEmit(agentId);
 	}
 
 	private addMessage(
@@ -1240,7 +1444,7 @@ export class AgentManager {
 		});
 		this.messages.set(agentId, list);
 		if (role === "user" || role === "assistant") this.refreshAutoTitle(agentId);
-		this.emit(ipcChannels.agentsMessage, { agentId, messages: list });
+		this.scheduleMessageEmit(agentId, true);
 	}
 
 	private refreshAutoTitle(agentId: string) {
@@ -1333,7 +1537,7 @@ export class AgentManager {
 		message.meta = { status, attempt, maxAttempts, delayMs, errorMessage: reason };
 
 		this.messages.set(agentId, list);
-		this.emit(ipcChannels.agentsMessage, { agentId, messages: list });
+		this.scheduleMessageEmit(agentId, true);
 	}
 
 	private convertAgentMessages(
@@ -1415,8 +1619,8 @@ export class AgentManager {
 								status: isError ? "error" : "done",
 								toolName,
 								toolCallId,
-								args: historicalCall?.args,
-								result,
+								args: this.truncateForDetail(this.safeJson(historicalCall?.args)),
+								result: this.truncateForDetail(this.extractToolResultText(result) || this.safeJson(result)),
 								isError,
 								detailText,
 								...(originalContent && /write|edit|create|patch/i.test(toolName)
@@ -1494,14 +1698,18 @@ export class AgentManager {
 		isError: boolean,
 	) {
 		const details = this.extractToolDetails(result);
+		// args/结果/details 都先序列化再截断，避免单条工具详情撑大 ChatMessage.meta。
+		const argsText = args ? this.truncateForDetail(this.safeJson(args)) : "";
+		const resultText = result
+			? this.truncateForDetail(this.extractToolResultText(result) || this.safeJson(result))
+			: "";
+		const detailsText = details ? this.truncateForDetail(this.safeJson(details)) : "";
 		const sections = [
 			`工具：${toolName ?? "tool"}`,
 			`状态：${isError ? "失败" : "完成"}`,
-			args ? `参数：\n${this.safeJson(args)}` : "",
-			result
-				? `结果：\n${this.extractToolResultText(result) || this.safeJson(result)}`
-				: "",
-			details ? `详情：\n${this.safeJson(details)}` : "",
+			args ? `参数：\n${argsText}` : "",
+			result ? `结果：\n${resultText}` : "",
+			details ? `详情：\n${detailsText}` : "",
 		].filter(Boolean);
 		return sections.join("\n\n");
 	}
@@ -1510,6 +1718,22 @@ export class AgentManager {
 		if (!result || typeof result !== "object") return undefined;
 		return (result as any).details;
 	}
+
+	/** 对超长工具文本做首尾截断，保留头部和尾部以兼顾开头信息和错误堆栈。 */
+	private truncateForDetail(text: unknown): string {
+		// safeJson/extractToolResultText 在某些输入下可能返回 undefined（如 JSON.stringify(undefined)），
+		// 必须在此归一化为字符串，否则后续 .length 访问会抛 TypeError 导致主进程未捕获异常弹窗。
+		const str = typeof text === "string" ? text : text == null ? "" : String(text);
+		if (str.length <= AgentManager.MAX_TOOL_RESULT_CHARS) return str;
+		const keep = Math.floor(AgentManager.MAX_TOOL_RESULT_CHARS / 2);
+		const omitted = str.length - keep * 2;
+		return (
+			`${str.slice(0, keep)}\n` +
+			`…（已省略中间 ${omitted} 字符，完整内容共 ${str.length} 字符）\n` +
+			str.slice(-keep)
+		);
+	}
+
 
 
 	private extractToolResultText(result: unknown) {
@@ -1615,6 +1839,36 @@ export class AgentManager {
 	/** 清理 ANSI 转义码，模型思考内容中常见终端颜色序列 */
 	private stripAnsi(text: string): string {
 		return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
+	}
+
+	/**
+	 * 安排一次消息 emit。流式高频事件走节流合并（同一 agent 50ms 内多次调用只 emit 一次最新数组）；
+	 * immediate=true 时跳过节流立即 flush，用于 message_end/tool_execution_end 等终态事件，确保最终状态不丢。
+	 */
+	private scheduleMessageEmit(agentId: string, immediate = false) {
+		if (immediate) {
+			this.flushMessageEmit(agentId);
+			return;
+		}
+		if (this.pendingMessageAgents.has(agentId)) return;
+		this.pendingMessageAgents.add(agentId);
+		const timer = setTimeout(() => this.flushMessageEmit(agentId), AgentManager.MESSAGE_FLUSH_INTERVAL_MS);
+		// 节流定时器不应阻止进程退出
+		timer.unref?.();
+		this.messageFlushTimers.set(agentId, timer);
+	}
+
+	private flushMessageEmit(agentId: string) {
+		const timer = this.messageFlushTimers.get(agentId);
+		if (timer) {
+			clearTimeout(timer);
+			this.messageFlushTimers.delete(agentId);
+		}
+		this.pendingMessageAgents.delete(agentId);
+		this.emit(ipcChannels.agentsMessage, {
+			agentId,
+			messages: this.messages.get(agentId) ?? [],
+		});
 	}
 
 	private emitThinking(agentId: string, thinking: string) {
