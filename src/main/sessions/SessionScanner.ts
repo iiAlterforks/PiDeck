@@ -95,10 +95,26 @@ export class SessionScanner {
     for (const entry of entries) {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) files.push(...await this.collectJsonl(path));
-      else if (entry.isFile() && entry.name.endsWith(".jsonl")) files.push(path);
+      else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        // pi-interactive-subagents 会为每个子代理写一个独立 session 文件，与主会话放在同一项目目录。
+        // 文件名 id 段（_Z_ 之后）不是标准 UUID 格式（8-12-8-4 等），主会话/导入会话则是标准 UUID（8-4-4-4-12）。
+        // 用文件名格式过滤掉子代理 session，避免它们污染顶级历史会话列表（其内容已在主会话的「查看子会话」里展示）。
+        if (this.isSubagentSessionFile(entry.name)) continue;
+        files.push(path);
+      }
     }
 
     return files;
+  }
+
+  /** 判断文件是否为 pi-interactive-subagents 的子代理 session 文件。
+   *  依据：文件名中的 id 段（时间戳_Z_ 之后、.jsonl 之前）不是标准 UUID 格式。
+   *  主会话/导入会话的文件名 id 与其内部 session.id 一致（标准 UUID 8-4-4-4-12）；
+   *  子代理文件名 id 是 pi-interactive-subagents 分配的 childId（8-12-8-4 等非标准格式），与其内部 session.id 不同。 */
+  private isSubagentSessionFile(fileName: string): boolean {
+    const idPart = fileName.replace(/^.*Z_/, "").replace(/\.jsonl$/, "");
+    const STANDARD_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    return !STANDARD_UUID.test(idPart);
   }
 
   private async readSummary(filePath: string): Promise<SessionSummary | null> {
