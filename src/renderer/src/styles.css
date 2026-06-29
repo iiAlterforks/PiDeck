@@ -3132,6 +3132,9 @@ body.is-terminal-resizing .terminal-resize-handle::before {
 }
 .thinking-card.streaming .thinking-card-content {
 	max-height: 240px;
+	/* 流式思考内容会持续增长：限制高度但允许内部滚动，配合 JS 在更新时自动滚到底部，
+	   让用户始终看到最新生成的思考（像终端 tail -f），而不是被裁切在视口外。 */
+	overflow-y: auto;
 	background: var(--color-bg-hover);
 	border-radius: 0 0 var(--radius-sm) var(--radius-sm);
 }

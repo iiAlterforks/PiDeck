@@ -1653,6 +1653,17 @@ export const TurnRow = memo(function TurnRow(props: {
 									showThinking={props.showThinking}
 								/>
 							))}
+						{/* 合并的思考（来自打包 thinking 的 assistant 消息）：也放在正文前，
+							保证思考块始终在回答上方，不受"打包 vs 独立"分组的影响 */}
+						{props.showThinking &&
+							mergedThinking &&
+							standaloneThinking.length === 0 && (
+							<ThinkingBlock
+								text={mergedThinking}
+								endedAt={run.endedAt}
+								showThinking={props.showThinking}
+							/>
+						)}
 						{/* 工具调用组 */}
 						{toolGroups.map((g) => (
 							<ToolGroupCard key={g.id} group={g} />
@@ -1668,16 +1679,6 @@ export const TurnRow = memo(function TurnRow(props: {
 								isStreaming={props.isStreaming ?? false}
 							/>
 						)}
-						{/* 合并的思考内联展示（仅当没有独立思考组时附在正文后） */}
-						{props.showThinking &&
-							mergedThinking &&
-							standaloneThinking.length === 0 && (
-								<ThinkingBlock
-									text={mergedThinking}
-									endedAt={run.endedAt}
-									showThinking={props.showThinking}
-								/>
-							)}
 						{/* 操作栏：hover/focus 显隐，复制整轮回答 */}
 						{mergedText && (
 							<div className="turn-row-actions">

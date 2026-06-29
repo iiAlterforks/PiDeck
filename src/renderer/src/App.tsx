@@ -780,7 +780,12 @@ export function App() {
   const isAwaitingAssistant = Boolean(
     activeAgent &&
     (activeAgent.status === "running" || activeRuntimeState?.isStreaming) &&
-    activeMessages.at(-1)?.role !== "assistant",
+    // 最后一条是 assistant 且已有正文 → 本轮回答已进入正文输出，不再算"等待回复"。
+    // 但思考阶段（带 thinking 无 text）、工具阶段（tool 消息）的 assistant 仍应算等待：
+    // 这些模型（如 glm/deepseek）把 thinking 整块随 message_update 推送，
+    // 若此刻判为非等待，流式思考卡片会被立即隐藏，导致用户看到"思考完才一起返回"。
+    (activeMessages.at(-1)?.role !== "assistant" ||
+      !(activeMessages.at(-1)?.text ?? "").trim())
   );
   /** 正在流式追加的最后一条 assistant 消息的 id（agent 处于运行/流式状态时才有值）。
    *  用于让对应 AssistantText 走轻量渲染路径，避免每个 token 都对不断增长的全量正文
@@ -797,10 +802,38 @@ export function App() {
     return undefined;
   }, [activeAgent, activeRuntimeState, activeMessages]);
 
-  /** 当前活跃 agent 的实时思考文本 */
-  const activeThinking = activeAgentId
-    ? (streamingThinking[activeAgentId] ?? "")
-    : "";
+  /** 当前活跃 agent 的实时思考文本。
+   *  优先取 thinking_delta 通道（streamingThinking）—— 适用于逐步推送思考的模型；
+   *  若为空（部分模型/网关不走 thinking_delta，而是把 thinking 打包在 message 事件整体推送），
+   *  则 fallback 到当前正在流式追加的最后一条 assistant 消息的 .thinking 字段，
+   *  让这类模型的流式思考也能实时可见。 */
+  const activeThinking = (() => {
+    if (!activeAgentId) return "";
+    const delta = streamingThinking[activeAgentId] ?? "";
+    if (delta.trim()) return delta;
+    // 仅在 agent 流式运行时才回退取消息自身的 thinking，避免回答结束后还残留
+    if (
+      !activeAgent ||
+      activeAgent.status !== "running" ||
+      !activeRuntimeState?.isStreaming
+    )
+      return "";
+    for (let i = activeMessages.length - 1; i >= 0; i--) {
+      const m = activeMessages[i];
+      if (m.role === "user") break;
+      if (m.role === "assistant" && m.thinking?.trim()) return m.thinking;
+    }
+    return "";
+  })();
+  /** 流式思考内容区的 DOM 引用，用于在思考文本增长时自动滚到底部，
+   *  让用户始终看到最新生成的思考，而非被固定高度裁切。 */
+  const streamingThinkingContentRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = streamingThinkingContentRef.current;
+    if (!el) return;
+    // 思考文本流式增长时把内容区滚到底，避免新内容被裁切在 240px 视口外
+    el.scrollTop = el.scrollHeight;
+  }, [activeThinking]);
   const activeTerminalHeight = activeAgentId
     ? (terminalHeightByAgent[activeAgentId] ?? COMPOSER_DEFAULT_TERMINAL_HEIGHT)
     : COMPOSER_DEFAULT_TERMINAL_HEIGHT;
@@ -4383,7 +4416,7 @@ ${goalTextRef.current}
                   />
                   {settings.showThinking && activeThinking && (
                     <section className="thinking-card streaming">
-                      <div className="thinking-card-content">{activeThinking}</div>
+                      <div className="thinking-card-content" ref={streamingThinkingContentRef}>{activeThinking}</div>
                     </section>
                   )}
                 </>
