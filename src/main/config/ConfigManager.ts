@@ -1,8 +1,15 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { normalize, join } from "node:path";
+import { normalize, join, dirname } from "node:path";
+import { dirname as posixDirname, normalize as posixNormalize } from "node:path/posix";
 import { homedir } from "node:os";
 import { net } from "electron";
 import type { ConfigFileDiagnostic, ConfigFileReadResult } from "../../shared/types";
+import {
+	ensureOpenAiVersionPath,
+	needsSessionBaseUrlVersionHint,
+	suggestNormalizedBaseUrl,
+} from "./baseUrlPath";
+import type { WslEnvironment } from "../wsl/WslPaths";
 
 /** pi 全局配置目录：~/.pi/agent/ */
 const PI_AGENT_DIR = join(homedir(), ".pi", "agent");
@@ -75,10 +82,17 @@ type TestRequest = {
  * 按照 pi 实际文件格式解析：models.json 是嵌套 providers 结构，auth.json 是对象映射。
  */
 export class ConfigManager {
-	private readonly configDir: string;
+	private configDir: string;
 
 	constructor(configDir?: string) {
 		this.configDir = configDir ?? PI_AGENT_DIR;
+	}
+
+	/** 将配置目录切换到统一解析出的 WSL HOME；null 恢复 Windows home。 */
+	configureWsl(environment: WslEnvironment | null) {
+		this.configDir = environment
+			? join(environment.windowsHome, ".pi", "agent")
+			: PI_AGENT_DIR;
 	}
 
 	// ── 读取 ──────────────────────────────────────────────
@@ -100,7 +114,7 @@ export class ConfigManager {
 	}
 
 	async ensureTrustedDirectory(directoryPath: string): Promise<void> {
-		const normalizedPath = normalize(directoryPath);
+		const normalizedPath = this.normalizeTrustPath(directoryPath);
 		const trustConfig = await this.getTrustConfig();
 		if (trustConfig.diagnostic) return;
 
@@ -109,7 +123,6 @@ export class ConfigManager {
 		);
 		if (existingEntry) return;
 
-		// 启动/恢复 Agent 前主动信任项目目录，避免 pi 只因 --approve 信任本次运行而不落盘。
 		// 若用户已用不同大小写/分隔符写过同一路径，或显式设为 false，则不覆盖，尊重用户的 trust.json 决策。
 		await this.writeJsonFile("trust.json", {
 			...trustConfig.parsed,
@@ -117,9 +130,61 @@ export class ConfigManager {
 		});
 	}
 
+	/**
+	 * 查询某项目目录的信任决策，沿父目录链查找最近记录（复刻 pi 的 findNearestTrustEntry 语义）。
+	 * pi 的信任语义是父目录决策继承到子目录，例如 trust.json 记录 "C:\\Users": true，
+	 * 则 C:\\Users\\14012\\project 同样视为已信任。返回 true/false；未记录返回 null。
+	 */
+	async getProjectTrustDecision(cwd: string): Promise<boolean | null> {
+		const trustConfig = await this.getTrustConfig();
+		if (trustConfig.diagnostic) return null;
+		return this.findNearestTrustEntry(trustConfig.parsed, cwd);
+	}
+
+	/**
+	 * 写入某项目目录的信任决策（覆盖该路径既有值）。
+	 * 用户在信任弹窗选择“信任并记住”或“不信任”后调用，持久化决策避免重复打扰。
+	 */
+	async setProjectTrustDecision(cwd: string, decision: boolean): Promise<void> {
+		const trustConfig = await this.getTrustConfig();
+		if (trustConfig.diagnostic) return;
+		const key = this.normalizeTrustPath(cwd);
+		await this.writeJsonFile("trust.json", {
+			...trustConfig.parsed,
+			[key]: decision,
+		});
+	}
+
+	/**
+	 * 沿父目录链查找最近的信任记录。key 比较统一走 normalizeTrustPathKey，
+	 * 与 ensureTrustedDirectory 的去重逻辑保持一致，避免大小写/分隔符差异导致漏查。
+	 */
+	private findNearestTrustEntry(data: Record<string, boolean>, cwd: string): boolean | null {
+		const normalized = new Map<string, boolean>();
+		for (const [key, value] of Object.entries(data)) {
+			normalized.set(this.normalizeTrustPathKey(key), value);
+		}
+		let current = this.normalizeTrustPathKey(cwd);
+		while (true) {
+			const value = normalized.get(current);
+			if (value === true || value === false) return value;
+			const parent = current.startsWith("/") ? posixDirname(current) : dirname(current);
+			if (parent === current) return null;
+			current = parent;
+		}
+	}
+
 	private normalizeTrustPathKey(path: string) {
-		const normalized = normalize(path).replace(/[\\/]+$/, "");
-		return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+		const normalized = this.normalizeTrustPath(path).replace(/[\\/]+$/, "");
+		return process.platform === "win32" && !normalized.startsWith("/")
+			? normalized.toLowerCase()
+			: normalized;
+	}
+
+	private normalizeTrustPath(path: string) {
+		if (!path.startsWith("/")) return normalize(path);
+		const normalized = posixNormalize(path);
+		return normalized === "/" ? normalized : normalized.replace(/\/+$/, "");
 	}
 
 	// ── 保存（可视化表单） ────────────────────────────────
@@ -280,11 +345,23 @@ export class ConfigManager {
 		baseUrl: string,
 		apiKey: string,
 		apiType?: string,
-	): Promise<{ success: boolean; models?: Array<{ id: string; name?: string }>; error?: string }> {
+	): Promise<{
+		success: boolean;
+		models?: Array<{ id: string; name?: string }>;
+		error?: string;
+		/** 实际成功/最后一次请求的 URL（脱敏），用于 UI 对比会话侧路径 */
+		requestUrl?: string;
+		/** 检测侧补了版本路径，而配置 baseUrl 仍是根路径 → 会话可能 404 */
+		sessionBaseUrlNeedsVersion?: boolean;
+		/** 建议写入配置的 baseUrl（含 /v1 等）；UI 可自动改写 */
+		suggestedBaseUrl?: string;
+	}> {
 		const requests = this.buildModelsRequest(baseUrl, apiKey, apiType);
 		let lastError: string | undefined;
+		let lastRequestUrl: string | undefined;
 
 		for (const request of requests) {
+			lastRequestUrl = this.redactSecret(request.url, apiKey);
 			try {
 				const controller = new AbortController();
 				// 10 秒超时，避免网络不通时长时间卡住
@@ -311,7 +388,21 @@ export class ConfigManager {
 						continue;
 					}
 
-					return { success: true, models };
+					// 成功路径若依赖检测侧自动补 /v1，而用户配置仍是根路径，
+					// 会话侧会原样用 baseUrl → 返回建议 baseUrl 供 UI 自动改写。
+					const sessionBaseUrlNeedsVersion = needsSessionBaseUrlVersionHint(
+						baseUrl,
+						request.url,
+					);
+					const suggestedBaseUrl =
+						suggestNormalizedBaseUrl(baseUrl, request.url, apiType) ?? undefined;
+					return {
+						success: true,
+						models,
+						requestUrl: lastRequestUrl,
+						sessionBaseUrlNeedsVersion,
+						suggestedBaseUrl,
+					};
 				} finally {
 					clearTimeout(timeout);
 				}
@@ -326,7 +417,15 @@ export class ConfigManager {
 			}
 		}
 
-		return { success: false, error: lastError ?? "获取模型列表失败" };
+		return {
+			success: false,
+			error: lastError ?? "获取模型列表失败",
+			requestUrl: lastRequestUrl,
+			sessionBaseUrlNeedsVersion: needsSessionBaseUrlVersionHint(
+				baseUrl,
+				lastRequestUrl,
+			),
+		};
 	}
 
 
@@ -598,15 +697,10 @@ export class ConfigManager {
 
 	/**
 	 * 确保 OpenAI 兼容 API 的基础 URL 包含 /v1 版本路径。
-	 * 很多代理/本地模型需要 {baseUrl}/v1/... 格式的请求路径。
-	 * 用户配置 baseUrl 时习惯只填到域名字段（如 http://localhost:11434），
-	 * 自动补齐 /v1 可以避免常见错误。
-	 * 如果 baseUrl 已包含 /v1、/api 等路径段则跳过补齐。
+	 * 仅用于「获取模型 / 测试连接」；pi 会话不会走此补齐。
 	 */
 	private ensureVersionPath(baseUrl: string): string {
-		const u = baseUrl.replace(/\/+$/, "");
-		const hasVersionPath = /\/v\d+$|\/api$/.test(u);
-		return hasVersionPath ? u : `${u}/v1`;
+		return ensureOpenAiVersionPath(baseUrl);
 	}
 
 	private googleModelPath(modelId: string) {
@@ -783,6 +877,10 @@ export class ConfigManager {
 		error?: string;
 		requestUrl?: string;
 		requestBody?: string;
+		/** 检测侧补了 /v1，配置仍是根路径 → 会话侧可能失败 */
+		sessionBaseUrlNeedsVersion?: boolean;
+		/** 建议写入配置的 baseUrl；仅 success 时由 UI 自动改写 */
+		suggestedBaseUrl?: string;
 	}> {
 		const startedAt = Date.now();
 		const api = this.normalizeApiType(apiType);
@@ -790,6 +888,13 @@ export class ConfigManager {
 			this.buildTestRequest(baseUrl, apiKey, modelId, api, requestHeaders);
 		const safeRequestUrl = this.redactSecret(requestUrl, apiKey);
 		const safeRequestBody = this.redactSecret(requestBody, apiKey);
+		// 与 fetch 一致：检测用了补齐路径、配置仍是根路径时给出建议 baseUrl。
+		const sessionBaseUrlNeedsVersion = needsSessionBaseUrlVersionHint(
+			baseUrl,
+			requestUrl,
+		);
+		const suggestedBaseUrl =
+			suggestNormalizedBaseUrl(baseUrl, requestUrl, api) ?? undefined;
 
 		try {
 			const controller = new AbortController();
@@ -821,12 +926,14 @@ export class ConfigManager {
 				} catch {
 					/* 忽略解析错误 */
 				}
+				// 失败时不自动改写 baseUrl，只保留诊断字段。
 				return {
 					success: false,
 					error: this.redactSecret(detail, apiKey),
 					latencyMs,
 					requestUrl: safeRequestUrl,
 					requestBody: safeRequestBody,
+					sessionBaseUrlNeedsVersion,
 				};
 			}
 
@@ -839,6 +946,8 @@ export class ConfigManager {
 				latencyMs,
 				requestUrl: safeRequestUrl,
 				requestBody: safeRequestBody,
+				sessionBaseUrlNeedsVersion,
+				suggestedBaseUrl,
 			};
 		} catch (e) {
 			const latencyMs = Date.now() - startedAt;
@@ -854,6 +963,7 @@ export class ConfigManager {
 				latencyMs,
 				requestUrl: safeRequestUrl,
 				requestBody: safeRequestBody,
+				sessionBaseUrlNeedsVersion,
 			};
 		}
 	}

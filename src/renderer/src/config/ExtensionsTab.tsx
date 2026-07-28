@@ -1,21 +1,79 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { Copy, Download, RotateCcw, Trash2 } from "lucide-react";
 import type { PiCliUpdateResult, PiExtensionListResult, PiExtensionSummary, PiPackageInfo } from "../../../shared/types";
 import { t } from "../i18n";
+import { showNotice } from "../utils/notice";
+import { writeClipboard } from "../utils/clipboard";
 
 type ExtensionsApi = {
 	list: () => Promise<PiExtensionListResult>;
 	uninstall: (source: string, scope?: "user" | "project" | "unknown") => Promise<void>;
 	install: (source: string) => Promise<string>;
+	removeBuiltIn: (source: string) => Promise<void>;
+	restoreBuiltIn: (source: string) => Promise<void>;
 	update: () => Promise<PiCliUpdateResult>;
 };
 
-const api: ExtensionsApi = (window as unknown as { piDesktop?: { extensions: ExtensionsApi } }).piDesktop!.extensions;
+function getExtensionsApi(): ExtensionsApi {
+	const api = (window as unknown as { piDesktop?: { extensions?: ExtensionsApi } })
+		.piDesktop?.extensions;
+	if (!api) throw new Error("PiDeck extensions API is not available");
+	return api;
+}
+
+/** PiDeck 内置扩展名 → source 文件名映射 */
+const PIDEK_BUILTIN_SOURCE: Record<string, string> = {
+	"pi-deck-todo": "pi-deck-todo.ts",
+	"pi-deck-plan-mode": "pi-deck-plan-mode.ts",
+	"pi-deck-ask-question": "pi-deck-ask-question.ts",
+	"pi-deck-nul-redirect-fix": "pi-deck-nul-redirect-fix.ts",
+};
 
 /** 预设推荐扩展包 */
 const RECOMMENDED_PACKAGES: PiPackageInfo[] = [
 	{
+		name: "pi-deck-todo",
+		description: "PiDeck 内置：TODO 列表扩展，支持在对话中添加和管理任务项，自动追踪完成状态并在会话间持久化。",
+		installCmd: "npm:@earendil-works/pi-deck-todo",
+		tags: ["extension"],
+		downloads: "",
+		updated: "",
+		npmUrl: "",
+		repoUrl: "https://github.com/ayuayue/PiDeck",
+	},
+	{
+		name: "pi-deck-plan-mode",
+		description: "PiDeck 内置：计划模式扩展，让 AI 在回复前首先生成执行计划，复杂任务一目了然。",
+		installCmd: "npm:@earendil-works/pi-deck-plan-mode",
+		tags: ["extension"],
+		downloads: "",
+		updated: "",
+		npmUrl: "",
+		repoUrl: "https://github.com/ayuayue/PiDeck",
+	},
+	{
+		name: "pi-deck-ask-question",
+		description: "PiDeck 内置：在对话中插入精心设计的问题卡片，引导 AI 给出更精准的回答。",
+		installCmd: "npm:@earendil-works/pi-deck-ask-question",
+		tags: ["extension"],
+		downloads: "",
+		updated: "",
+		npmUrl: "",
+		repoUrl: "https://github.com/ayuayue/PiDeck",
+	},
+	{
+		name: "pi-deck-nul-redirect-fix",
+		description: "PiDeck 内置：修复 Windows 下 pi 重定向到 NUL 设备时可能产生的残留文件问题。",
+		installCmd: "npm:@earendil-works/pi-deck-nul-redirect-fix",
+		tags: ["extension"],
+		downloads: "",
+		updated: "",
+		npmUrl: "",
+		repoUrl: "https://github.com/ayuayue/PiDeck",
+	},
+	{
 		name: "context-mode",
-		description: "MCP 插件，可节省 98% 的上下文窗口。支持 Claude Code、Gemini CLI、VS Code Copilot 等。沙箱代码执行、FTS5 知识库和意图驱动搜索。",
+		description: "MCP 插件，可节省 98% 的上下文窗口。沙箱代码执行、FTS5 知识库和意图驱动搜索。",
 		installCmd: "npm:context-mode",
 		tags: ["extension"],
 		downloads: "107K/mo",
@@ -44,15 +102,6 @@ const RECOMMENDED_PACKAGES: PiPackageInfo[] = [
 		repoUrl: "https://github.com/nicobailon/pi-mcp-adapter",
 	},
 	{
-		name: "@samfp/pi-memory",
-		description: "长期记忆扩展，用于在 Pi 会话之间保存和检索偏好、项目事实与经验教训。",
-		installCmd: "npm:@samfp/pi-memory",
-		tags: ["extension", "memory"],
-		downloads: "",
-		updated: "",
-		npmUrl: "https://pi.dev/packages/@samfp/pi-memory?name=%40samfp%2Fpi-memory",
-	},
-	{
 		name: "pi-subagents",
 		description: "任务委派扩展，支持链式、并行执行和 TUI 澄清。可将复杂任务拆解给多个子 Agent。",
 		installCmd: "npm:pi-subagents",
@@ -64,6 +113,14 @@ const RECOMMENDED_PACKAGES: PiPackageInfo[] = [
 	},
 ];
 
+/** 从扩展来源提取简短描述名 */
+function shortName(source: string): string {
+	return source
+		.replace(/^(?:npm|file|github|git|https?):/i, "")
+		.replace(/\.ts$/, "")
+		.replace(/@[^/]+\//, "");
+}
+
 export function ExtensionsTab(props: {
 	data: PiExtensionListResult;
 	loading: boolean;
@@ -72,15 +129,63 @@ export function ExtensionsTab(props: {
 	onUninstall: (extension: PiExtensionSummary) => void;
 }) {
 	const [installingSources, setInstallingSources] = useState<Set<string>>(() => new Set());
+	const [restoringBuiltIn, setRestoringBuiltIn] = useState<string | null>(null);
+	const [removingBuiltIn, setRemovingBuiltIn] = useState<string | null>(null);
+
+	// 首次加载或列表刷新时展示扩展冲突通知
+	useEffect(() => {
+		if (!props.data.conflicts || props.data.conflicts.length === 0) return;
+		for (const c of props.data.conflicts) {
+			showNotice(
+				t("config.extensionConflict", {
+					builtIn: shortName(c.builtIn),
+					thirdParty: shortName(c.thirdParty),
+				}),
+				8000,
+				"warning",
+			);
+		}
+	}, [props.data.conflicts]);
+
+	const handleRemoveBuiltIn = async (extension: PiExtensionSummary) => {
+		if (removingBuiltIn) return;
+		setRemovingBuiltIn(extension.source);
+		try {
+			await getExtensionsApi().removeBuiltIn(extension.source);
+			props.onRefresh();
+		} catch (e) {
+			alert(t("config.installFailed") + ": " + (e instanceof Error ? e.message : String(e)));
+		} finally {
+			setRemovingBuiltIn(null);
+		}
+	};
+
+	const handleRestoreBuiltIn = async (extension: PiExtensionSummary) => {
+		if (restoringBuiltIn) return;
+		setRestoringBuiltIn(extension.source);
+		try {
+			await getExtensionsApi().restoreBuiltIn(extension.source);
+			props.onRefresh();
+		} catch (e) {
+			alert(t("config.installFailed") + ": " + (e instanceof Error ? e.message : String(e)));
+		} finally {
+			setRestoringBuiltIn(null);
+		}
+	};
 	const [updating, setUpdating] = useState<string | null>(null);
 	const [updateResult, setUpdateResult] = useState<PiCliUpdateResult | null>(null);
 	const [showUpdateDialog, setShowUpdateDialog] = useState(false);
 
 	const handleInstall = async (pkg: PiPackageInfo) => {
-		// 安装任务按扩展源分别记录；多个扩展并发安装时，不能用单一字符串覆盖前一个 loading 状态。
 		setInstallingSources((current) => new Set(current).add(pkg.installCmd));
 		try {
-			await api.install(pkg.installCmd);
+			// 对已移除的内置扩展，走恢复流程而非 npm 安装
+			const builtInSource = pkg.name.startsWith("pi-deck-") ? PIDEK_BUILTIN_SOURCE[pkg.name] : undefined;
+			if (builtInSource) {
+				await getExtensionsApi().restoreBuiltIn(builtInSource);
+			} else {
+				await getExtensionsApi().install(pkg.installCmd);
+			}
 			props.onRefresh();
 		} catch (e) {
 			alert(t("config.installFailed") + ": " + (e instanceof Error ? e.message : String(e)));
@@ -98,7 +203,7 @@ export function ExtensionsTab(props: {
 		setUpdateResult(null);
 		setShowUpdateDialog(true);
 		try {
-			const result = await api.update();
+			const result = await getExtensionsApi().update();
 			setUpdateResult(result);
 		} catch (e) {
 			alert(t("settings.extensionsUpdateFailed", { error: e instanceof Error ? e.message : String(e) }));
@@ -156,7 +261,15 @@ export function ExtensionsTab(props: {
 				</p>
 				<div className="extensions-recommended-list">
 					{RECOMMENDED_PACKAGES.map((pkg) => {
-						const alreadyInstalled = props.data.extensions.some((ext) => ext.source === pkg.installCmd);
+						// 内置扩展按 source 文件名匹配，npm 扩展按 installCmd 匹配
+						const builtInSource = pkg.name.startsWith("pi-deck-") ? PIDEK_BUILTIN_SOURCE[pkg.name] : undefined;
+						const builtInExt = builtInSource
+							? props.data.extensions.find((ext) => ext.builtIn && ext.source === builtInSource)
+							: undefined;
+						// 已部署（非移除状态）视为已安装；已移除的内置扩展允许恢复安装
+						const alreadyInstalled = builtInExt
+							? builtInExt.enabled !== false
+							: props.data.extensions.some((ext) => ext.source === pkg.installCmd);
 						const installing = installingSources.has(pkg.installCmd);
 						return (
 						<div
@@ -179,17 +292,32 @@ export function ExtensionsTab(props: {
 								</div>
 							</div>
 							<div className="extensions-recommended-action" onClick={(e) => e.stopPropagation()}>
-								{installing ? (
-									<span className="config-btn" style={{ opacity: 0.6 }}>{t("config.installing")}</span>
-								) : (
-									<button
-										className="config-btn"
-										onClick={() => handleInstall(pkg)}
-										disabled={alreadyInstalled || installing}
-									>
-										{alreadyInstalled ? t("config.installed") : t("config.install")}
-									</button>
-								)}
+								{/* 安装中保持与图标按钮同尺寸，避免 config-btn 文本把操作区撑开错位 */}
+								<button
+									className="config-icon-btn"
+									title={installing ? t("config.installing") : alreadyInstalled ? t("config.installed") : t("config.install")}
+									onClick={() => handleInstall(pkg)}
+									disabled={alreadyInstalled || installing}
+									aria-busy={installing}
+								>
+									{installing ? (
+										<span className="skillhub-installing-dot" aria-hidden="true" />
+									) : (
+										<Download size={15} strokeWidth={1.8} aria-hidden="true" />
+									)}
+								</button>
+								<button
+									className="config-icon-btn"
+									title={t("common.copy")}
+									onClick={(e) => {
+										e.stopPropagation();
+										const cmd = `pi install ${pkg.installCmd}`;
+										writeClipboard(cmd);
+										showNotice(t("app.codeCopied"), 1200);
+									}}
+								>
+									<Copy size={14} strokeWidth={1.8} />
+								</button>
 							</div>
 						</div>
 					);
@@ -232,6 +360,10 @@ export function ExtensionsTab(props: {
 								extension={extension}
 								uninstalling={props.uninstallingSource === extension.source}
 								onUninstall={props.onUninstall}
+								onRemoveBuiltIn={handleRemoveBuiltIn}
+								onRestoreBuiltIn={handleRestoreBuiltIn}
+								removingBuiltIn={removingBuiltIn === extension.source}
+								restoringBuiltIn={restoringBuiltIn === extension.source}
 							/>
 						))
 					)}
@@ -245,11 +377,18 @@ function ExtensionCard(props: {
 	extension: PiExtensionSummary;
 	uninstalling: boolean;
 	onUninstall: (extension: PiExtensionSummary) => void;
+	onRemoveBuiltIn: (extension: PiExtensionSummary) => void;
+	onRestoreBuiltIn: (extension: PiExtensionSummary) => void;
+	removingBuiltIn?: boolean;
+	restoringBuiltIn?: boolean;
 }) {
 	const { extension } = props;
 	const name = extension.source.replace(/^(?:npm|file|github|git):/i, "");
 	return (
-		<article className="session-card skill-card extension-card">
+		<article
+			className={`session-card skill-card extension-card${props.uninstalling ? " extension-removing" : ""}`}
+			aria-busy={props.uninstalling}
+		>
 			<div className="session-card-display">
 				<div className="session-card-inner skill-card-main">
 					<div className="session-card-title skill-title-row">
@@ -258,6 +397,9 @@ function ExtensionCard(props: {
 							{extension.builtIn && (
 								<span className="skill-state enabled">{t("common.builtIn")}</span>
 							)}
+							<span className={`skill-state ${extension.enabled === false ? "disabled" : "enabled"}`}>
+								{extension.enabled !== false ? t("common.enabled") : t("common.disabled")}
+							</span>
 							<span className="skill-state enabled">
 								{extension.scope === "project"
 									? t("common.project")
@@ -278,17 +420,41 @@ function ExtensionCard(props: {
 					{extension.updateError && <small className="setting-status error">{extension.updateError}</small>}
 					{extension.path && <small>{extension.path}</small>}
 				</div>
-				{!extension.builtIn && (
-					<div className="session-card-actions skill-card-actions">
+				<div className="prompts-list-item-actions">
+					{/* 内置扩展：移除（禁止自动部署）或恢复 */}
+					{extension.builtIn && extension.enabled !== false && (
 						<button
-							className="session-rename-button danger"
+							className="config-icon-btn"
+							disabled={props.removingBuiltIn}
+							onClick={() => props.onRemoveBuiltIn(extension)}
+							title={props.removingBuiltIn ? t("config.uninstalling") : t("config.uninstall")}
+						>
+							<Trash2 size={14} strokeWidth={1.8} />
+						</button>
+					)}
+					{extension.builtIn && extension.enabled === false && (
+						<button
+							className="config-icon-btn"
+							style={{ color: "var(--color-accent)" }}
+							disabled={props.restoringBuiltIn}
+							onClick={() => props.onRestoreBuiltIn(extension)}
+							title={t("config.restoreBuiltIn")}
+						>
+							<RotateCcw size={14} strokeWidth={1.8} />
+						</button>
+					)}
+					{/* 三方扩展：卸载 */}
+					{!extension.builtIn && (
+						<button
+							className="config-icon-btn danger"
 							disabled={props.uninstalling}
 							onClick={() => props.onUninstall(extension)}
+							title={props.uninstalling ? t("config.uninstalling") : t("config.uninstall")}
 						>
-							{props.uninstalling ? t("config.uninstalling") : t("config.uninstall")}
+							<Trash2 size={14} strokeWidth={1.8} />
 						</button>
-					</div>
-				)}
+					)}
+				</div>
 			</div>
 		</article>
 	);

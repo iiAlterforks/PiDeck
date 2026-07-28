@@ -8,6 +8,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { X } from "lucide-react";
 import { ConfirmDialog } from "../components/app/AppParts";
+import { writeClipboard } from "../utils/clipboard";
 import type {
 	FeishuBotConfig,
 	FeishuBridgeStatus,
@@ -76,6 +77,10 @@ const EVENTS_JSON = `[
   "minutes.minute.generated_v1"
 ]`;
 
+const CALLBACKS_JSON = `[
+  "card.action.trigger"
+]`;
+
 type FeishuApiRaw = {
 	botsList?: () => Promise<FeishuBotConfig[]>;
 	statusRequest?: () => Promise<FeishuBridgeStatus>;
@@ -121,6 +126,7 @@ export function ImTab(_props: Props) {
 	const [guideOpen, setGuideOpen] = useState(false);
 	const [copiedScope, setCopiedScope] = useState(false);
 	const [copiedEvents, setCopiedEvents] = useState(false);
+	const [copiedCallbacks, setCopiedCallbacks] = useState(false);
 	const [copiedCredential, setCopiedCredential] = useState<string | null>(null);
 	const [revealedSecrets, setRevealedSecrets] = useState<Record<string, string>>({});
 	const [guideAnimating, setGuideAnimating] = useState(false);
@@ -128,11 +134,11 @@ export function ImTab(_props: Props) {
 
 	const api = (window as unknown as { piDesktop?: { feishu?: FeishuApiRaw } }).piDesktop?.feishu;
 
-	/** 使用主进程能力打开外部链接；比原生 <a target="_blank"> 更可靠，避免 Electron 内嵌窗口导航被拦截。 */
-	const openExternal = useCallback(async (url: string) => {
-		const appApi = (window as unknown as { piDesktop?: { app?: { openExternal: (u: string) => Promise<void> } } }).piDesktop?.app;
+	/** 使用主进程能力打开外部链接；force=true 强制系统浏览器（如飞书登录/指南页不适合内置浏览器）。 */
+	const openExternal = useCallback(async (url: string, forceSystem?: boolean) => {
+		const appApi = (window as unknown as { piDesktop?: { app?: { openExternal: (u: string, forceSystem?: boolean) => Promise<void> } } }).piDesktop?.app;
 		if (appApi?.openExternal) {
-			await appApi.openExternal(url);
+			await appApi.openExternal(url, forceSystem);
 		} else {
 			window.open(url, "_blank", "noopener,noreferrer");
 		}
@@ -253,7 +259,7 @@ export function ImTab(_props: Props) {
 	}, [api, loadData]);
 
 	const handleCopyValue = useCallback(async (key: string, value: string) => {
-		await navigator.clipboard.writeText(value);
+		await writeClipboard(value);
 		setCopiedCredential(key);
 		setTimeout(() => setCopiedCredential(null), 1600);
 	}, []);
@@ -334,7 +340,7 @@ export function ImTab(_props: Props) {
 						</button>
 						<button
 							className="config-btn"
-							onClick={() => openExternal("https://xid01i1952l.feishu.cn/wiki/Yf8Gw5QW3is7xdkuG98cvRVen5d?from=from_copylink")}
+							onClick={() => openExternal("https://xid01i1952l.feishu.cn/wiki/Yf8Gw5QW3is7xdkuG98cvRVen5d?from=from_copylink", true)}
 						>
 							{t("config.im.onlineGuide")}
 						</button>
@@ -668,7 +674,7 @@ export function ImTab(_props: Props) {
 							<p><strong>{t("config.im.guideMethodA")}</strong></p>
 							<p style={{ fontSize: "var(--font-size-micro)", color: "var(--color-text-tertiary)" }}>{t("config.im.guideMethodADesc")}</p>
 							<ol>
-								<li>{t("config.im.guideMethodAStep1a")}<br /><button className="config-link-like" onClick={() => openExternal("https://open.feishu.cn/app")}>https://open.feishu.cn/app</button> → {t("config.im.guideMethodAStep1b")}</li>
+								<li>{t("config.im.guideMethodAStep1a")}<br /><button className="config-link-like" onClick={() => openExternal("https://open.feishu.cn/app", true)}>https://open.feishu.cn/app</button> → {t("config.im.guideMethodAStep1b")}</li>
 								<li>{t("config.im.guideMethodAStep2")}</li>
 								<li>{t("config.im.guideMethodAStep3")}</li>
 								<li>{t("config.im.guideMethodAStep4")}</li>
@@ -678,7 +684,7 @@ export function ImTab(_props: Props) {
 							<p style={{ marginTop: 16 }}><strong>{t("config.im.guideMethodB")}</strong></p>
 							<p style={{ fontSize: "var(--font-size-micro)", color: "var(--color-text-tertiary)" }}>{t("config.im.guideMethodBDesc")}</p>
 							<ol>
-								<li>{t("config.im.guideMethodBStep1a")}<br /><button className="config-link-like" onClick={() => openExternal("https://open.feishu.cn/app")}>https://open.feishu.cn/app</button> → {t("config.im.guideMethodBStep1b")}</li>
+								<li>{t("config.im.guideMethodBStep1a")}<br /><button className="config-link-like" onClick={() => openExternal("https://open.feishu.cn/app", true)}>https://open.feishu.cn/app</button> → {t("config.im.guideMethodBStep1b")}</li>
 								<li>{t("config.im.guideMethodBStep2")}</li>
 								<li>{t("config.im.guideMethodBStep3")}<br />
 									<ul className="config-im-guide-perms">
@@ -703,15 +709,22 @@ export function ImTab(_props: Props) {
 							<p style={{ marginTop: 20, fontWeight: 600 }}>{t("config.im.guideScopeTitle")}</p>
 							<p style={{ fontSize: "var(--font-size-micro)", color: "var(--color-text-tertiary)" }}>{t("config.im.guideScopeDesc")}</p>
 							<pre className="config-im-code-block">{SCOPES_JSON}</pre>
-							<button className="config-btn small" onClick={() => { navigator.clipboard.writeText(SCOPES_JSON); setCopiedScope(true); setTimeout(() => setCopiedScope(false), 2000); }}>
+							<button className="config-btn small" onClick={() => { writeClipboard(SCOPES_JSON); setCopiedScope(true); setTimeout(() => setCopiedScope(false), 2000); }}>
 								{copiedScope ? t("common.copied") : t("common.copy")}
 							</button>
 
 							<p style={{ marginTop: 20, fontWeight: 600 }}>{t("config.im.guideEventsTitle")}</p>
 							<p style={{ fontSize: "var(--font-size-micro)", color: "var(--color-text-tertiary)" }}>{t("config.im.guideEventsDesc")}</p>
 							<pre className="config-im-code-block">{EVENTS_JSON}</pre>
-							<button className="config-btn small" onClick={() => { navigator.clipboard.writeText(EVENTS_JSON); setCopiedEvents(true); setTimeout(() => setCopiedEvents(false), 2000); }}>
+							<button className="config-btn small" onClick={() => { writeClipboard(EVENTS_JSON); setCopiedEvents(true); setTimeout(() => setCopiedEvents(false), 2000); }}>
 								{copiedEvents ? t("common.copied") : t("common.copy")}
+							</button>
+
+							<p style={{ marginTop: 20, fontWeight: 600 }}>{t("config.im.guideCallbacksTitle")}</p>
+							<p style={{ fontSize: "var(--font-size-micro)", color: "var(--color-text-tertiary)" }}>{t("config.im.guideCallbacksDesc")}</p>
+							<pre className="config-im-code-block">{CALLBACKS_JSON}</pre>
+							<button className="config-btn small" onClick={() => { writeClipboard(CALLBACKS_JSON); setCopiedCallbacks(true); setTimeout(() => setCopiedCallbacks(false), 2000); }}>
+								{copiedCallbacks ? t("common.copied") : t("common.copy")}
 							</button>
 						</div>
 					</div>

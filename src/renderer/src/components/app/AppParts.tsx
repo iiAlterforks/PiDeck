@@ -1,20 +1,52 @@
 import {
+	Fragment,
 	isValidElement,
 	memo,
+	useCallback,
 	useEffect,
 	useId,
+	useLayoutEffect,
+	useMemo,
 	useRef,
 	useState,
 	type CSSProperties,
 	type PointerEvent as ReactPointerEvent,
 	type ReactNode,
 } from "react";
-import { toPng } from "html-to-image";
+import { toBlob } from "html-to-image";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import "katex/dist/katex.min.css";
+import {
+	summarizeMessage,
+	type ToolGroupItem,
+	type MessageItem,
+	type ThinkingGroupItem,
+	type AgentRunItem,
+	type RenderMessage,
+	type ComposerSuggestionResult,
+	type ComposerTrigger,
+	type SuggestionItem,
+	groupToolMessages,
+	buildOutline,
+	detectTrigger,
+	applySuggestion,
+	clearSuggestionTrigger,
+	buildSuggestionItems,
+	mergeCommands,
+	matches,
+	displayPath,
+	flattenFiles,
+	parseToolArgs,
+	getToolFilePath,
+	countTextLines,
+	getToolEditDiff,
+	sameAgentRunForRender,
+	sameChatMessageForRender,
+} from "./AppUtils";
+import { getComposerEnterIntent } from "../../composerBehavior";
 
 // Mermaid 库体积数 MB，仅在真正出现 mermaid 代码块时才动态加载，
 // 避免随渲染进程常驻、放大内存占用并在流式期间抢占主线程。
@@ -24,17 +56,27 @@ function loadMermaid() {
 	return mermaidModulePromise;
 }
 import {
+	AlertTriangle,
+	Brush,
 	Check,
 	ChevronDown,
+	ChevronLeft,
 	ChevronRight,
+	ChevronsUpDown,
+	ChevronUp,
+	ClipboardList,
+	MoveDown,
+	MoveUp,
+	ChevronsDownUp,
 	GitBranch,
+	Bot,
 	Brain,
+	Eye,
 	FileText,
 	Folder,
 	Globe2,
 	MessageCircle,
 	Network,
-	Pencil,
 	PawPrint,
 	Pin,
 	Plus,
@@ -45,10 +87,24 @@ import {
 	UploadCloud,
 	Wrench,
 	X,
+	Star,
+	FolderOpen,
+	Copy,
+	Trash,
+	Share,
+	SquarePen,
+	Send,
+	UserPen,
 } from "lucide-react";
+import { getFileIconSeti, getFileIconColor, getFileTypeLabel } from "../../fileIcons";
+import { normalizeSessionPathForCompare } from "../../agentListDisplay";
 import { t, type TranslationKey } from "../../i18n";
+import { showNotice } from "../../utils/notice";
+import { writeClipboard } from "../../utils/clipboard";
+import { filePathFromHref, stripFileLocation, toInternalFileHref } from "../../utils/fileLinks";
 import { Button } from "../ui/Button";
 import { CloseIconButton, IconButton } from "../ui/IconButton";
+import { Modal } from "../ui/Modal";
 import { SelectField } from "../ui/SelectField";
 import { TextField } from "../ui/TextField";
 import type {
@@ -56,6 +112,7 @@ import type {
 	AgentTab,
 	AppInfo,
 	AppSettings,
+	ComposerAgentMode,
 	AvailableModel,
 	ChatMessage,
 	CodexImportReport,
@@ -70,16 +127,18 @@ import type {
 	PetManifest,
 	PiCliUpdateResult,
 	PiCommand,
+	PiInstallExecResult,
 	PiInstallStatus,
 	PiUpdateCheckResult,
 	Project,
 	SessionSummary,
 } from "../../../../shared/types";
 import { parseRichInputChips, type RichInputChip } from "./RichInput";
+import removeMarkdown from "remove-markdown";
 /** 复用 petdex 标准网格规格，在主设置面板里为宠物选择器渲染单格动画预览 */
 import { GRID_COLS, CELL_W, CELL_H, MODE_ROW, MODE_FRAMES } from "../../pet/PetSpriteSheet";
 
-export type DrawerPanel = "files" | "sessions";
+export type DrawerPanel = "files" | "sessions" | "browser" | "editor" | "git";
 
 export type SessionModifiedFile = {
 	path: string;
@@ -94,124 +153,14 @@ export type SessionModifiedFile = {
 
 type DiffFileHandler = (path: string, originalContent?: string, content?: string) => void;
 
-function countToolContentLines(value: unknown) {
-	if (typeof value !== "string" || !value) return 0;
-	return value.split(/\r\n|\r|\n/).length;
-}
 
-const FILE_PATH_KEYS = [
-	"filePath",
-	"file_path",
-	"path",
-	"targetPath",
-	"target_path",
-	"outputPath",
-	"output_path",
-	"file",
-	"fileName",
-	"filename",
-] as const;
 
-function getPathField(input: unknown) {
-	if (!input || typeof input !== "object") return undefined;
-	const record = input as Record<string, unknown>;
-	for (const key of FILE_PATH_KEYS) {
-		const value = record[key];
-		if (typeof value === "string" && value.trim()) return value;
-	}
-	return undefined;
-}
 
-function collectPathFields(input: unknown) {
-	const paths = new Set<string>();
-	const primary = getPathField(input);
-	if (primary) paths.add(primary);
-	const record = input && typeof input === "object" ? (input as Record<string, unknown>) : undefined;
-	const nestedLists = [record?.edits, record?.files, record?.paths, record?.items];
-	for (const list of nestedLists) {
-		if (!Array.isArray(list)) continue;
-		for (const item of list) {
-			if (typeof item === "string" && item.trim()) paths.add(item);
-			const nestedPath = getPathField(item);
-			if (nestedPath) paths.add(nestedPath);
-		}
-	}
-	return [...paths];
-}
 
-function editChangedLineCount(edit: any) {
-	const oldLines = countToolContentLines(edit?.oldText ?? edit?.old_text);
-	const newLines = countToolContentLines(edit?.newText ?? edit?.new_text);
-	return Math.max(oldLines, newLines);
-}
 
-function getToolChangedLineCountForPath(toolName: string, args: any, path: string) {
-	// 会话卡片只基于当前轮工具参数估算触达行数，不读取 Git 工作区，
-	// 避免提交后工作区清空导致历史会话修改摘要消失。
-	if (/edit|patch/i.test(toolName)) {
-		const edits = Array.isArray(args?.edits) ? args.edits : undefined;
-		if (edits) {
-			const pathScopedEdits = edits.filter((edit: any) => {
-				const editPath = getPathField(edit);
-				return !editPath || editPath === path;
-			});
-			return pathScopedEdits.reduce(
-				(total: number, edit: any) => total + editChangedLineCount(edit),
-				0,
-			);
-		}
-		return Math.max(
-			countToolContentLines(args?.oldText ?? args?.old_text),
-			countToolContentLines(args?.newText ?? args?.new_text),
-		);
-	}
-	if (/write|create/i.test(toolName)) {
-		return countToolContentLines(args?.content ?? args?.text ?? args?.data ?? args?.body);
-	}
-	return 0;
-}
 
-function isFileMutationTool(toolName: string) {
-	return /write|edit|create|patch/i.test(toolName);
-}
 
-function mergeModifiedFiles(
-	base: SessionModifiedFile[] | undefined,
-	fallback: SessionModifiedFile[],
-) {
-	const byPath = new Map<string, SessionModifiedFile>();
-	for (const file of fallback) byPath.set(file.path, file);
-	// 固化摘要通常包含运行结束时的准确累计结果；放到后面覆盖兜底结果。
-	for (const file of base ?? []) byPath.set(file.path, file);
-	return Array.from(byPath.values());
-}
 
-function collectModifiedFilesFromToolMessages(messages: ChatMessage[]) {
-	const byPath = new Map<string, SessionModifiedFile>();
-	for (const message of messages) {
-		const toolName = message.meta?.toolName;
-		if (typeof toolName !== "string" || !isFileMutationTool(toolName)) continue;
-		const args = message.meta?.args;
-		const filePaths = collectPathFields(args);
-		for (const filePath of filePaths) {
-			const previous = byPath.get(filePath);
-			if (previous) byPath.delete(filePath);
-			byPath.set(filePath, {
-				path: filePath,
-				toolName,
-				status: String(message.meta?.status ?? "done"),
-				changedLines:
-					(previous?.changedLines ?? 0) +
-					getToolChangedLineCountForPath(toolName, args, filePath),
-				originalContent:
-					previous?.originalContent ??
-					(message.meta?.originalContent as string | undefined) ??
-					"",
-			});
-		}
-	}
-	return Array.from(byPath.values());
-}
 
 export function EnvironmentDialog(props: {
 	status: PiInstallStatus | null;
@@ -227,12 +176,33 @@ export function EnvironmentDialog(props: {
 	customPathResult: PiInstallStatus | null;
 	onCustomPathChange: (path: string) => void;
 	onValidateCustomPath: () => void;
+	/** npm 可用性 */
+	npmAvailable: boolean | null;
+	npmVersion?: string;
+	npmChecking: boolean;
+	/** 当前安装命令文本 */
+	installCommand: string;
+	/** 是否使用国内镜像源 */
+	installUseMirror: boolean;
+	/** 是否正在执行安装 */
+	installExecuting: boolean;
+	/** 安装执行结果 */
+	installResult: PiInstallExecResult | null;
+	/** 安装是否已成功完成 */
+	installCompleted: boolean;
+	onCheckNpm: () => void;
+	onInstallCommandChange: (cmd: string) => void;
+	onToggleInstallMirror: () => void;
+	onExecInstall: () => void;
+	onRestartApp: () => void;
+	/** 重置 piEnvironmentChecked 标记，使下次启动重新触发环境检测 */
+	onClearCheckFlag?: () => void;
 }) {
 	const installed = props.status?.installed || props.customPathResult?.installed;
 	const searchedDirs = props.status?.searchedDirs.slice(0, 16) ?? [];
 	const errorText = props.status?.error ?? props.customPathResult?.error;
 	const steps = [
-		t("environment.stepCli"),
+		t("environment.stepInstall"),
 		t("environment.stepPath"),
 		t("environment.stepPermission"),
 		t("environment.stepDone"),
@@ -243,17 +213,13 @@ export function EnvironmentDialog(props: {
 	const refCmd = 'where pi';
 
 	return (
-		<div className="modal-backdrop environment-backdrop">
-			<section className="environment-modal">
-				<div className="modal-header">
-					<strong>{t("environment.title")}</strong>
-					<CloseIconButton
-						label={t("common.close")}
-						onClick={props.onClose}
-					/>
-				</div>
-
-				<div className="environment-body">
+		<Modal
+			open={true}
+			onClose={props.onClose}
+			title={t("environment.title")}
+			size="medium"
+		>
+			<div className="environment-body">
 					<div className="env-stepper" aria-label={t("environment.title")}>
 						{steps.map((step, index) => (
 							<div
@@ -307,16 +273,151 @@ export function EnvironmentDialog(props: {
 								</div>
 							)}
 
-							{/* 安装指引卡片 */}
-							<div className="env-card env-guide-card">
-								<strong>{t("environment.installTitle")}</strong>
-								<small>{t("environment.installDesc")}</small>
-								<button
-									className="env-card-btn"
-									onClick={props.onOpenInstallDocs}
-								>
-									{t("environment.openInstallDocs")}
-								</button>
+							{/* npm 安装 pi 卡片（合并了安装指引） */}
+							<div className="env-card env-npm-install-card">
+								<strong>{t("environment.installCardTitle")}</strong>
+								<small>{t("environment.installCardDesc")}</small>
+								<small>
+									{t("environment.installDesc")}{" "}
+									<a
+										className="env-inline-link"
+										href="#"
+										onClick={(e) => {
+											e.preventDefault();
+											props.onOpenInstallDocs();
+										}}
+									>
+										{t("environment.openInstallDocs")}
+									</a>
+								</small>
+
+								{/* npm 可用性检测 */}
+								{props.npmAvailable === null && !props.npmChecking && (
+									<button
+										className="env-card-btn"
+										onClick={props.onCheckNpm}
+									>
+										{t("environment.stepInstall")}
+									</button>
+								)}
+
+								{props.npmChecking && (
+									<div className="env-install-loading">
+										<div className="loader" />
+										<span>{t("environment.checking")}</span>
+									</div>
+								)}
+
+								{/* npm 可用时：显示安装命令和操作 */}
+								{props.npmAvailable === true && !props.npmChecking && (
+									<div className="env-install-area">
+										{props.npmVersion && (
+											<div className="env-install-npm-version">
+												npm {props.npmVersion}
+											</div>
+										)}
+										<div className="env-install-command-row">
+											<label className="env-install-command-label">
+												{t("environment.installCommandLabel")}
+											</label>
+											<input
+												type="text"
+												className="env-install-command-input"
+												value={props.installCommand}
+												onChange={(e) =>
+													props.onInstallCommandChange(e.target.value)
+												}
+												disabled={props.installExecuting}
+												placeholder="npm install -g @earendil-works/pi-coding-agent"
+											/>
+										</div>
+										<div className="env-install-actions">
+											<button
+												className={`env-card-btn env-mirror-btn ${props.installUseMirror ? "active" : ""}`}
+												onClick={props.onToggleInstallMirror}
+												disabled={props.installExecuting}
+												title={t("environment.installUseMirror")}
+											>
+												{props.installUseMirror
+													? t("environment.installRemoveMirror")
+													: t("environment.installUseMirror")}
+											</button>
+											<button
+												className="env-card-btn primary"
+												onClick={props.onExecInstall}
+												disabled={props.installExecuting || !props.installCommand.trim()}
+											>
+												{props.installExecuting
+													? t("environment.installExecuting")
+													: t("environment.installExec")}
+											</button>
+										</div>
+
+										{/* 安装进行中：显示进度 */}
+										{props.installExecuting && (
+											<div className="env-install-progress">
+												<div className="loader" />
+												<span>{t("environment.installExecuting")}</span>
+											</div>
+										)}
+
+										{/* 安装完成 */}
+										{props.installCompleted && (
+											<div className="env-install-success">
+												<div className="env-success-icon">✓</div>
+												<div className="env-success-info">
+													<strong>{t("environment.installSuccess")}</strong>
+													<small>{t("environment.installRestartHint")}</small>
+												</div>
+												<button
+													className="env-card-btn primary"
+													onClick={props.onRestartApp}
+												>
+													{t("environment.restartApp")}
+												</button>
+											</div>
+										)}
+
+										{/* 安装结果输出 */}
+										{props.installResult && (
+											<div className={`env-install-result ${props.installResult.success ? "success" : "error"}`}>
+												<strong>
+													{props.installResult.success
+														? t("environment.installCompleted")
+														: t("environment.installFailed")}
+													{t("environment.installExitCode")}：{props.installResult.exitCode}
+												</strong>
+												{props.installResult.stdout && (
+													<>
+														<span>{t("environment.installOutput")}</span>
+														<pre className="env-install-output-pre">{props.installResult.stdout}</pre>
+													</>
+												)}
+												{props.installResult.stderr && (
+													<pre className="env-install-output-pre env-install-stderr">{props.installResult.stderr}</pre>
+												)}
+											</div>
+										)}
+									</div>
+								)}
+
+								{/* npm 不可用：引导安装 Node.js */}
+								{props.npmAvailable === false && !props.npmChecking && (
+									<div className="env-install-npm-missing">
+										<strong>{t("environment.npmNotFoundTitle")}</strong>
+										<small>{t("environment.npmNotFoundDesc")}</small>
+										<button
+											className="env-card-btn"
+											onClick={() =>
+												window.piDesktop.app.openExternal(
+													"https://nodejs.org/zh-cn/download/"
+												)
+											}
+										>
+											{t("environment.openNodejsOrg")}
+										</button>
+									</div>
+								)}
 							</div>
 
 							{/* 手动输入 pi 路径卡片 */}
@@ -387,9 +488,17 @@ export function EnvironmentDialog(props: {
 					>
 						{t("environment.recheck")}
 					</button>
+					{props.onClearCheckFlag && (
+						<button
+							className="env-clear-flag-btn"
+							onClick={props.onClearCheckFlag}
+							title={t("environment.clearCheckFlagHint")}
+						>
+							{t("environment.clearCheckFlag")}
+						</button>
+					)}
 				</div>
-			</section>
-		</div>
+			</Modal>
 	);
 }
 
@@ -397,53 +506,509 @@ export function SessionStatus(props: {
 	state?: AgentRuntimeState;
 	duration?: number;
 }) {
-	if (!props.state) return null;
+	const state = props.state;
+	if (!state) return null;
 	return (
 		<div className="session-status">
-			<span className="model-chip">
-				{props.state.provider ? `${props.state.provider}/` : ""}{props.state.modelName ?? props.state.modelId ?? "model"}
-			</span>
-			<span className="think-chip">{t("app.think")}: {props.state.thinkingLevel ?? "-"}</span>
-			{props.state.contextPercent != null && (
+			{state.contextPercent != null && (
 				<span className="ctx-chip">
 					{t("app.ctx")}:{" "}
-					{props.state.contextPercent?.toFixed?.(1) ??
-						props.state.contextPercent}
-					% / {formatCompact(props.state.contextWindow)}
+					{state.contextPercent?.toFixed?.(1) ??
+						state.contextPercent}
+					% / {formatCompact(state.contextWindow)}
+					{state.inputTokens != null && (
+						<>{" "}↑ {formatCompact(state.inputTokens)}</>
+					)}
+					{state.outputTokens != null && (
+						<>{" "}↓ {formatCompact(state.outputTokens)}</>
+					)}
 				</span>
 			)}
-			{props.state.inputTokens != null && (
-				<span className="token-chip token-input">
-					↑ {formatCompact(props.state.inputTokens)}
-				</span>
-			)}
-			{props.state.outputTokens != null && (
-				<span className="token-chip token-output">
-					↓ {formatCompact(props.state.outputTokens)}
-				</span>
-			)}
-			{props.state.cacheHitPercent != null && (
+			{(state.cacheHitPercent != null || state.cacheTotal != null) && (
 				<span className="cache-chip">
-					{t("app.cacheHit")}: {props.state.cacheHitPercent?.toFixed?.(0) ?? props.state.cacheHitPercent}%
+					{state.cacheHitPercent != null && (
+						<>{t("app.cacheHit")}: {state.cacheHitPercent?.toFixed?.(0) ?? state.cacheHitPercent}%</>
+					)}
+					{state.cacheHitPercent != null && state.cacheTotal != null && " "}
+					{state.cacheTotal != null && (
+						<>{t("app.cache")}: {formatCompact(state.cacheTotal)}</>
+					)}
 				</span>
 			)}
-			{props.state.cacheTotal != null && (
-				<span className="cache-chip cache-total">{t("app.cache")}: {formatCompact(props.state.cacheTotal)}</span>
+			{state.cost != null && (
+				<span className="cost-chip" title={t("app.totalCost")}>
+					${state.cost.toFixed(3)}
+				</span>
 			)}
 		</div>
 	);
 }
 
+/** 单个 extension widget 卡片：可折叠标题栏 + 内容行，支持手动关闭 */
+// widgetKey 由扩展定义且跨重启稳定,可按 widgetKey 持久化折叠状态。
+const EXTENSION_WIDGET_COLLAPSED_KEY_PREFIX =
+	"pid:extension-widget-collapsed:";
+
+/** Todo / Plan 两个扩展各自 setWidget，桌面端合成一张任务卡时用此 key 做折叠持久化。 */
+export const MERGED_TASK_WIDGET_KEY = "pi-deck-task-board";
+export const TODO_WIDGET_KEY = "pi-deck-todo";
+export const PLAN_WIDGET_KEY = "pi-deck-plan-todos";
+
+export type ExtensionWidgetSection = {
+	/** 原始 widget key，关闭合并卡时用于逐个 dismiss */
+	key: string;
+	label: string;
+	lines: string[];
+};
+
+/** 渲染 widget 单行内容，将 ✓ 标记高亮为绿色，让 todo 等扩展的完成态更醒目。 */
+function renderWidgetLine(line: string): ReactNode {
+	const parts = line.split(/(✓)/g);
+	if (parts.length <= 1) return line;
+	return parts.map((part, i) =>
+		part === "✓" ? (
+			<span key={i} className="widget-check-done">
+				✓
+			</span>
+		) : (
+			part
+		),
+	);
+}
+
+export function ExtensionWidgetCard(props: {
+	widgetKey: string;
+	lines: string[];
+	onClose: () => void;
+	/** 会话唯一标识，用于避免 Todo 等同名 widget 在不同 agent 间共享折叠状态。 */
+	sessionIdOrPath?: string;
+	/**
+	 * 可选分区：Todo + Plan 合并成一张卡时，用分区标题区分来源，
+	 * 而不是并排两张卡。有 sections 时优先渲染分区，忽略顶层 lines。
+	 */
+	sections?: ExtensionWidgetSection[];
+	/** 合并卡标题旁的摘要，如 “TODO 3 · Plan 2” */
+	meta?: string;
+}) {
+	const storageKey = props.sessionIdOrPath
+		? `${EXTENSION_WIDGET_COLLAPSED_KEY_PREFIX}${props.sessionIdOrPath}:${props.widgetKey}`
+		: `${EXTENSION_WIDGET_COLLAPSED_KEY_PREFIX}${props.widgetKey}`;
+	// 将非人类可读的 widget key 映射为友好展示名
+	const widgetLabel =
+		({
+			[TODO_WIDGET_KEY]: t("app.widgetTodo"),
+			[PLAN_WIDGET_KEY]: t("app.widgetPlan"),
+			[MERGED_TASK_WIDGET_KEY]: t("app.widgetTodos"),
+		} as Record<string, string>)[props.widgetKey] ?? props.widgetKey;
+	const [expanded, setExpanded] = useState(() => {
+		if (typeof window === "undefined") return true;
+		const stored = localStorage.getItem(storageKey);
+		return stored !== null ? stored === "true" : true;
+	});
+	const prevStorageKeyRef = useRef(storageKey);
+
+	// 切换 agent/session 时只读取对应 key，不把上一 agent 的状态写到新 key。
+	useEffect(() => {
+		if (prevStorageKeyRef.current === storageKey) return;
+		prevStorageKeyRef.current = storageKey;
+		const stored = localStorage.getItem(storageKey);
+		setExpanded(stored !== null ? stored === "true" : true);
+	}, [storageKey]);
+
+	const handleToggleExpanded = useCallback(() => {
+		setExpanded((prev) => {
+			const next = !prev;
+			localStorage.setItem(storageKey, String(next));
+			return next;
+		});
+	}, [storageKey]);
+
+	const sections = props.sections?.filter((s) => s.lines.length > 0) ?? [];
+	const useSections = sections.length > 0;
+	// 多分区时用 Tab 切换；activeTabIndex 在当前渲染周期持久。
+	const [activeTabIndex, setActiveTabIndex] = useState(0);
+	const activeSection = sections[activeTabIndex];
+
+	return (
+		<div className="extension-widget-card" data-widget-key={props.widgetKey}>
+			<div className="extension-widget-card-header">
+				<button
+					className="extension-widget-card-trigger"
+					onClick={handleToggleExpanded}
+					aria-expanded={expanded}
+				>
+					<ChevronDown
+						size={14}
+						className={`extension-widget-card-chevron${expanded ? " open" : ""}`}
+					/>
+					<span className="extension-widget-card-title">{widgetLabel}</span>
+					{props.meta ? (
+						<span className="extension-widget-card-meta">{props.meta}</span>
+					) : null}
+				</button>
+				<button
+					className="extension-widget-card-close"
+					onClick={(e) => {
+						e.stopPropagation();
+						props.onClose();
+					}}
+					title={t("common.close")}
+					aria-label={t("common.close")}
+				>
+					<X size={12} strokeWidth={2} />
+				</button>
+			</div>
+			{expanded && (
+				<div className="extension-widget-card-content">
+					{/* 多分区：Tab 切换 */}
+					{useSections && sections.length > 1 && (
+						<div className="extension-widget-tabs" role="tablist">
+							{sections.map((section, i) => (
+								<button
+									key={section.key}
+									role="tab"
+									aria-selected={i === activeTabIndex}
+									className={`extension-widget-tab${i === activeTabIndex ? " active" : ""}`}
+									onClick={() => setActiveTabIndex(i)}
+								>
+									{section.label}
+								</button>
+							))}
+						</div>
+					)}
+					{/* 分区内容：多分区时只显示当前 tab，单分区直接展开 */}
+					{useSections && activeSection
+						? activeSection.lines.map((line, index) => (
+								<div
+									key={`${activeSection.key}-${index}`}
+									className="extension-widget-card-line"
+								>
+									{renderWidgetLine(line)}
+								</div>
+						  ))
+						: props.lines.map((line, index) => (
+								<div key={index} className="extension-widget-card-line">
+									{renderWidgetLine(line)}
+								</div>
+						  ))}
+				</div>
+			)}
+		</div>
+	);
+}
+
+// 记忆管理阈值
+const HUNGRY_THRESHOLD = 0.15;
+const ARCHIVE_THRESHOLD = 0.1;
+// 仅作为路径片段，实际拼接用 joinMemoryStorePath，兼容 Windows 反斜杠。
+const MEM_STORE_SEGMENTS = [".pi", "agent", "memory-store.json"] as const;
+
+const TYPE_LABEL_KEYS: Record<string, TranslationKey> = {
+	decision: "mem.type.decision",
+	convention: "mem.type.convention",
+	pattern: "mem.type.pattern",
+	preference: "mem.type.preference",
+	fact: "mem.type.fact",
+	lesson: "mem.type.lesson",
+};
+
+function joinMemoryStorePath(homeDir: string): string {
+	const sep = homeDir.includes("\\") ? "\\" : "/";
+	const base = homeDir.replace(/[\\/]+$/, "");
+	return [base, ...MEM_STORE_SEGMENTS].join(sep);
+}
+
+function potencyBadge(p: number): { icon: string; cls: string } {
+	if (p >= 0.8) return { icon: "🔥", cls: "mem-badge-high" };
+	if (p >= 0.4) return { icon: "⭐", cls: "mem-badge-mid" };
+	if (p > ARCHIVE_THRESHOLD) return { icon: "⚠️", cls: "mem-badge-low" };
+	return { icon: "📦", cls: "mem-badge-archived" };
+}
+
+function formatMemoryTime(ts: number | undefined): string {
+	if (!ts) return t("mem.time.never");
+	const days = Math.floor((Date.now() - ts) / 864e5);
+	if (days === 0) return t("mem.time.today");
+	if (days === 1) return t("mem.time.yesterday");
+	return t("mem.time.daysAgo", { days });
+}
+
+function memoryTypeLabel(type: string): string {
+	const key = TYPE_LABEL_KEYS[type];
+	return key ? t(key) : "";
+}
+
+interface MemoryItem {
+	id: string;
+	type: string;
+	content: string;
+	potency: number;
+	tenured?: boolean;
+	lastInjectedAt?: number;
+}
+
+interface MemoryStore {
+	memories: MemoryItem[];
+}
+
+/**
+ * MemSpacedCard — 记忆管理卡片
+ *
+ * 直接从 ~/.pi/agent/memory-store.json 读取记忆数据，展示概览统计、低效记忆和全部记忆列表。
+ * 支持手动刷新、AI 整理记忆库入口。
+ */
+export const MemSpacedCard = memo(function MemSpacedCard(props: {
+	widgetKey: string;
+	lines: string[];
+	homeDir: string;
+	agentId?: string;
+	onClose: () => void;
+}) {
+	const [expanded, setExpanded] = useState(false);
+	const [view, setView] = useState<"summary" | "low-potency" | "all">("summary");
+	const [data, setData] = useState<MemoryStore | null>(null);
+	const [loading, setLoading] = useState(false);
+	const [error, setError] = useState("");
+
+	const storePath = props.homeDir ? joinMemoryStorePath(props.homeDir) : "";
+
+	const loadData = useCallback(async () => {
+		if (!storePath) return;
+		setLoading(true);
+		try {
+			const raw = await window.piDesktop.files.readContent(storePath);
+			if (!raw || raw.trim() === "") {
+				setData(null);
+				return;
+			}
+			setData(JSON.parse(raw));
+			setError("");
+		} catch (e) {
+			const err = e as { code?: string };
+			if (err?.code !== "ENOENT") {
+				setError(t("mem.card.loadFailed"));
+			}
+		} finally {
+			setLoading(false);
+		}
+	}, [storePath]);
+
+	useEffect(() => {
+		loadData();
+	}, [loadData]);
+
+	// 当 lines 变化时（扩展推送新数据）自动重新加载
+	useEffect(() => {
+		loadData();
+	}, [props.lines, loadData]);
+
+	const activeCount = data?.memories.filter((m) => m.potency >= ARCHIVE_THRESHOLD).length ?? 0;
+	const hungryMemories = data?.memories.filter(
+		(m) => m.potency < HUNGRY_THRESHOLD && m.potency >= ARCHIVE_THRESHOLD,
+	) ?? [];
+	const hungryCount = hungryMemories.length;
+	const tenuredCount = data?.memories.filter((m) => m.tenured).length ?? 0;
+
+	return (
+		<div className="mem-spaced-card">
+			<div className="mem-spaced-card-header">
+				<button
+					className="mem-spaced-card-trigger"
+					onClick={() => setExpanded((prev) => !prev)}
+					aria-expanded={expanded}
+				>
+					<ChevronDown
+						size={14}
+						className={`mem-spaced-card-chevron${expanded ? " open" : ""}`}
+					/>
+					<span className="mem-spaced-card-title">{props.widgetKey}</span>
+					<span className="mem-spaced-card-status">
+						<Brain size={12} />
+						{loading ? "..." : t("mem.card.activeCount", { count: activeCount })}
+					</span>
+				</button>
+				<button
+					className="mem-spaced-card-close"
+					onClick={props.onClose}
+					title={t("mem.card.close")}
+					aria-label={t("mem.card.close")}
+				>
+					<X size={12} strokeWidth={2} />
+				</button>
+			</div>
+			{expanded && !loading && data && (
+				<div className="mem-spaced-card-content">
+					<div className="mem-spaced-card-tabs">
+						<button
+							className={`mem-spaced-card-tab${view === "summary" ? " active" : ""}`}
+							onClick={() => setView("summary")}
+						>
+							{t("mem.card.tabSummary")}
+						</button>
+						<button
+							className={`mem-spaced-card-tab${view === "low-potency" ? " active" : ""}`}
+							onClick={() => setView("low-potency")}
+						>
+							{hungryCount > 0
+								? t("mem.card.tabLowPotencyWithCount", { count: hungryCount })
+								: t("mem.card.tabLowPotency")}
+						</button>
+						<button
+							className={`mem-spaced-card-tab${view === "all" ? " active" : ""}`}
+							onClick={() => setView("all")}
+						>
+							{t("mem.card.tabAll")}
+						</button>
+					</div>
+					{view === "summary" && (
+						<div className="mem-spaced-card-summary">
+							<div className="mem-spaced-card-stat">
+								<span>{t("mem.card.statTotal")}</span>
+								<span>{data.memories.length}</span>
+							</div>
+							<div className="mem-spaced-card-stat">
+								<span>{t("mem.card.statActive")}</span>
+								<span>{activeCount}</span>
+							</div>
+							<div className="mem-spaced-card-stat">
+								<span>{t("mem.card.statLow")}</span>
+								<span className={hungryCount > 0 ? "mem-hungry" : ""}>{hungryCount}</span>
+							</div>
+							<div className="mem-spaced-card-stat">
+								<span>{t("mem.card.statTenured")}</span>
+								<span>{tenuredCount}</span>
+							</div>
+						</div>
+					)}
+					{view === "low-potency" && (
+						<div className="mem-spaced-card-list">
+							{hungryMemories.length === 0 ? (
+								<div className="mem-spaced-card-empty">{t("mem.card.emptyLow")}</div>
+							) : (
+								<div className="mem-card-scroll">
+									{hungryMemories.slice(0, 15).map((m) => {
+										const badge = potencyBadge(m.potency);
+										return (
+											<div key={m.id} className="mem-spaced-card-item">
+												<span className={`mem-badge ${badge.cls}`}>{badge.icon}</span>
+												<span className="mem-item-content">
+													{m.content.slice(0, 60)}
+													{m.content.length > 60 ? "…" : ""}
+												</span>
+												<span className="mem-item-meta">
+													{memoryTypeLabel(m.type)}
+													{" p:"}
+													{m.potency.toFixed(2)}
+													{" "}
+													{formatMemoryTime(m.lastInjectedAt)}
+												</span>
+											</div>
+										);
+									})}
+								</div>
+							)}
+						</div>
+					)}
+					{view === "all" && (
+						<div className="mem-spaced-card-list">
+							{data.memories.length === 0 ? (
+								<div className="mem-spaced-card-empty">{t("mem.card.emptyAll")}</div>
+							) : (
+								<div className="mem-card-scroll">
+									{[...data.memories].sort((a, b) => b.potency - a.potency).slice(0, 50).map((m) => {
+										const badge = potencyBadge(m.potency);
+										const pct = Math.round(m.potency * 100);
+										const typeLabel = memoryTypeLabel(m.type);
+										return (
+											<div key={m.id} className="mem-spaced-card-item mem-all-item">
+												<span className={`mem-badge ${badge.cls}`}>{badge.icon}</span>
+												<div className="mem-all-body">
+													<span className="mem-item-content">
+														{m.content.slice(0, 70)}
+														{m.content.length > 70 ? "..." : ""}
+													</span>
+													<div className="mem-all-bar-wrap">
+														<div className="mem-all-bar" style={{ width: `${pct}%` }} />
+													</div>
+												</div>
+												<span className="mem-item-meta">
+													{typeLabel.slice(0, 2)}
+													{" "}
+													{pct}%
+												</span>
+											</div>
+										);
+									})}
+								</div>
+							)}
+						</div>
+					)}
+					<div className="mem-spaced-card-footer">
+						<div className="mem-footer-left">
+							{props.agentId && (
+								<button
+									className="mem-org-btn"
+									title={t("mem.card.organizeTitle")}
+									onClick={() => {
+										window.piDesktop.agents.prompt({
+											agentId: props.agentId!,
+											message: t("mem.card.organizePrompt"),
+											description: t("mem.card.organizeDescription"),
+										});
+									}}
+								>
+									<Bot size={14} />
+									<span>{t("mem.card.organize")}</span>
+								</button>
+							)}
+						</div>
+						<div className="mem-footer-right">
+							<span className="mem-spaced-card-count">{t("mem.card.countItems", { count: activeCount })}</span>
+							<button
+								className="mem-refresh-btn"
+								title={t("mem.card.refreshTitle")}
+								onClick={loadData}
+							>
+								<RefreshCw size={13} />
+							</button>
+						</div>
+					</div>
+				</div>
+			)}
+			{expanded && loading && (
+				<div className="mem-spaced-card-content">
+					<div className="mem-spaced-card-empty">{t("mem.card.loading")}</div>
+				</div>
+			)}
+			{expanded && error && (
+				<div className="mem-spaced-card-content">
+					<div className="mem-spaced-card-empty mem-error">{error}</div>
+				</div>
+			)}
+		</div>
+	);
+});
+
 export function ComposerToolbar(props: {
 	state?: AgentRuntimeState;
 	compacting: boolean;
 	disabled?: boolean;
-	onCycleModel: () => void;
 	onPickModel: () => void;
+	onPickPromptTemplate: () => void;
 	onPickThinking: () => void;
 	onCompact: () => void;
+	/** 当前发送模式，用于按钮文字和轻高亮 */
+	composerAgentMode?: ComposerAgentMode;
+	onOpenComposerModePicker?: () => void;
+	/** 取消计划模式：直接切回普通发送模式，不经过模式选择器 */
+	onCancelPlan?: () => void;
 	/** 在思考按钮后插入的额外指示器（如飞书链接状态） */
 	feishuIndicator?: ReactNode;
+	/** 会话文件路径卡片,渲染在思考按钮之后、feishuIndicator 之后 */
+	pathIndicator?: ReactNode;
+	/** 文件引用按钮回调 */
+	onAttachFile?: () => void;
+
 }) {
 	const ctxPercent = props.state?.contextPercent;
 	const showCompact = ctxPercent != null && ctxPercent > 30;
@@ -453,18 +1018,59 @@ export function ComposerToolbar(props: {
 		? THINKING_LEVELS.find((level) => level.value === currentThinkingLevel)?.labelKey
 		: undefined;
 	const thinkingDisplay = thinkingLevelLabel ? t(thinkingLevelLabel) : "-";
+
+	// mode 选择器：和模型/思考面板保持一致，默认普通。
+	const activeMode = props.composerAgentMode ?? "normal";
+	const activeModeLabel = activeMode === "plan" ? t("app.composerModePlan") : t("app.composerModeNormal");
+
 	return (
 		<div className="composer-toolbar">
+			{props.onOpenComposerModePicker && (
+				<button
+					className={activeMode === "plan" ? "composer-mode-active" : ""}
+					disabled={props.disabled}
+					onClick={props.onOpenComposerModePicker}
+					title={t("app.composerModeTitle")}
+				>
+					{activeModeLabel}
+				</button>
+			)}
+			{activeMode === "plan" && props.onCancelPlan && (
+				<button
+					className="composer-mode-cancel"
+					disabled={props.disabled}
+					onClick={props.onCancelPlan}
+					title={t("app.composerModeCancelPlan")}
+				>
+					<X size={14} strokeWidth={2.5} aria-hidden="true" />
+					{t("app.composerModeCancelPlan")}
+				</button>
+			)}
 			<button onClick={props.onPickModel} disabled={props.disabled}>
 				{t("app.model")}: {props.state?.provider ? `${props.state.provider}/` : ""}{props.state?.modelName ?? "-"}
 			</button>
-			<button onClick={props.onCycleModel} disabled={props.disabled}>
-				{t("app.cycleModel")}
+			<button
+				onClick={props.onPickPromptTemplate}
+				disabled={props.disabled}
+				title={t("app.promptTemplatePickerTitle")}
+			>
+				{t("app.promptTemplatePickerTitle")}
 			</button>
 			<button onClick={props.onPickThinking} disabled={props.disabled}>
 				{t("app.think")}: {thinkingDisplay}
 			</button>
+			{props.onAttachFile && (
+				<button
+					onClick={props.onAttachFile}
+					disabled={props.disabled}
+					title={t("app.attachFileDesc")}
+				>
+					{t("app.attachFile")}
+				</button>
+			)}
 			{props.feishuIndicator}
+			{props.pathIndicator}
+
 			{showCompact && (
 				<button
 					className={
@@ -494,13 +1100,21 @@ export function ModelPicker(props: {
 	current?: { provider?: string; modelId?: string; modelName?: string };
 	onClose: () => void;
 	onPick: (model: AvailableModel) => void;
+	/** 收藏的模型 ID 列表（格式：provider/modelId），收藏的模型独立置顶显示但仍保留在原供应商分组 */
+	favoriteModels: string[];
+	/** 切换收藏状态 */
+	onToggleFavorite: (provider: string, modelId: string) => void;
 }) {
 	const [modelPickerSearch, setModelPickerSearch] = useState("");
 	const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
 	const normalizedSearch = modelPickerSearch.trim().toLowerCase();
+	const selectedItemRef = useRef<HTMLButtonElement | null>(null);
+	const modelPickerListRef = useRef<HTMLDivElement | null>(null);
 	const currentModelKey = props.current?.provider && props.current?.modelId
 		? `${props.current.provider}/${props.current.modelId}`
 		: undefined;
+	const favoritesSet = new Set(props.favoriteModels ?? []);
+
 	// 搜索同时覆盖模型展示名、模型 id 和 provider,避免用户只记得任一字段时找不到模型。
 	const filteredModels = normalizedSearch
 		? props.models.filter((model) =>
@@ -516,8 +1130,19 @@ export function ModelPicker(props: {
 					),
 			)
 		: props.models;
-	
-	// 按供应商分组
+
+	// 收藏列表（从全部模型中提取，不移除原供应商分组下的显示）
+	const favorites: AvailableModel[] = filteredModels.filter((model) =>
+		favoritesSet.has(`${model.provider}/${model.id}`),
+	);
+	favorites.sort((a, b) => {
+		const ap = a.provider ?? '';
+		const bp = b.provider ?? '';
+		if (ap !== bp) return ap.localeCompare(bp);
+		return (a.name ?? a.id).localeCompare(b.name ?? b.id);
+	});
+
+	// 全量模型按供应商分组（收藏模型也保留在原分组）
 	const groupedModels = filteredModels.reduce<Record<string, AvailableModel[]>>((groups, model) => {
 		const provider = model.provider || 'other';
 		if (!groups[provider]) {
@@ -526,7 +1151,13 @@ export function ModelPicker(props: {
 		groups[provider].push(model);
 		return groups;
 	}, {});
-	
+	// 每个分组按展示名排序
+	for (const provider of Object.keys(groupedModels)) {
+		groupedModels[provider].sort((a, b) =>
+			(a.name ?? a.id).localeCompare(b.name ?? b.id),
+		);
+	}
+
 	// 供应商排序：常见的放前面
 	const providerOrder = ['anthropic', 'openai', 'google', 'deepseek', 'other'];
 	const sortedProviders = Object.keys(groupedModels).sort((a, b) => {
@@ -537,7 +1168,52 @@ export function ModelPicker(props: {
 		if (bIndex !== -1) return 1;
 		return a.localeCompare(b);
 	});
-	
+	const providerGroupKeys = favorites.length > 0
+		? ['__favorites__', ...sortedProviders]
+		: sortedProviders;
+	const allProviderGroupsCollapsed =
+		providerGroupKeys.length > 0 && providerGroupKeys.every((groupKey) => collapsedGroups.has(groupKey));
+
+	const renderModelRow = (model: AvailableModel) => {
+		const modelKey = `${model.provider}/${model.id}`;
+		const selected = modelKey === currentModelKey;
+		const favorited = favoritesSet.has(modelKey);
+		return (
+			<button
+				ref={selected ? selectedItemRef : undefined}
+				key={modelKey}
+				className={`picker-palette-item${selected ? " selected" : ""}`}
+				onClick={() => props.onPick(model)}
+			>
+				{/* 收藏/取消收藏按钮：填充星为收藏，空心为未收藏 */}
+				<span
+					className={`model-favorite-star${favorited ? ' favorited' : ''}`}
+					title={favorited ? t("app.modelUnfavorite") : t("app.modelFavorite")}
+					onClick={(e) => {
+						e.stopPropagation();
+						props.onToggleFavorite(model.provider, model.id);
+					}}
+				>
+					<Star size={14} strokeWidth={1.8} fill={favorited ? 'currentColor' : 'none'} />
+				</span>
+				<span className="picker-palette-label">{model.name ?? model.id}</span>
+				<span className="picker-palette-desc">
+					{model.provider}/{model.id}
+				</span>
+				{selected && <span className="picker-palette-check">✓</span>}
+			</button>
+		);
+	};
+
+	// 打开选模型弹框时，自动滚动到当前选中的模型行，避免用户从头翻找。
+	useEffect(() => {
+		if (!selectedItemRef.current) return;
+		// 在布局完成后再滚动，确保列表已渲染且尺寸稳定。
+		requestAnimationFrame(() => {
+			selectedItemRef.current?.scrollIntoView({ block: "center", inline: "nearest" });
+		});
+	}, [currentModelKey, normalizedSearch]);
+
 	return (
 		<div className="picker-backdrop" onClick={props.onClose}>
 			<div
@@ -555,60 +1231,125 @@ export function ModelPicker(props: {
 					</IconButton>
 				</div>
 				<div className="picker-palette-search">
-					<input
-						autoFocus
-						value={modelPickerSearch}
-						onChange={(event) => setModelPickerSearch(event.target.value)}
-						placeholder={t("app.modelPickerSearch")}
-					/>
-				</div>
-				<div className="picker-palette-list">
-					{sortedProviders.length > 0 ? (
-						sortedProviders.map((provider) => (
-							<div key={provider} className="model-group">
-								<div
-									className={`model-group-header${collapsedGroups.has(provider) ? ' collapsed' : ''}`}
+					<div className="picker-palette-search-row">
+						<input
+							autoFocus
+							value={modelPickerSearch}
+							onChange={(event) => setModelPickerSearch(event.target.value)}
+							placeholder={t("app.modelPickerSearch")}
+							className={providerGroupKeys.length > 0 ? "has-actions" : undefined}
+						/>
+						{providerGroupKeys.length > 0 && (
+							<div className="picker-palette-actions">
+								<IconButton
+									className="picker-palette-action-icon"
+									label={t("app.modelCollapseAllProviders")}
+									title={t("app.modelCollapseAllProviders")}
 									onClick={() => {
-										setCollapsedGroups(prev => {
+										// 一键折叠当前结果里的所有 provider 分组，适合像 IDE 一样快速收拢长列表。
+										setCollapsedGroups((prev) => {
 											const next = new Set(prev);
-											if (next.has(provider)) next.delete(provider);
-											else next.add(provider);
+											for (const groupKey of providerGroupKeys) next.add(groupKey);
 											return next;
 										});
 									}}
+									disabled={allProviderGroupsCollapsed}
 								>
-									{provider}
-									<span className="model-group-count">{groupedModels[provider].length}</span>
-								</div>
-								{!collapsedGroups.has(provider) && groupedModels[provider].map((model) => {
-									const modelKey = `${model.provider}/${model.id}`;
-									const selected = modelKey === currentModelKey;
-									return (
-										<button
-											key={modelKey}
-											className={`picker-palette-item${selected ? " selected" : ""}`}
-											onClick={() => props.onPick(model)}
-										>
-											<span className="picker-palette-label">{model.name ?? model.id}</span>
-											<span className="picker-palette-desc">
-												{model.provider}/{model.id}
-											</span>
-											{selected && <span className="picker-palette-check">✓</span>}
-										</button>
-									);
-								})}
+									<ChevronsDownUp size={13} strokeWidth={2} aria-hidden="true" />
+								</IconButton>
+								<IconButton
+									className="picker-palette-action-icon"
+									label={t("app.modelExpandAllProviders")}
+									title={t("app.modelExpandAllProviders")}
+									onClick={() => {
+										// 展开当前结果里的所有 provider 分组，避免用户折叠后还要逐个恢复。
+										setCollapsedGroups((prev) => {
+											const next = new Set(prev);
+											for (const groupKey of providerGroupKeys) next.delete(groupKey);
+											return next;
+										});
+									}}
+									disabled={!allProviderGroupsCollapsed}
+								>
+									<ChevronsUpDown size={13} strokeWidth={2} aria-hidden="true" />
+								</IconButton>
 							</div>
-						))
-					) : (
+						)}
+					</div>
+				</div>
+				<div className="picker-palette-list" ref={modelPickerListRef}>
+					<button
+						type="button"
+						className="picker-palette-scroll-btn picker-palette-scroll-top"
+						title={t("app.modelScrollToTop")}
+						onClick={() => modelPickerListRef.current?.scrollTo({ top: 0, behavior: "smooth" })}
+					>
+						<MoveUp size={14} strokeWidth={1.8} aria-hidden="true" />
+					</button>
+					{/* 收藏分区：置于最顶部，可折叠 */}
+					{favorites.length > 0 && (
+						<div className="model-group model-favorites-group">
+							<div
+								className={`model-group-header${collapsedGroups.has('__favorites__') ? ' collapsed' : ''}`}
+								onClick={() => {
+									setCollapsedGroups(prev => {
+										const next = new Set(prev);
+										if (next.has('__favorites__')) next.delete('__favorites__');
+										else next.add('__favorites__');
+										return next;
+									});
+								}}
+							>
+								<span className={`model-favorites-arrow${collapsedGroups.has('__favorites__') ? ' collapsed' : ''}`}>
+									<Star size={14} strokeWidth={1.8} fill='currentColor' />
+								</span>
+								{t("app.modelFavorites")}
+								<span className="model-group-count">{favorites.length}</span>
+							</div>
+							{!collapsedGroups.has('__favorites__') && favorites.map(renderModelRow)}
+						</div>
+					)}
+					{/* 其余模型按供应商分组 */}
+					{sortedProviders.map((provider) => (
+						<div key={provider} className="model-group">
+							<div
+								className={`model-group-header${collapsedGroups.has(provider) ? ' collapsed' : ''}`}
+								onClick={() => {
+									setCollapsedGroups(prev => {
+										const next = new Set(prev);
+										if (next.has(provider)) next.delete(provider);
+										else next.add(provider);
+										return next;
+									});
+								}}
+							>
+								{provider}
+								<span className="model-group-count">{groupedModels[provider].length}</span>
+							</div>
+							{!collapsedGroups.has(provider) && groupedModels[provider].map(renderModelRow)}
+						</div>
+					))}
+					{favorites.length === 0 && sortedProviders.length === 0 && (
 						<div className="picker-palette-empty">{t("app.modelPickerEmpty")}</div>
 					)}
+					<button
+						type="button"
+						className="picker-palette-scroll-btn picker-palette-scroll-bottom"
+						title={t("app.modelScrollToBottom")}
+						onClick={() => {
+							const el = modelPickerListRef.current;
+							if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+						}}
+					>
+						<MoveDown size={14} strokeWidth={1.8} aria-hidden="true" />
+					</button>
 				</div>
 			</div>
 		</div>
 	);
 }
 
-const THINKING_LEVELS = [
+export const THINKING_LEVELS = [
 	{ value: "off", labelKey: "thinking.levelLabel.off", descriptionKey: "thinking.level.off" },
 	// minimal 是 pi/Codex reasoning 的最轻量档位,放在 Off 与 Low 之间便于按强度递增选择。
 	{ value: "minimal", labelKey: "thinking.levelLabel.minimal", descriptionKey: "thinking.level.minimal" },
@@ -617,7 +1358,66 @@ const THINKING_LEVELS = [
 	{ value: "high", labelKey: "thinking.levelLabel.high", descriptionKey: "thinking.level.high" },
 	// xhigh 只在部分模型上可用;选择后以前端收到的 runtime state 为准,必要时提示用户已被回退。
 	{ value: "xhigh", labelKey: "thinking.levelLabel.xhigh", descriptionKey: "thinking.level.xhigh" },
+	// max 是最高推理深度,需要模型支持;适合极端复杂的任务。
+	{ value: "max", labelKey: "thinking.levelLabel.max", descriptionKey: "thinking.level.max" },
 ] satisfies Array<{ value: string; labelKey: TranslationKey; descriptionKey: TranslationKey }>;
+
+export function ComposerModePicker(props: {
+	currentMode: ComposerAgentMode;
+	onClose: () => void;
+	onPick: (mode: ComposerAgentMode) => void;
+}) {
+	const items = [
+		{
+			value: "normal" as const,
+			labelKey: "app.composerModeNormal" as const,
+			descriptionKey: "app.composerModeNormalDesc" as const,
+		},
+		{
+			value: "plan" as const,
+			labelKey: "app.composerModePlan" as const,
+			descriptionKey: "app.composerModePlanDesc" as const,
+		},
+	];
+
+	return (
+		<div className="picker-backdrop" onClick={props.onClose}>
+			<div
+				className="picker-palette composer-mode-picker"
+				onClick={(event) => event.stopPropagation()}
+			>
+				<div className="picker-palette-header">
+					<div className="thinking-picker-header-content">
+						<span>{t("app.composerModeTitle")}</span>
+					</div>
+					<IconButton
+						className="picker-palette-close"
+						label={t("common.close")}
+						onClick={props.onClose}
+					>
+						<X size={16} strokeWidth={2.2} aria-hidden="true" />
+					</IconButton>
+				</div>
+				<div className="picker-palette-list">
+					{items.map((item) => {
+						const selected = item.value === props.currentMode;
+						return (
+							<button
+								key={item.value}
+								className={`picker-palette-item${selected ? " selected" : ""}`}
+								onClick={() => props.onPick(item.value)}
+							>
+								<span className="picker-palette-label">{t(item.labelKey)}</span>
+								<span className="picker-palette-desc">{t(item.descriptionKey)}</span>
+								{selected && <span className="picker-palette-check">✓</span>}
+							</button>
+						);
+					})}
+				</div>
+			</div>
+		</div>
+	);
+}
 
 export function ThinkingPicker(props: {
 	current?: string;
@@ -666,6 +1466,135 @@ export function ThinkingPicker(props: {
 	);
 }
 
+/**
+ * Prompt Template 选择器：列出 ~/.pi/agent/prompts/ 下所有 .md 模板，
+ * 点击后将模板内容插入到 composer 输入框。
+ */
+export function PromptTemplatePicker(props: {
+	templates: Array<{
+		name: string;
+		path: string;
+		description: string;
+		content: string;
+		scope?: "global" | "project";
+		argumentHint?: string;
+	}>;
+	onClose: () => void;
+	onPick: (template: {
+		name: string;
+		path: string;
+		description: string;
+		content: string;
+		scope?: "global" | "project";
+		argumentHint?: string;
+	}) => void;
+}) {
+	type TemplateItem = typeof props.templates[number];
+	const [search, setSearch] = useState("");
+	const [previewTemplate, setPreviewTemplate] = useState<TemplateItem | null>(null);
+	const normalizedSearch = search.trim().toLowerCase();
+	const filtered: TemplateItem[] = normalizedSearch
+		? props.templates.filter(
+				(t: TemplateItem) =>
+					t.name.toLowerCase().includes(normalizedSearch) ||
+					t.description.toLowerCase().includes(normalizedSearch),
+			)
+		: props.templates;
+
+	const templateList = filtered.map((template) => (
+		<div
+			key={template.path}
+			className="picker-palette-item-wrap"
+		>
+			<button
+				className="picker-palette-item"
+				onClick={() => props.onPick(template)}
+			>
+				<FileText size={14} strokeWidth={1.8} aria-hidden="true" />
+				<span className="picker-palette-label">/{template.name}</span>
+				{template.argumentHint && (
+					<code className="picker-palette-arg-hint">{template.argumentHint}</code>
+				)}
+				<span className="picker-palette-desc">{template.description}</span>
+			</button>
+			<button
+				className="picker-palette-preview-btn"
+				title={t("common.preview")}
+				onClick={(e) => {
+					e.stopPropagation();
+					setPreviewTemplate(
+						previewTemplate?.path === template.path ? null : template,
+					);
+				}}
+			>
+				<Eye size={14} strokeWidth={1.8} />
+			</button>
+		</div>
+	));
+
+	const emptyState = filtered.length === 0 && (
+		<div className="picker-palette-empty">
+			{search
+				? t("app.promptTemplateSearchEmpty")
+				: t("app.promptTemplateEmpty")}
+		</div>
+	);
+
+	return (
+		<div className="picker-backdrop" onClick={props.onClose}>
+			<div
+				className="picker-palette prompt-template-picker"
+				onClick={(event) => event.stopPropagation()}
+			>
+				<div className="picker-palette-header">
+					{previewTemplate ? (
+						<>
+							<button
+								className="picker-preview-back-btn"
+								onClick={() => setPreviewTemplate(null)}
+								title={t("app.promptTemplateBackToPicker")}
+							>
+								<ChevronLeft size={16} strokeWidth={2.2} />
+							</button>
+							<span>{t("app.promptTemplatePreviewTitle", { name: "/" + previewTemplate.name })}</span>
+						</>
+					) : (
+						<span>{t("app.promptTemplatePickerTitle")}</span>
+					)}
+					<IconButton
+						className="picker-palette-close"
+						label={t("common.close")}
+						onClick={props.onClose}
+					>
+						<X size={16} strokeWidth={2.2} aria-hidden="true" />
+					</IconButton>
+				</div>
+				{!previewTemplate && (
+					<div className="picker-palette-search">
+						<input
+							autoFocus
+							value={search}
+							onChange={(e) => setSearch(e.target.value)}
+							placeholder={t("app.promptTemplateSearchPlaceholder")}
+						/>
+					</div>
+				)}
+				{previewTemplate ? (
+					<div className="picker-preview-inline">
+						<pre className="picker-preview-content">{previewTemplate.content}</pre>
+					</div>
+				) : (
+					<div className="picker-palette-list">
+						{templateList}
+						{emptyState}
+					</div>
+				)}
+				{/* 旧的弹框预览已移除，改为内联显示 */}
+			</div>
+		</div>
+	);
+}
+
 function formatCompact(value?: number | null) {
 	if (value == null) return "-";
 	if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
@@ -673,145 +1602,53 @@ function formatCompact(value?: number | null) {
 	return String(value);
 }
 
-export function BranchSelector(props: {
-	gitInfo: GitBranchInfo;
-	switchingBranch?: string | null;
-	onSwitch: (branch: string) => void;
-	onCreateBranch: (branchName: string) => void;
-}) {
-	const [open, setOpen] = useState(false);
-	const [creatingBranch, setCreatingBranch] = useState(false);
-	const [newBranchName, setNewBranchName] = useState("");
-	const ref = useRef<HTMLDivElement>(null);
+/** PiDeck 品牌几何路径（与 boot / Agent 头像共用，勿随意改形） */
+// Keep renderer copies of the generated app icon so Vite includes the same
+// branded asset across the sidebar, agent rows, empty state, and boot fallback.
+const appIconUrl = new URL("../../assets/app-icon.png", import.meta.url).href;
 
-	// 点击外部区域自动关闭下拉
-	useEffect(() => {
-		if (!open) return;
-		const handler = (event: MouseEvent) => {
-			if (ref.current && !ref.current.contains(event.target as Node)) {
-				setOpen(false);
-				setCreatingBranch(false);
-				setNewBranchName("");
-			}
-		};
-		document.addEventListener("mousedown", handler);
-		return () => document.removeEventListener("mousedown", handler);
-	}, [open]);
-
-	const current = props.gitInfo.current ?? "";
-	const branches = props.gitInfo.branches;
-
-	// 无分支信息时不渲染
-	if (!current && branches.length === 0) return null;
-
-	const handleCreateBranch = () => {
-		const trimmed = newBranchName.trim();
-		if (!trimmed) return;
-		props.onCreateBranch(trimmed);
-		setOpen(false);
-		setCreatingBranch(false);
-		setNewBranchName("");
-	};
-
+/**
+ * 侧栏 Agent 状态圆点（对齐最近会话列表风格）：
+ * idle=实心蓝点；starting=灰色转圈；running=实心黄点；error=实心红点；closed=灰色静默点。
+ * 仅用色点/转圈表达状态，title/aria-label 保留完整文案。
+ */
+export function AgentStatusIndicator(props: { status: string }) {
+	const statusKey = `app.status${props.status.charAt(0).toUpperCase()}${props.status.slice(1)}` as TranslationKey;
+	const label = t(statusKey) || props.status;
 	return (
-		<div className="branch-select" ref={ref}>
-			<button
-				className="branch-trigger"
-				disabled={Boolean(props.switchingBranch)}
-				onClick={() => setOpen((v) => !v)}
-				title={t("app.branchCurrent", {
-					branch: current,
-					count: branches.length,
-				})}
-			>
-				<span className="branch-icon">
-					<GitBranch size={14} />
-				</span>
-				<span className="branch-label" title={current}>
-					{current || "detached"}
-				</span>
-				<span className="branch-badge">{branches.length}</span>
-				<span className={`branch-chevron${open ? " open" : ""}`}>
-					<ChevronDown size={12} />
-				</span>
-			</button>
-			{open && (
-				<div className="branch-dropdown">
-					{branches.length <= 1 && (
-						<div className="branch-empty-hint">{t("app.branchOnlyOne")}</div>
-					)}
-					{branches.map((branch) => {
-						const switching = props.switchingBranch === branch;
-						return (
-						<button
-							key={branch}
-							className={branch === current ? "active" : ""}
-							disabled={Boolean(props.switchingBranch)}
-							onClick={() => {
-								if (branch !== current) props.onSwitch(branch);
-								setOpen(false);
-							}}
-						>
-							<span className="branch-item-icon">
-								{branch === current ? (
-									<Check size={14} className="branch-check" />
-								) : (
-									<GitBranch size={14} />
-								)}
-							</span>
-							<span className="branch-item-label" title={branch}>
-								{switching ? t("app.branchSwitching") : branch}
-							</span>
-						</button>
-					);
-					})}
-					{creatingBranch ? (
-						<div className="branch-create-form">
-							<input
-								type="text"
-								placeholder={t("app.branchNewPlaceholder")}
-								value={newBranchName}
-								onChange={(e) => setNewBranchName(e.target.value)}
-								onKeyDown={(e) => {
-									if (e.key === "Enter") handleCreateBranch();
-									if (e.key === "Escape") {
-										setCreatingBranch(false);
-										setNewBranchName("");
-									}
-								}}
-								autoFocus
-							/>
-							<button
-								className="branch-create-confirm"
-								disabled={!newBranchName.trim()}
-								onClick={handleCreateBranch}
-							>
-								<Check size={14} />
-							</button>
-						</div>
-					) : (
-						<button
-							className="branch-create-trigger"
-							onClick={() => setCreatingBranch(true)}
-						>
-							<Plus size={14} />
-							<span>{t("app.branchCreate")}</span>
-						</button>
-					)}
-				</div>
-			)}
-		</div>
+		<span
+			className={`agent-status-indicator status-${props.status}`}
+			title={label}
+			aria-label={label}
+		>
+			{/* starting 用环状 spinner，其余状态用实心圆点 */}
+			<span className="agent-status-dot" aria-hidden="true" />
+		</span>
 	);
 }
-
-// 应用内品牌 logo 资源：与 build/icon.png 同源（npm run make-icon 生成），
-// 复制到 renderer assets 以便 Vite 处理。换图标只需重新 make-icon 并覆盖此文件。
-const appIconUrl = new URL("../../assets/app-icon.png", import.meta.url).href;
 
 export function LogoMark() {
 	return (
 		<div className="logo-mark" aria-label={t("app.logoLabel")}>
 			<img src={appIconUrl} alt="" aria-hidden="true" />
+		</div>
+	);
+}
+
+// 官方 pi 风格 canvas logo（侧栏可点击重播）
+export { PiLogoCanvas } from "./PiLogoCanvas";
+
+/**
+ * 侧栏品牌 lockup：π 标 + PiDeck 字标，垂直居中平齐。
+ * replayToken 由 App 在 agent 启动/关闭时递增，驱动 logo 重播拼装动画。
+ */
+export function BrandLockup(props: { replayToken?: number } = {}) {
+	return (
+		<div className="brand-lockup" aria-label="PiDeck">
+			<LogoMark key={props.replayToken} />
+			<span className="brand-wordmark" aria-hidden="true">
+				PiDeck
+			</span>
 		</div>
 	);
 }
@@ -839,38 +1676,27 @@ export function AgentAvatar(props: { status: string }) {
 	);
 }
 
-export function matches(value: string, keyword: string) {
-	return (
-		!keyword.trim() ||
-		value.toLowerCase().includes(keyword.trim().toLowerCase())
-	);
-}
-
-export function displayPath(path?: string) {
-	if (!path) return "";
-	const home = getHomePathPrefix();
-	const normalized = path.replace(/\\/g, "/");
-	const friendly =
-		home && normalized.toLowerCase().startsWith(home.toLowerCase())
-			? `~${normalized.slice(home.length)}`
-			: normalized;
-	return friendly.length > 36 ? `...${friendly.slice(-35)}` : friendly;
-}
-
-function getHomePathPrefix() {
-	// 浏览器侧无法直接读取 OS home;从常见 Windows 用户路径中提取到 /Users/name,其他路径保持原样。
-	const match = location.href.match(/file:\/\/\/([A-Za-z]:\/Users\/[^/]+)/i);
-	return match?.[1] ?? "C:/Users/14012";
-}
-
 export function EmptyState(props: { hasProject: boolean; onCreate: () => void }) {
 	return (
 		<div className="empty-state">
 			<div className="empty-logo">
 				<img src={appIconUrl} alt="" aria-hidden="true" />
 			</div>
-			<h2>{t("app.startAgent")}</h2>
-			<p>{t("app.emptyGuide")}</p>
+			<div className="empty-tagline" aria-label={`${t("app.emptyTaglineLine1")} ${t("app.emptyTaglineLine2Prefix")}${t("app.emptyTaglineYours")}`}>
+				<span>{t("app.emptyTaglineLine1")}</span>
+				<span>
+					{t("app.emptyTaglineLine2Prefix")}
+					<em className="empty-tagline-yours">{t("app.emptyTaglineYours")}</em>
+				</span>
+			</div>
+			<p className="empty-subtitle">
+				{t("app.emptySubtitle").split("\n").map((line, i) => (
+					<Fragment key={i}>
+						{i > 0 && <br />}
+						<span className="empty-subtitle-line">{line}</span>
+					</Fragment>
+				))}
+			</p>
 			{props.hasProject ? (
 				<button onClick={props.onCreate}>{t("app.createAgent")}</button>
 			) : (
@@ -880,46 +1706,36 @@ export function EmptyState(props: { hasProject: boolean; onCreate: () => void })
 	);
 }
 
-export type ToolGroupItem = {
-	kind: "tool-group";
-	id: string;
-	messages: ChatMessage[];
-};
-
-export type MessageItem = { kind: "message"; message: ChatMessage };
-
-export type ThinkingGroupItem = {
-	kind: "thinking-group";
-	id: string;
-	messages: ChatMessage[];
-	text: string;
-	startedAt: number;
-	endedAt: number;
-};
-
-export type AgentRunItem = {
-	kind: "agent-run";
-	id: string;
-	items: Array<MessageItem | ToolGroupItem | ThinkingGroupItem>;
-	startedAt: number;
-	endedAt: number;
-};
-
-export type RenderMessage = MessageItem | ToolGroupItem | ThinkingGroupItem | AgentRunItem;
-
 async function copyElementAsPng(element: HTMLElement) {
 	// 截图复制依赖浏览器 ClipboardItem PNG 支持；失败时由调用方提示/回退，不影响文本复制。
-	const dataUrl = await toPng(element, {
-		cacheBust: true,
-		pixelRatio: Math.min(2, window.devicePixelRatio || 1),
-		backgroundColor: getComputedStyle(document.documentElement).getPropertyValue("--color-bg-panel") || undefined,
-		filter: (node) =>
-			!(node instanceof HTMLElement) ||
-			(!node.classList.contains("turn-row-actions") &&
-				!node.classList.contains("user-turn-actions") &&
-				!node.classList.contains("copy-menu-popover")),
-	});
-	const blob = await (await fetch(dataUrl)).blob();
+	// 使用 toBlob 而非 toPng+fetch 避免 CSP 拒绝连接 data: URL。
+	// 克隆节点 + 内边距 + 临时注入 body 的方式与分享为图片（handleMultiSelectCopy）保持一致，
+	// 避免直接截图导致图片紧贴内容边缘、缺少留白。
+	const clone = element.cloneNode(true) as HTMLElement;
+	clone.style.padding = "24px";
+	clone.style.background =
+		getComputedStyle(document.documentElement).getPropertyValue("--color-bg-panel") || "#fff";
+	// 将 clone 插入到原元素旁边，确保 CSS 样式正确继承（父层选择器、rem 等）
+	if (element.parentElement) {
+		element.parentElement.insertBefore(clone, element.nextSibling);
+	}
+	let blob: Blob | null = null;
+	try {
+		blob = await toBlob(clone, {
+			cacheBust: true,
+			pixelRatio: Math.min(2, window.devicePixelRatio || 1),
+			backgroundColor:
+				getComputedStyle(document.documentElement).getPropertyValue("--color-bg-panel") || undefined,
+			filter: (node) =>
+				!(node instanceof HTMLElement) ||
+				(!node.classList.contains("turn-row-actions") &&
+					!node.classList.contains("user-turn-actions") &&
+					!node.classList.contains("copy-menu-popover")),
+		});
+	} finally {
+		clone.remove();
+	}
+	if (!blob) return;
 	await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
 }
 
@@ -951,14 +1767,16 @@ function CopyMenu(props: {
 	useEffect(() => clearCloseTimer, []);
 	const copy = async (kind: "text" | "markdown" | "image") => {
 		try {
-			if (kind === "text") await navigator.clipboard.writeText(props.text);
-			if (kind === "markdown") await navigator.clipboard.writeText(props.markdown);
+			if (kind === "text") await writeClipboard(props.text);
+			if (kind === "markdown") await writeClipboard(props.markdown);
 			if (kind === "image" && props.targetRef.current) await copyElementAsPng(props.targetRef.current);
 			setCopied(kind);
 			setOpen(false);
+			showNotice(t("copy.success"), 1200);
 			window.setTimeout(() => setCopied(null), 1800);
 		} catch {
 			setCopied(null);
+			showNotice(t("copy.failed"), 2000);
 		}
 	};
 	const toggleOpen = () => {
@@ -985,8 +1803,9 @@ function CopyMenu(props: {
 				type="button"
 				onClick={toggleOpen}
 				aria-expanded={open}
+				title={t("common.copy")}
 			>
-				{copied ? `${t("common.copy")} ✓` : t("common.copy")}
+				{copied ? <Check size={14} /> : <Copy size={14} />}
 			</button>
 			{open && (
 				<div className="copy-menu-popover" style={menuStyle}>
@@ -997,136 +1816,6 @@ function CopyMenu(props: {
 			)}
 		</div>
 	);
-}
-
-export function groupToolMessages(messages: ChatMessage[]): RenderMessage[] {
-	const result: RenderMessage[] = [];
-	let currentTools: ChatMessage[] = [];
-	let currentThinking: ChatMessage[] = [];
-	let currentRun: Array<MessageItem | ToolGroupItem | ThinkingGroupItem> = [];
-	let runStartedAt = 0;
-	let runEndedAt = 0;
-
-	function isThinkingOnly(message: ChatMessage) {
-		return (
-			message.role === "assistant" &&
-			Boolean(message.thinking?.trim()) &&
-			!stripThinkingTags(stripAnsi(message.text)).trim()
-		);
-	}
-
-	function flushThinking() {
-		if (currentThinking.length === 0) return;
-		const previous = currentRun[currentRun.length - 1];
-		const nextGroup: ThinkingGroupItem = {
-			kind: "thinking-group",
-			id: currentThinking.map((message) => message.id).join("|"),
-			messages: currentThinking,
-			text: currentThinking
-				.map((message) => stripAnsi(message.thinking ?? ""))
-				.filter(Boolean)
-				.join("\n\n"),
-			startedAt: currentThinking[0]?.timestamp ?? runStartedAt,
-			endedAt:
-				currentThinking[currentThinking.length - 1]?.timestamp ?? runEndedAt,
-		};
-		if (previous?.kind === "thinking-group") {
-			// 历史会话可能把多段纯 thinking 拆成多条 assistant 消息；如果展示层上已经相邻，
-			// 继续合并成一个折叠块，避免一轮回答里出现一串重复“思考过程”卡片。
-			previous.id = `${previous.id}|${nextGroup.id}`;
-			previous.messages = [...previous.messages, ...nextGroup.messages];
-			previous.text = [previous.text, nextGroup.text].filter(Boolean).join("\n\n");
-			previous.endedAt = nextGroup.endedAt;
-		} else {
-			currentRun.push(nextGroup);
-		}
-		runEndedAt = nextGroup.endedAt;
-		currentThinking = [];
-	}
-
-	function flushTools() {
-		if (currentTools.length === 0) return;
-		flushThinking();
-		// 同一轮问答里的连续 tool 消息聚合显示,减少工具调用刷屏;详情仍保留在每条 tool 的 meta 里可展开查看。
-		const group: ToolGroupItem = {
-			kind: "tool-group",
-			id: currentTools.map((message) => message.id).join("|"),
-			messages: currentTools,
-		};
-		currentRun.push(group);
-		runEndedAt = currentTools[currentTools.length - 1]?.timestamp ?? runEndedAt;
-		currentTools = [];
-	}
-
-	function flushRun() {
-		flushTools();
-		flushThinking();
-		if (currentRun.length === 0) return;
-
-		// 合并连续的 assistant 文本消息，避免同一轮回答被拆成多个气泡
-		const merged: Array<MessageItem | ToolGroupItem | ThinkingGroupItem> = [];
-		for (const item of currentRun) {
-			const prev = merged[merged.length - 1];
-			if (
-				item.kind === "message" &&
-				item.message.role === "assistant" &&
-				prev?.kind === "message" &&
-				prev.message.role === "assistant"
-			) {
-				prev.message = {
-					...prev.message,
-					text: prev.message.text + "\n\n" + item.message.text,
-					thinking: (prev.message.thinking || "") + (item.message.thinking ? "\n\n" + item.message.thinking : ""),
-					id: prev.message.id + "|" + item.message.id,
-				};
-			} else {
-				merged.push(item);
-			}
-		}
-
-		result.push({
-			kind: "agent-run",
-			id: merged
-				.map((item) => (item.kind === "message" ? item.message.id : item.id))
-				.join("|"),
-			items: merged,
-			startedAt: runStartedAt,
-			endedAt: runEndedAt || runStartedAt,
-		});
-		currentRun = [];
-		runStartedAt = 0;
-		runEndedAt = 0;
-	}
-
-	function appendRunMessage(message: ChatMessage) {
-		flushThinking();
-		flushTools();
-		if (currentRun.length === 0) runStartedAt = message.timestamp;
-		runEndedAt = message.timestamp;
-		currentRun.push({ kind: "message", message });
-	}
-
-	for (const message of messages) {
-		if (isThinkingOnly(message)) {
-			flushTools();
-			if (currentRun.length === 0 && currentThinking.length === 0) {
-				runStartedAt = message.timestamp;
-			}
-			currentThinking.push(message);
-			runEndedAt = message.timestamp;
-		} else if (message.role === "assistant") {
-			appendRunMessage(message);
-		} else if (message.role === "tool") {
-			flushThinking();
-			if (currentRun.length === 0) runStartedAt = message.timestamp;
-			currentTools.push(message);
-		} else {
-			flushRun();
-			result.push({ kind: "message", message });
-		}
-	}
-	flushRun();
-	return result;
 }
 
 // ============================================================
@@ -1141,30 +1830,44 @@ export function groupToolMessages(messages: ChatMessage[]): RenderMessage[] {
 /** 按工具名选择语义图标：read→文件、edit→铅笔、bash→终端、grep→搜索等，未匹配回退扳手。 */
 function toolIcon(toolName: string): ReactNode {
 	const key = toolName.toLowerCase();
-	if (key.includes("read") || key.includes("view")) return <FileText size={14} />;
+	if (key.includes("read") || key.includes("view")) return <FileText size={15} />;
 	if (key.includes("write") || key.includes("edit") || key.includes("apply_patch") || key.includes("patch"))
-		return <Pencil size={14} />;
-	if (key.includes("bash") || key.includes("shell") || key.includes("terminal")) return <Terminal size={14} />;
-	if (key.includes("grep") || key.includes("search")) return <Search size={14} />;
-	if (key.includes("glob") || key.includes("list") || key.includes("ls")) return <Folder size={14} />;
-	if (key.includes("task") || key.includes("subagent") || key.includes("agent")) return <Network size={14} />;
-	if (key.includes("web") || key.includes("fetch")) return <Globe2 size={14} />;
-	if (key.includes("todo")) return <Check size={14} />;
-	return <Wrench size={14} />;
+		return <SquarePen size={15} />;
+	if (key.includes("bash") || key.includes("shell") || key.includes("terminal")) return <Terminal size={15} />;
+	if (key.includes("grep") || key.includes("search")) return <Search size={15} />;
+	if (key.includes("glob") || key.includes("list") || key.includes("ls")) return <Folder size={15} />;
+	if (key.includes("task") || key.includes("subagent") || key.includes("agent")) return <Network size={15} />;
+	if (key.includes("web") || key.includes("fetch")) return <Globe2 size={15} />;
+	if (key.includes("todo")) return <Check size={15} />;
+	return <Wrench size={15} />;
 }
 
+
+
 /** 从工具消息 meta 中提取副标题（文件路径或命令），让 trigger 行能体现工具作用对象。
- *  pi 的工具参数放在 meta.args 里（如 read 的 path、bash 的 command、edit 的 filePath），
- *  这里同时兼容历史平铺 meta.path/command/file 的写法。 */
+ *  pi 的工具参数可能是对象，也可能已被主进程截断/序列化为 JSON 字符串；两种格式都要兼容，否则 bash 命令摘要会丢失。 */
 function getToolSubtitle(message: ChatMessage): string {
 	const meta = message.meta;
 	if (!meta) return "";
 	// 优先从 args 取参数（pi 工具事件的标准结构）
-	const args = meta.args as Record<string, unknown> | undefined;
-	if (args && typeof args === "object") {
-		for (const key of ["filePath", "file_path", "path", "file", "command", "pattern", "query"]) {
+	const args = parseToolArgs(meta.args);
+	if (args) {
+		for (const key of [
+			// 文件操作类
+			"filePath", "file_path", "path", "file",
+			// bash/shell 命令
+			"command",
+			// 搜索/查询类（grep、web_search 等）
+			"pattern", "query", "queries",
+			// 网络获取类（fetch_content 等）
+			"url", "urls",
+			// 待办事项类（todo 等）
+			"action", "text",
+		]) {
 			const v = args[key];
 			if (typeof v === "string" && v) return v;
+			// queries 和 urls 是数组，取第一条
+			if (Array.isArray(v) && v.length > 0 && typeof v[0] === "string") return v[0];
 		}
 	}
 	// 兼容历史平铺写法
@@ -1174,7 +1877,43 @@ function getToolSubtitle(message: ChatMessage): string {
 	if (typeof command === "string" && command) return command;
 	const file = meta.file;
 	if (typeof file === "string" && file) return file;
+	// 兜底：取 args 中第一个非空字符串值
+	if (args && typeof args === "object") {
+		for (const val of Object.values(args as Record<string, unknown>)) {
+			if (typeof val === "string" && val) return val;
+		}
+	}
 	return "";
+}
+
+function getToolArgFilePath(args: Record<string, unknown> | undefined): string | undefined {
+	return getToolFilePath(args);
+}
+
+function getToolDiffTarget(message: ChatMessage): { path: string; originalContent: string; content: string; changedLines: number } | undefined {
+	const toolName = getToolName(message);
+	if (!/write|edit|create|patch/i.test(toolName)) return undefined;
+	const args = parseToolArgs(message.meta?.args);
+	const path = getToolArgFilePath(args);
+	if (!args || !path) return undefined;
+	if (/write|create/i.test(toolName)) {
+		const content = typeof args.content === "string"
+			? args.content
+			: typeof args.text === "string"
+				? args.text
+				: undefined;
+		if (content === undefined) return undefined;
+		return { path, originalContent: "", content, changedLines: countTextLines(content) };
+	}
+	// edit/patch：不存储 full file originalContent，只展示变动区域
+	const diff = getToolEditDiff(args);
+	if (!diff) return undefined;
+	return {
+		path,
+		originalContent: diff.oldText,
+		content: diff.newText,
+		changedLines: Math.max(countTextLines(diff.oldText), countTextLines(diff.newText)),
+	};
 }
 
 /**
@@ -1212,18 +1951,28 @@ function getToolTone(message: ChatMessage): "running" | "error" | "warning" | "o
 const BUILT_IN_TOOLS = new Set(["bash", "edit", "find", "grep", "ls", "read", "write"]);
 
 /**
+ * 扩展工具中带下划线的名称，会被 MCP-direct 正则误匹配为形如 {server}_{tool}。
+ * 在此登记后 getToolKind 将其归为 "extension" 而非 "mcp-direct"。
+ */
+const NON_MCP_TOOLS = new Set(["ask_question"]);
+
+/**
  * 识别工具来源类型：
  * - mcp-proxy：toolName 为 mcp（pi-mcp-adapter 代理模式，LLM 通过单一 mcp 工具调用具体 server/tool）
- * - mcp-direct：toolName 形如 {server}_{tool} 且非内置工具（directTools 模式，server 名去掉 -mcp 后缀）
+ * - mcp-direct：toolName 形如 {server}_{tool} 且非内置/非扩展工具（directTools 模式，server 名去掉 -mcp 后缀）
  * - builtin：pi 内置工具（bash/edit/find/grep/ls/read/write）
- * - extension：其余带下划线或自定义命名的扩展工具
+ * - extension：扩展工具或自定义命名的其他工具
  */
 function getToolKind(toolName: string): "mcp-proxy" | "mcp-direct" | "builtin" | "extension" {
 	const key = toolName.toLowerCase();
 	if (key === "mcp") return "mcp-proxy";
 	if (BUILT_IN_TOOLS.has(key)) return "builtin";
 	// directTools 模式：server_tool，server 名通常含字母/连字符，tool 名也是标识符
-	if (/^[a-z][a-z0-9-]*_[a-z][a-z0-9_-]*$/i.test(toolName)) return "mcp-direct";
+	if (/^[a-z][a-z0-9-]*_[a-z][a-z0-9_-]*$/i.test(toolName)) {
+		// 已知扩展工具名含下划线但不是 MCP 直连 → 归为 extension
+		if (NON_MCP_TOOLS.has(key)) return "extension";
+		return "mcp-direct";
+	}
 	return "extension";
 }
 
@@ -1242,9 +1991,18 @@ function getToolKindLabel(toolName: string): string {
 }
 
 /** 单个工具调用卡片：trigger 行（图标+工具名+副标题+状态+耗时）+ 展开后详情。 */
+/** 格式化 ask 答案展示：长文本可换行，避免 fixed height 下覆盖错位 */
+function formatAskAnswerText(answer: unknown, answerLabel?: string): string {
+	if (typeof answerLabel === "string" && answerLabel.trim()) return answerLabel;
+	if (typeof answer === "boolean") return answer ? t("common.true") : t("common.false");
+	if (answer == null) return t("ask.answered");
+	return String(answer);
+}
+
 export const ToolCard = memo(function ToolCard(props: {
 	message: ChatMessage;
 	defaultOpen?: boolean;
+	onDiffFile?: DiffFileHandler;
 }) {
 	const [expanded, setExpanded] = useState(props.defaultOpen ?? false);
 	const status = getToolStatus(props.message);
@@ -1253,66 +2011,200 @@ export const ToolCard = memo(function ToolCard(props: {
 	const tone = getToolTone(props.message);
 	const subtitle = getToolSubtitle(props.message);
 	const kindLabel = getToolKindLabel(toolName);
-	// 模型用 read 工具读取 SKILL.md 来加载 skill：识别后以 skill 徽标样式渲染，
-	// 让用户看到模型主动调用了哪个 skill（区别于普通文件读取）
+	const diffTarget = getToolDiffTarget(props.message);
+	const durationMs =
+		typeof props.message.meta?.durationMs === "number"
+			? props.message.meta.durationMs
+			: undefined;
+	const showDuration = status !== "running" && durationMs !== undefined;
+	// 模型用 read 工具读取 SKILL.md 来加载 skill：识别后以 skill 徽标样式渲染
 	const skillName = getReadSkillName(props.message);
 	const isSkillRead = Boolean(skillName);
-	const statusLabel =
-		status === "running"
-			? t("tool.statusRunning")
-			: status === "error"
-				? t("tool.statusError")
-				: t("tool.statusDone");
+	// 历史/实时会话中从 ask_question 工具结果反推的提问卡片数据
+	// items 存在时为批量问卷：逐题展示答案，避免只显示第一题像「未回答」
+	const askCard = props.message.meta?._askCard as
+		| {
+				question?: string;
+				type?: string;
+				answered?: boolean;
+				answer?: unknown;
+				answerLabel?: string;
+				options?: unknown[];
+				cancelled?: boolean;
+				items?: Array<{
+					id?: string;
+					question?: string;
+					type?: string;
+					answered?: boolean;
+					answer?: unknown;
+					answerLabel?: string;
+					options?: unknown[];
+					wasCustom?: boolean;
+				}>;
+		  }
+		| undefined;
+	const isAskCard = Boolean(askCard?.question) || Boolean(askCard?.items?.length);
+	// 运行中显示 "运行中"，出错显示 "错误"，完成后不显示状态文本
+const statusLabel =
+	status === "running"
+		? t("tool.statusRunning")
+		: status === "error"
+			? ""
+			: "";
 	const [copied, setCopied] = useState(false);
 	const handleCopy = () => {
-		navigator.clipboard.writeText(detailText);
+		writeClipboard(detailText);
 		setCopied(true);
+		showNotice(t("app.codeCopied"), 1200);
 		setTimeout(() => setCopied(false), 2000);
 	};
 	return (
 		<section
-			className={`tool-card tone-${tone}${isSkillRead ? " tool-card--skill" : ""}`}
+			className={`tool-card tone-${tone}${isSkillRead ? " tool-card--skill" : ""}${isAskCard ? " tool-card--ask" : ""}`}
 			data-status={status}
 			data-tool-kind={isSkillRead ? "skill" : getToolKind(toolName)}
 			data-message-id={props.message.id}
 		>
-			<button
-				className="tool-card-trigger"
-				onClick={() => setExpanded((v) => !v)}
-				aria-expanded={expanded}
-			>
-				<span className="tool-card-icon">
-					{isSkillRead ? <Brain size={14} /> : toolIcon(toolName)}
-				</span>
-				<span className="tool-card-name">
-					{isSkillRead ? `skill:${skillName}` : toolName}
-				</span>
-				{!isSkillRead && kindLabel && (
-					<span className="tool-card-kind">{kindLabel}</span>
-				)}
-				{subtitle && (
-					<span className="tool-card-subtitle" title={subtitle}>
-						{subtitle}
+			<div className={`tool-card-header${diffTarget ? " has-diff" : ""}`}>
+				<button
+					className="tool-card-trigger"
+					onClick={() => setExpanded((v) => !v)}
+					aria-expanded={expanded}
+				>
+					<span className="tool-card-icon">
+						{isSkillRead ? <Brain size={15} /> : isAskCard ? <MessageCircle size={15} /> : toolIcon(toolName)}
 					</span>
+					<span className="tool-card-name">
+						{isSkillRead ? `skill:${skillName}` : isAskCard ? t("ask.toolName") : toolName}
+					</span>
+					<ChevronDown
+						size={14}
+						className={`tool-card-chevron${expanded ? " open" : ""}`}
+					/>
+					{!isSkillRead && kindLabel && (
+						<span className="tool-card-kind">{kindLabel}</span>
+					)}
+					<span className="tool-card-status">
+						{status === "running" && <span className="tool-card-spinner" aria-hidden="true" />}
+						{askCard?.answered ? t("ask.answered") : (statusLabel)}
+					</span>
+					{showDuration && (
+						<span className="tool-card-duration" title={t("tool.durationTitle")}>
+							{formatDuration(durationMs)}
+						</span>
+					)}
+					{isAskCard && askCard ? (
+						<span
+							className="tool-card-subtitle"
+							title={
+								Array.isArray(askCard.items) && askCard.items.length > 0
+									? t("ask.batchTitle", { count: String(askCard.items.length) })
+									: (askCard.question ?? "")
+							}
+						>
+							|{" "}
+							{Array.isArray(askCard.items) && askCard.items.length > 0
+								? t("ask.batchTitle", { count: String(askCard.items.length) })
+								: askCard.question}
+						</span>
+					) : subtitle ? (
+						<span className="tool-card-subtitle" title={subtitle}>
+							| {subtitle}
+						</span>
+					) : null}
+				</button>
+				{diffTarget && props.onDiffFile && (
+					<button
+						className="tool-card-diff-chip"
+						type="button"
+						onClick={() => props.onDiffFile?.(diffTarget.path, diffTarget.originalContent, diffTarget.content)}
+						title={`${t("tool.viewDiff")} · ${diffTarget.path}`}
+					>
+						{t("tool.diff")}
+					</button>
 				)}
-				<span className="tool-card-status">
-					{status === "running" && <span className="tool-card-spinner" aria-hidden="true" />}
-					{statusLabel}
-				</span>
-				<ChevronDown
-					size={14}
-					className={`tool-card-chevron${expanded ? " open" : ""}`}
-				/>
-			</button>
+			</div>
 			{expanded && (
 				<div className="tool-card-content">
-					<pre className="tool-card-detail">{detailText}</pre>
+					{isAskCard && askCard ? (
+						<div className="ask-question-card-tool-inner">
+							{/* 批量：问题与答案尽量同一行；任一侧过长时自动换行，不互相覆盖 */}
+							{Array.isArray(askCard.items) && askCard.items.length > 0 ? (
+								<div className="ask-question-card-batch-list">
+									{askCard.items.map((item, idx) => {
+										const answerText = formatAskAnswerText(item.answer, item.answerLabel);
+										return (
+											<div key={item.id ?? idx} className="ask-question-card-batch-item">
+												<span className="ask-question-card-batch-num" aria-hidden="true">
+													{idx + 1}
+												</span>
+												<div className="ask-question-card-batch-row">
+													<span className="ask-question-card-batch-q" title={item.question || item.id}>
+														{item.question || item.id}
+													</span>
+													<span className="ask-question-card-batch-sep" aria-hidden="true">
+														→
+													</span>
+													{item.answered ? (
+														<span className="ask-question-card-batch-a" title={answerText}>
+															{answerText}
+														</span>
+													) : (
+														<span className="ask-question-card-batch-a ask-question-card-batch-a--muted">
+															{askCard.cancelled ? t("ask.cancelled") : t("ask.unanswered")}
+														</span>
+													)}
+												</div>
+											</div>
+										);
+									})}
+								</div>
+							) : (
+								<>
+									<div className="ask-question-card-title"><MessageCircle size={13} />{askCard.question}</div>
+									{askCard.options && askCard.options.length > 0 && (
+										<div className="ask-question-card-options-list">
+											{askCard.options.map((opt, i) => {
+												const optLabel = typeof opt === "string" ? opt : (opt as any).label ?? String((opt as any).value ?? "");
+												const optValue = typeof opt === "string" ? opt : String((opt as any).value ?? optLabel);
+												const desc = typeof opt === "object" && opt ? (opt as any).description : undefined;
+												const isSelected = Boolean(askCard.answered) && (optLabel === askCard.answerLabel || optValue === askCard.answer);
+												return (
+													<div key={i} className={`ask-question-card-option-item${isSelected ? " selected" : ""}`}>
+														<span className="ask-question-card-option-selector">{isSelected ? "✓" : ""}</span>
+														<div className="ask-question-card-option-text">
+															<span className="ask-question-card-option-label">{optLabel}</span>
+															{desc && <span className="ask-question-card-option-desc">{desc}</span>}
+														</div>
+													</div>
+												);
+											})}
+										</div>
+									)}
+									{askCard.answered ? (
+										<div className="ask-question-card-answered ask-question-card-answered--wrap">
+											<Check size={14} className="ask-question-card-answered-ok" />
+											<span className="ask-question-card-answer-text">
+												{formatAskAnswerText(askCard.answer, askCard.answerLabel)}
+											</span>
+										</div>
+									) : (
+										<div className="ask-question-card-answered" style={{ color: "var(--color-text-tertiary)" }}>
+											{t("ask.unanswered")}
+										</div>
+									)}
+								</>
+							)}
+						</div>
+					) : (
+						<pre className="tool-card-detail">{detailText}</pre>
+					)}
 					<button
 						className="tool-card-copy"
 						onClick={handleCopy}
 						title={t("tool.copyDetail")}
 					>
-						{copied ? `${t("common.copy")} ✓` : t("common.copy")}
+						{copied ? <Check size={14} /> : <Copy size={14} />}
 					</button>
 				</div>
 			)}
@@ -1323,25 +2215,670 @@ export const ToolCard = memo(function ToolCard(props: {
 /** 工具组直接平铺为工具列表；每个 ToolCard 自己默认折叠，避免外层再占一行。 */
 export const ToolGroupCard = memo(function ToolGroupCard(props: {
 	group: ToolGroupItem;
+	onDiffFile?: DiffFileHandler;
 }) {
 	return (
 		<section className="tool-group-card flat" data-message-id={props.group.id}>
 			<div className="tool-group-card-list">
 				{props.group.messages.map((message) => (
-					<ToolCard key={message.id} message={message} />
+					<ToolCard key={message.id} message={message} onDiffFile={props.onDiffFile} />
 				))}
 			</div>
 		</section>
 	);
 });
 
+function getDiagnosticTone(message: ChatMessage): "error" | "warning" | "success" | "info" {
+	if (message.role === "error") return "error";
+	const status = String(message.meta?.status ?? "");
+	if (status === "error") return "error";
+	if (status === "running") return "warning";
+	if (status === "success") return "success";
+	return "info";
+}
+
+/** 压缩事件卡片：在时间线上标记会话被压缩过，展示摘要和节约的 token 数。
+ * 支持展开查看压缩前的归档消息。 */
+export const CompactionCard = memo(function CompactionCard(props: {
+	message: ChatMessage;
+}) {
+	const [expanded, setExpanded] = useState(false);
+	const summary = props.message.text;
+	const tokensBefore = (props.message.meta as any)?.tokensBefore;
+	const compactionCount = (props.message.meta as any)?.compactionCount;
+	const archivedMessages = (props.message.meta as any)?.archivedMessages as ChatMessage[] | undefined;
+	const time = formatTime(props.message.timestamp);
+	const hasArchived = Array.isArray(archivedMessages) && archivedMessages.length > 0;
+
+	return (
+		<article
+			className={`compaction-card${expanded ? " compaction-card--expanded" : ""}`}
+			data-message-id={props.message.id}
+		>
+			<button
+				type="button"
+				className="compaction-card-header"
+				onClick={() => hasArchived && setExpanded(!expanded)}
+				disabled={!hasArchived}
+				aria-expanded={expanded}
+			>
+				<span className="compaction-card-icon" aria-hidden="true">
+					{hasArchived ? (expanded ? "📂" : "📁") : "🔁"}
+				</span>
+				<div className="compaction-card-body">
+					<span className="compaction-card-summary">{stripAnsi(summary)}</span>
+					<div className="compaction-card-meta">
+						{typeof compactionCount === "number" && compactionCount > 0 && (
+							<span className="compaction-card-count">
+								{t("app.compactionCount", { count: compactionCount })}
+							</span>
+						)}
+						{typeof tokensBefore === "number" && (
+							<span className="compaction-card-tokens">
+								~{Math.round(tokensBefore / 1000)}k tokens before
+							</span>
+						)}
+						{hasArchived && (
+							<span className="compaction-card-hint">
+								{expanded ? t("app.compactionCollapse") : t("app.compactionExpand")}
+							</span>
+						)}
+					</div>
+					<time className="compaction-card-time">{time}</time>
+				</div>
+			</button>
+			{expanded && hasArchived && (
+				<div className="compaction-card-archive">
+					<div className="compaction-card-archive-divider" />
+					<ArchivedMessageList messages={archivedMessages} />
+				</div>
+			)}
+		</article>
+	);
+});
+
+/** 归档消息列表：压缩卡片展开时，以简略格式渲染压缩前的消息历史。 */
+function ArchivedMessageList({ messages }: { messages: ChatMessage[] }) {
+	return (
+		<div className="archived-message-list">
+			{messages.map((msg) => (
+				<ArchivedMessage key={msg.id} message={msg} />
+			))}
+		</div>
+	);
+}
+
+/** 单条归档消息：根据角色显示对应的图标和内容预览。
+ * 只展示纯文本内容，不渲染 Markdown / 代码高亮 / 工具详情，保持归档区视觉干净。 */
+function ArchivedMessage({ message }: { message: ChatMessage }) {
+	const text = stripAnsi(message.text).trim();
+	// 截断过长的消息以减少展开区体积
+	const preview = text.length > 300 ? text.slice(0, 300) + "…" : text;
+	const roleIcon =
+		message.role === "user" ? "👤" :
+		message.role === "assistant" ? "🤖" :
+		message.role === "tool" ? "🔧" : "💬";
+
+	return (
+		<div className={`archived-message archived-message--${message.role}`}>
+			<span className="archived-message-role">{roleIcon}</span>
+			<span className="archived-message-text">{preview || "(empty)"}</span>
+		</div>
+	);
+}
+
+/** 错误/RPC/系统诊断消息使用独立卡片，避免和普通 AI 正文混在一起难以扫读。 */
+export const DiagnosticMessageCard = memo(function DiagnosticMessageCard(props: {
+	message: ChatMessage;
+}) {
+	const tone = getDiagnosticTone(props.message);
+	const title = props.message.role === "error"
+		? t("diagnostic.errorTitle")
+		: t("diagnostic.systemTitle");
+	return (
+		<article
+			className={`diagnostic-card tone-${tone}`}
+			data-message-id={props.message.id}
+			data-role={props.message.role}
+		>
+			<div className="diagnostic-card-header">
+				<AlertTriangle size={14} aria-hidden="true" />
+				<span>{title}</span>
+				<time>{formatTime(props.message.timestamp)}</time>
+			</div>
+			<pre className="diagnostic-card-body">{stripAnsi(
+				props.message.meta && typeof props.message.meta === "object" && "i18nKey" in props.message.meta
+					? t((props.message.meta as Record<string, string>).i18nKey as TranslationKey)
+					: props.message.text
+			)}</pre>
+		</article>
+	);
+});
+
+/**
+ * 内联提问卡片：渲染 Extension UI 请求（select/confirm/input/editor）作为 system 消息。
+ * 用于实时会话中模型通过 ask_question 扩展向用户发起交互。
+ */
+export const AskQuestionCard = memo(function AskQuestionCard(props: {
+	message: ChatMessage;
+	onRespond?: (response: { value?: string | boolean; cancelled?: boolean; confirmed?: boolean }) => void;
+}) {
+	const meta = props.message.meta as Record<string, unknown> | undefined;
+	const uiRequest = meta?.uiRequest as Record<string, unknown> | undefined;
+	const status = String(meta?.status ?? "pending");
+	const response = meta?.response as Record<string, unknown> | undefined;
+	const answered = status === "answered" && response && !response.cancelled;
+	const cancelled = status === "cancelled" || status === "error";
+
+	const [inputValue, setInputValue] = useState("");
+	const [cancelling, setCancelling] = useState(false);
+	const inputRef = useRef<HTMLTextAreaElement>(null);
+
+	// 编辑器输入 ref
+	const editorRef = useRef<HTMLTextAreaElement>(null);
+
+	// 当 prefill 变化时同步到 inputValue
+	useEffect(() => {
+		if (uiRequest?.prefill) setInputValue(String(uiRequest.prefill));
+	}, [uiRequest?.prefill]);
+
+	const handleSelect = (value: string) => {
+		props.onRespond?.({ value });
+	};
+
+	const handleConfirm = (value: boolean) => {
+		props.onRespond?.({ confirmed: value });
+	};
+
+	const handleInputSubmit = () => {
+		if (inputValue.trim()) {
+			props.onRespond?.({ value: inputValue });
+		}
+	};
+
+	const handleCancel = () => {
+		setCancelling(true);
+		props.onRespond?.({ cancelled: true });
+	};
+
+	// 已回答/取消的卡片：信息已在 ToolCard 的 _askCard 中展示，此处不再重复渲染
+	if (answered || cancelled) {
+		return null;
+	}
+
+	// pending 卡片：显示交互界面
+	const cancellingLabel = t("ask.cancelling");
+	const method = String(uiRequest?.method ?? "input");
+	const title = String(uiRequest?.title ?? "");
+	const placeholder = String(uiRequest?.placeholder ?? "");
+	const options = uiRequest?.options as string[] | undefined;
+
+	return (
+		<article className="ask-question-card pending" data-message-id={props.message.id}>
+			<div className="ask-question-card-header">
+				<MessageCircle size={14} />
+				<span className="ask-question-card-title">{title || t("ask.defaultTitle")}</span>
+				<span className="ask-question-card-status">{cancelling ? t("ask.cancelling") : t("ask.waiting")}</span>
+			</div>
+			<div className="ask-question-card-body">
+				{method === "select" && options && options.length > 0 && (
+					<div className="ask-question-card-options">
+						{/* 过滤掉 Pi 自带的 "✎ 自行输入..." 选项，用下方内联输入框替代 */}
+						{options.filter((opt) => !opt.startsWith("✎")).map((opt, i) => (
+							<button
+								key={i}
+								className="ask-question-card-option"
+								onClick={() => handleSelect(opt)}
+								disabled={cancelling}
+							>
+								{opt}
+							</button>
+						))}
+					</div>
+				)}
+				{method === "confirm" && (
+					<div className="ask-question-card-options ask-question-card-options-confirm">
+						<button
+							className="ask-question-card-option ask-question-card-option-yes"
+							onClick={() => handleConfirm(true)}
+							disabled={cancelling}
+						>
+							{t("common.true")}
+						</button>
+						<button
+							className="ask-question-card-option ask-question-card-option-no"
+							onClick={() => handleConfirm(false)}
+							disabled={cancelling}
+						>
+							{t("common.false")}
+						</button>
+					</div>
+				)}
+				{method === "input" && (
+					<div className="ask-question-card-input-row">
+						<textarea
+							ref={inputRef}
+							className="ask-question-card-input"
+							placeholder={placeholder || t("ask.inputPlaceholder")}
+							value={inputValue}
+							onChange={(e) => setInputValue(e.target.value)}
+							onKeyDown={(e) => {
+								// 与主输入框一致：IME 确认候选词的回车不触发提交
+							if (getComposerEnterIntent(e, "enter-send") === "send") {
+									e.preventDefault();
+									handleInputSubmit();
+								}
+							}}
+							disabled={cancelling}
+						/>
+						<button
+							className="ask-question-card-submit"
+							onClick={handleInputSubmit}
+							disabled={!inputValue.trim() || cancelling}
+							title={t("ask.submit")}
+						>
+							<Check size={14} />
+						</button>
+						<button
+							className="ask-question-card-cancel"
+							onClick={handleCancel}
+							disabled={cancelling}
+							title={t("common.cancel")}
+							aria-label={t("common.cancel")}
+						>
+							<X size={14} />
+						</button>
+					</div>
+				)}
+				{method === "editor" && (
+					<div className="ask-question-card-editor-area">
+						<textarea
+							ref={editorRef}
+							className="ask-question-card-editor"
+							placeholder={placeholder || t("ask.editorPlaceholder")}
+							value={inputValue}
+							onChange={(e) => setInputValue(e.target.value)}
+							disabled={cancelling}
+						/>
+						<div className="ask-question-card-editor-actions">
+							<button
+								className="ask-question-card-submit"
+								onClick={handleInputSubmit}
+								disabled={!inputValue.trim() || cancelling}
+							>
+								{t("ask.submit")}
+							</button>
+							<button
+								className="ask-question-card-cancel"
+								onClick={handleCancel}
+								disabled={cancelling}
+								title={t("common.cancel")}
+								aria-label={t("common.cancel")}
+							>
+								<X size={14} />
+							</button>
+						</div>
+					</div>
+				)}
+			</div>
+		</article>
+	);
+});
+
+/**
+ * 批量 ask 内联栏：Tab 标签页问卷 + Submit 审阅防误提。
+ * 扩展通过一次 input envelope 下发全部问题，桌面端在此处渲染完整的 Tab 交互。
+ */
+export const BatchAskInlineBar = memo(function BatchAskInlineBar(props: {
+	uiRequest: {
+		requestId: string;
+		title: string;
+		batchQuestions?: Array<{
+			id: string;
+			type: "select" | "confirm" | "input" | "editor";
+			question: string;
+			options?: Array<string | { label: string; value?: string; description?: string }>;
+			allowOther?: boolean;
+			placeholder?: string;
+			prefill?: string;
+		}>;
+		batchReview?: boolean;
+	};
+	activeAgentId?: string;
+	onCancel: () => void;
+	onSubmit: (answersJson: string) => void;
+}) {
+	const { uiRequest } = props;
+	const questions = uiRequest.batchQuestions ?? [];
+	const totalQ = questions.length;
+
+	// 逐题临时答案
+	const [answers, setAnswers] = useState<Record<string, string | boolean | null>>(
+		() => {
+			const init: Record<string, string | boolean | null> = {};
+			for (const q of questions) init[q.id] = null;
+			return init;
+		},
+	);
+	const [answeredLookup, setAnsweredLookup] = useState<Record<string, boolean>>({});
+	const [currentTab, setCurrentTab] = useState(0);
+	const [inputValues, setInputValues] = useState<Record<string, string>>({});
+
+	// 当前题目
+	const currentQ = questions[currentTab];
+
+	const isReviewTab = currentTab === totalQ;
+
+	// 更新答案
+	const setAnswer = (id: string, value: string | boolean | null) => {
+		setAnswers((prev) => ({ ...prev, [id]: value }));
+		setAnsweredLookup((prev) => ({
+			...prev,
+			[id]: value !== null && value !== undefined,
+		}));
+	};
+
+	const answeredCount = Object.values(answeredLookup).filter(Boolean).length;
+	const allAnswered = answeredCount >= totalQ;
+
+	// 提交：序列化为扩展能解析的 JSON
+	const handleSubmit = () => {
+		const result = questions.map((q) => ({
+			id: q.id,
+			type: q.type,
+			value: answers[q.id] ?? null,
+			label:
+				typeof answers[q.id] === "boolean"
+					? answers[q.id]
+						? "是"
+						: "否"
+					: String(answers[q.id] ?? ""),
+			wasCustom: false,
+		}));
+		props.onSubmit(JSON.stringify({ answers: result }));
+	};
+
+	// 未提醒：去审阅 tab
+	const goToReview = () => setCurrentTab(totalQ);
+
+	if (totalQ === 0) {
+		return (
+			<div className="ask-inline-bar">
+				<div className="ask-inline-bar-header">
+					<MessageCircle size={14} />
+					<span>{uiRequest.title || t("ask.batchTitle", { count: "0" })}</span>
+					<button className="ask-inline-bar-close" onClick={props.onCancel} aria-label={t("common.cancel")}>
+						<X size={14} />
+					</button>
+				</div>
+				<div className="ask-inline-bar-question">{t("ask.cancelled")}</div>
+			</div>
+		);
+	}
+
+	return (
+		<div className="ask-inline-bar ask-inline-bar--batch">
+			{/* 标题行：进度 + 关闭 */}
+			<div className="ask-inline-bar-header">
+				<MessageCircle size={14} />
+				<span>{uiRequest.title || t("ask.batchTitle", { count: String(totalQ) })}</span>
+				<span className="ask-inline-bar-batch-progress">
+					{t("ask.batchProgress", { done: String(answeredCount), total: String(totalQ) })}
+				</span>
+				<button
+					className="ask-inline-bar-close"
+					onClick={props.onCancel}
+					aria-label={t("common.cancel")}
+				>
+					<X size={14} />
+				</button>
+			</div>
+
+			{/* 顶部 Tab 条 */}
+			<div className="ask-batch-tabs" role="tablist">
+				{questions.map((q, i) => {
+					const isActive = i === currentTab;
+					const isAnswered = answeredLookup[q.id] === true;
+					return (
+						<button
+							key={q.id}
+							role="tab"
+							aria-selected={isActive}
+							className={`ask-batch-tab${isActive ? " active" : ""}${isAnswered ? " answered" : ""}`}
+							onClick={() => setCurrentTab(i)}
+						>
+							<span className="ask-batch-tab-num">{i + 1}</span>
+							<span className="ask-batch-tab-label">{q.question.slice(0, 16)}</span>
+							{isAnswered && <Check size={10} className="ask-batch-tab-check" />}
+						</button>
+					);
+				})}
+				{/* Submit 审阅 Tab */}
+				{uiRequest.batchReview && (
+					<button
+						key="__review__"
+						role="tab"
+						aria-selected={isReviewTab}
+						className={`ask-batch-tab ask-batch-tab--review${isReviewTab ? " active" : ""}`}
+						onClick={goToReview}
+					>
+						<ClipboardList size={12} />
+						<span className="ask-batch-tab-label">{t("ask.batchReviewTab")}</span>
+					</button>
+				)}
+			</div>
+
+			{/* 题目内容区 */}
+			<div className="ask-inline-bar-body">
+				{isReviewTab ? (
+					/* Submit 审阅 Tab */
+					<div className="ask-batch-review">
+						<div className="ask-batch-review-title">
+							<ClipboardList size={16} />
+							{t("ask.batchReviewTitle")}
+						</div>
+						<div className="ask-batch-review-hint">{t("ask.batchReviewHint")}</div>
+						<div className="ask-batch-review-list">
+							{questions.map((q, i) => {
+								const val = answers[q.id];
+								const isAns = answeredLookup[q.id] === true;
+								return (
+									<div key={q.id} className="ask-batch-review-item">
+										<span className="ask-batch-review-num">{i + 1}</span>
+										<span className="ask-batch-review-q">{q.question}</span>
+										<span className={`ask-batch-review-a${isAns ? " answered" : " unanswered"}`}>
+											{isAns
+												? typeof val === "boolean"
+													? val
+														? "✅ " + t("common.true")
+														: "❌ " + t("common.false")
+													: String(val)
+												: "—"}
+										</span>
+									</div>
+								);
+							})}
+						</div>
+						{!allAnswered && (
+							<div className="ask-batch-review-warning">
+								<AlertTriangle size={14} />
+								{t("ask.batchIncomplete")}
+							</div>
+						)}
+						<button
+							className="ask-batch-submit-all-btn"
+							disabled={!allAnswered}
+							onClick={handleSubmit}
+						>
+							{t("ask.batchSubmitAll")}
+						</button>
+					</div>
+				) : currentQ ? (
+					<div className="ask-batch-question">
+						<div className="ask-batch-question-header">
+							<span className="ask-batch-question-num">
+								{t("common.details")} {currentTab + 1}/{totalQ}
+							</span>
+						</div>
+						<div className="ask-inline-bar-question">{currentQ.question}</div>
+						<div className="ask-batch-question-body">
+							{currentQ.type === "confirm" ? (
+								<div className="ask-inline-bar-options ask-inline-bar-options-confirm">
+									<button
+										className={`ask-inline-bar-option ask-inline-bar-option-yes${answers[currentQ.id] === true ? " selected" : ""}`}
+										onClick={() => setAnswer(currentQ.id, true)}
+									>
+										{t("common.true")}
+									</button>
+									<button
+										className={`ask-inline-bar-option ask-inline-bar-option-no${answers[currentQ.id] === false ? " selected" : ""}`}
+										onClick={() => setAnswer(currentQ.id, false)}
+									>
+										{t("common.false")}
+									</button>
+								</div>
+							) : currentQ.type === "select" && currentQ.options && currentQ.options.length > 0 ? (
+								<>
+									<div className="ask-inline-bar-options">
+										{currentQ.options.map((opt, i) => {
+											const optLabel =
+												typeof opt === "string" ? opt : opt.label ?? String(opt.value ?? "");
+											const optVal =
+												typeof opt === "string" ? opt : String(opt.value ?? optLabel);
+											const isSelected = answers[currentQ.id] === optVal;
+											return (
+												<button
+													key={i}
+													className={`ask-inline-bar-option${isSelected ? " selected" : ""}`}
+													onClick={() => setAnswer(currentQ.id, optVal)}
+												>
+													<span className="ask-inline-bar-option-marker">{optLabel}</span>
+												</button>
+											);
+										})}
+									</div>
+									{currentQ.allowOther !== false && (
+										<div className="ask-inline-bar-custom-input">
+											<input
+												className="ask-inline-bar-custom-field"
+												placeholder={currentQ.placeholder || t("ask.customPlaceholder")}
+												value={inputValues[currentQ.id] ?? ""}
+												onChange={(e) =>
+													setInputValues((prev) => ({
+														...prev,
+														[currentQ.id]: e.target.value,
+													}))
+												}
+												onKeyDown={(e) => {
+													if (e.key === "Enter") {
+														const v = (e.target as HTMLInputElement).value.trim();
+														if (v) setAnswer(currentQ.id, v);
+													}
+												}}
+											/>
+											<button
+												className="ask-inline-bar-submit-btn"
+												onClick={() => {
+													const v = inputValues[currentQ.id]?.trim();
+													if (v) setAnswer(currentQ.id, v);
+												}}
+											>
+												{t("common.submit")}
+											</button>
+										</div>
+									)}
+								</>
+							) : currentQ.type === "editor" ? (
+								<div className="ask-batch-editor-area">
+									<textarea
+										className="ask-inline-bar-input ask-batch-textarea"
+										placeholder={currentQ.placeholder || t("ask.editorPlaceholder")}
+										value={inputValues[currentQ.id] ?? (currentQ.prefill ?? "")}
+										onChange={(e) =>
+											setInputValues((prev) => ({
+												...prev,
+												[currentQ.id]: e.target.value,
+											}))
+										}
+										onBlur={(e) => {
+											if (e.target.value.trim()) setAnswer(currentQ.id, e.target.value);
+										}}
+									/>
+								</div>
+							) : (
+								<div className="ask-inline-bar-input-area">
+									<input
+										className="ask-inline-bar-input"
+										placeholder={currentQ.placeholder || t("ask.inputPlaceholder")}
+										value={inputValues[currentQ.id] ?? ""}
+										onChange={(e) =>
+											setInputValues((prev) => ({
+												...prev,
+												[currentQ.id]: e.target.value,
+											}))
+										}
+										onKeyDown={(e) => {
+											if (e.key === "Enter") {
+												const v = (e.target as HTMLInputElement).value.trim();
+												if (v) setAnswer(currentQ.id, v);
+											}
+										}}
+									/>
+									<button
+										className="ask-inline-bar-submit-btn"
+										onClick={() => {
+											const v = inputValues[currentQ.id]?.trim();
+											if (v) setAnswer(currentQ.id, v);
+										}}
+									>
+										{t("common.submit")}
+									</button>
+								</div>
+							)}
+						</div>
+
+						{/* 底部分页按钮 */}
+						<div className="ask-batch-nav">
+							{currentTab > 0 && (
+								<button
+									className="ask-batch-nav-btn"
+									onClick={() => setCurrentTab(currentTab - 1)}
+								>
+									{t("ask.batchPrev")}
+								</button>
+							)}
+							<div className="ask-batch-nav-spacer" />
+							{currentTab < totalQ - 1 ? (
+								<button
+									className="ask-batch-nav-btn primary"
+									onClick={() => setCurrentTab(currentTab + 1)}
+								>
+									{t("ask.batchNext")}
+								</button>
+							) : (
+								<button className="ask-batch-nav-btn primary" onClick={goToReview}>
+									{t("ask.batchGoReview")}
+								</button>
+							)}
+						</div>
+					</div>
+				) : (
+					<div className="ask-inline-bar-question">{t("ask.cancelled")}</div>
+				)}
+			</div>
+		</div>
+	);
+});
+
 /** 思考过程折叠卡片：默认收起，展开后显示完整推理文本（超长时提供截断展开）。 */
 export const ThinkingBlock = memo(function ThinkingBlock(props: {
 	text: string;
+	startedAt?: number;
 	endedAt?: number;
 	showThinking?: boolean;
 }) {
-	const [expanded, setExpanded] = useState(false);
+	// 默认展开，方便用户看到推理过程；可手动折叠
+	const [expanded, setExpanded] = useState(true);
 	if (!props.showThinking || !props.text.trim()) return null;
 	const previewLen = 220;
 	const needsTruncate = props.text.length > previewLen;
@@ -1349,6 +2886,12 @@ export const ThinkingBlock = memo(function ThinkingBlock(props: {
 		expanded || !needsTruncate
 			? props.text
 			: `${props.text.slice(0, previewLen)}...`;
+	// 计算思考耗时（毫秒），有 endAt 且有 startAt 时才显示
+	const durationMs =
+		props.endedAt && props.startedAt && props.endedAt >= props.startedAt
+			? props.endedAt - props.startedAt
+			: null;
+	const durationText = durationMs != null ? formatDuration(durationMs) : null;
 	return (
 		<section className="thinking-card">
 			<button
@@ -1356,42 +2899,69 @@ export const ThinkingBlock = memo(function ThinkingBlock(props: {
 				onClick={() => setExpanded((v) => !v)}
 				aria-expanded={expanded}
 			>
-				<Brain size={14} />
+				<Brain size={15} />
 				<span>{t("thinking.title")}</span>
-				{props.endedAt ? <small>{formatTime(props.endedAt)}</small> : null}
-				<em>{expanded ? t("common.collapse") : t("common.expand")}</em>
 				<ChevronDown
-					size={14}
+					size={15}
 					className={`thinking-card-chevron${expanded ? " open" : ""}`}
 				/>
+				{!expanded && props.text && (
+					<span className="thinking-card-subtitle" title={props.text}>
+						{props.text.slice(0, 80)}{props.text.length > 80 ? "..." : ""}
+					</span>
+				)}
+				{durationText && <small>{durationText}</small>}
 			</button>
 			{expanded && <div className="thinking-card-content">{previewText}</div>}
 		</section>
 	);
 });
 
-/** 流式等待指示器：思考中/响应中，三点脉动 + 文案。 */
-export function ThinkingIndicator(props: {
+
+
+/**
+ * 流式响应指示器（三点脉动动画 + 状态文案），在 agent 运行/流式期间显示。
+ *
+ * 状态优先级：
+ *  1. 工具执行中 → "正在工具调用"（琥珀色）
+ *  2. 有思考文本 / 流式回答中 → "正在回应"
+ *  3. 过渡等待 → 只显示三点动画，无标签
+ *
+ * 注意：原来的 "正在思考" 状态已合并到 "正在回应"，不再单独展示。
+ */
+export function RespondingIndicator(props: {
 	thinking?: string;
 	showThinking?: boolean;
 	isExecutingTool?: boolean;
-	executingToolName?: string;
+	isStreaming?: boolean;
 }) {
-	const hasThinking =
-		props.showThinking && props.thinking && props.thinking.length > 0;
+	const { isExecutingTool, isStreaming, thinking, showThinking } = props;
+
+	let kind: "executing" | "responding" | "waiting";
+	let label: string;
+
+	if (isExecutingTool) {
+		kind = "executing";
+		label = t("thinking.executing");
+	} else if ((showThinking && thinking && thinking.length > 0) || isStreaming) {
+		// 有思考文本或流式回答中统一显示“正在回应”
+		kind = "responding";
+		label = t("thinking.responding");
+	} else {
+		// 过渡等待：只显示三点动画
+		kind = "waiting";
+		label = "...";
+	}
+
 	return (
-		<div
-			className="thinking-indicator"
-			data-kind={hasThinking ? "thinking" : "responding"}
-		>
-			<span className="thinking-indicator-dots" aria-hidden="true">
+		<div className="responding-indicator" data-kind={kind}>
+			<span className="responding-indicator-dots" aria-hidden="true">
 				<span />
 				<span />
 				<span />
 			</span>
-			<span className="thinking-indicator-label">
-				{hasThinking ? t("thinking.streaming") : t("thinking.responding")}
-			</span>
+			{/* 标签始终渲染，waiting 态通过 CSS visibility:hidden 隐藏，保持容器宽度稳定 */}
+			<span className="responding-indicator-label">{label}</span>
 		</div>
 	);
 }
@@ -1470,6 +3040,15 @@ function PetChooserPreview(props: {
 
 /** 助手正文：扁平 markdown 渲染，无气泡包裹，全宽排版，支持内嵌图片。
  *  路径链接化用 remark 插件在 mdast 层处理（见底部 remarkLinkifyPaths），不再前置改写原始字符串。 */
+/** 表格容器：与 code-block-wrap 保持相同的宽度与圆角，内部 <table> 仍负责横向滚动。 */
+function TableWrapper(props: React.ComponentProps<"table">) {
+	return (
+		<div className="table-wrap">
+			<table {...props} />
+		</div>
+	);
+}
+
 /** 流式输出期间的轻量代码块：不加载 mermaid、不跑数学/语法高亮，只展示原始文本，
  *  避免未闭合的 ```mermaid 围栏触发 mermaid.initialize/render 挤占主线程。 */
 function StreamingCodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
@@ -1478,10 +3057,17 @@ function StreamingCodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
 		? (child.props as { className?: string; children?: ReactNode })
 		: undefined;
 	const text = extractText(codeProps?.children ?? props.children);
+	const [copied, setCopied] = useState(false);
+	const handleCopy = () => {
+		writeClipboard(text);
+		setCopied(true);
+		showNotice(t("app.codeCopied"), 1200);
+		setTimeout(() => setCopied(false), 1800);
+	};
 	return (
 		<div className="code-block-wrap">
-			<button className="code-copy" onClick={() => navigator.clipboard.writeText(text)}>
-				{t("code.copy")}
+			<button className="code-copy" onClick={handleCopy} title={t("code.copy")}>
+				{copied ? <Check size={14} /> : <Copy size={14} />}
 			</button>
 			<pre {...props}>{props.children}</pre>
 		</div>
@@ -1499,7 +3085,7 @@ export const AssistantText = memo(
 		 *  mermaid 图渲染，避免每个 token 都对不断增长的全量正文调用重型插件导致主线程卡死。 */
 		isStreaming?: boolean;
 	}) {
-		// 统一在此处清理 ANSI 转义码与 <thinking> 标签，调用方可直接传原始消息文本
+		// 清理 ANSI 转义码与 <thinking> 标签，thinking 由调用方通过 ThinkingBlock 渲染
 		const cleanText = stripThinkingTags(stripAnsi(props.text));
 		// 流式期间用轻量管线（仅 GFM + 路径链接化），回答结束后切回含数学/图表的完整渲染。
 		const streaming = Boolean(props.isStreaming);
@@ -1528,6 +3114,7 @@ export const AssistantText = memo(
 					urlTransform={markdownUrlTransform}
 					components={{
 						pre: streaming ? StreamingCodeBlock : CodeBlock,
+						table: TableWrapper,
 						span: MathSpan,
 						a: (linkProps) => (
 							<MarkdownLink
@@ -1563,72 +3150,270 @@ export const TurnRow = memo(function TurnRow(props: {
 	onOpenFile?: (path: string) => void;
 	onDiffFile?: DiffFileHandler;
 	onResendUserMessage?: (message: ChatMessage) => void;
-	fileSummariesByMessage?: Record<string, SessionModifiedFile[]>;
+	onDeleteMessage?: (messageId: string) => void;
+	onEditMessage?: (messageId: string, newText: string) => void;
+	/** Agent 正在处理请求或流式输出中时禁用编辑/删除等操作按钮 */
+	agentRunning?: boolean;
+	/** 打开多选分享弹框 */
+	onEnterMultiSelect?: () => void;
 }) {
 	const { run } = props;
+	const [editing, setEditing] = useState(false);
+	const [editText, setEditText] = useState("");
+	const editAreaRef = useRef<HTMLDivElement | null>(null);
+	// 激活编辑时自动滚动到编辑区（避免 textarea 超出可视区域）
+	useEffect(() => {
+		if (editing && editAreaRef.current) {
+			editAreaRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+		}
+	}, [editing]);
 	const isComplete = run.endedAt > 0;
 	const duration = isComplete && run.startedAt > 0 ? run.endedAt - run.startedAt : 0;
-	const showDuration = isComplete && duration > 100;
+	const showDuration = isComplete && duration > 0;
 
-	// 合并本轮所有 assistant 文本与思考（保持原 AgentRun 的合并语义：同一轮多段回答拼成一整篇）
+	// 收集本轮所有 assistant 消息（按 run.items 的时序保持原始顺序）
 	const assistantMessages = run.items.filter(
 		(item): item is MessageItem =>
 			item.kind === "message" && item.message.role === "assistant",
 	);
-	const textParts: string[] = [];
-	const thinkingParts: string[] = [];
 	const allImages: ImageContent[] = [];
 	for (const item of assistantMessages) {
-		const txt = stripThinkingTags(stripAnsi(item.message.text)).trim();
-		if (txt) textParts.push(txt);
-		if (item.message.thinking?.trim())
-			thinkingParts.push(stripAnsi(item.message.thinking));
 		if (item.message.images) allImages.push(...item.message.images);
 	}
-	const mergedText = textParts.join("\n\n");
-	const mergedThinking = thinkingParts.join("\n\n");
+	// 合并后的完整文本仅用于编辑/复制/删除等操作栏，不用于展示
+	const mergedText = assistantMessages
+		.map((item) => stripThinkingTags(stripAnsi(item.message.text)).trim())
+		.filter(Boolean)
+		.join("\n\n");
 
-	// 独立思考组：未伴随正文的纯 thinking 消息
-	const standaloneThinking = run.items.filter(
-		(item): item is ThinkingGroupItem => item.kind === "thinking-group",
+	/** 找出 message 在 run.items 中的位置，分离「执行过程」（最后一条 assistant message 之前的所有条目）。
+	 *  执行过程包含 thinking-group、tool-group 以及中间穿插的 assistant 消息，
+	 *  默认折叠并以概要形式展示，用户可展开查看细节。最后一条 assistant 消息作为最终回答始终可见。 */
+	const lastAssistantIndex = (() => {
+		for (let i = run.items.length - 1; i >= 0; i--) {
+			if (run.items[i].kind === "message" && (run.items[i] as MessageItem).message.role === "assistant") {
+				return i;
+			}
+		}
+		return -1;
+	})();
+	// 执行过程 = 除最终回答外的所有条目（最终回答在折叠区外始终可见，不能再进折叠详情）。
+	// 边界：lastAssistantIndex === 0（如「思考+直接回答」的无工具回合）时，若取 run.items 全量，
+	// 最终回答会被同时渲染进折叠详情和下方正文，展开后出现两份；filter 排除它本身，
+	// 同时保留最终回答之后可能存在的尾部 tool/thinking 条目（slice 方案会将其丢弃）。
+	const executionItems = lastAssistantIndex >= 0
+		? (run.items as (ThinkingGroupItem | ToolGroupItem | MessageItem)[]).filter(
+			(_, index) => index !== lastAssistantIndex,
+		)
+		: (run.items as (ThinkingGroupItem | ToolGroupItem | MessageItem)[]);
+	const finalMessageItem = lastAssistantIndex >= 0 ? (run.items[lastAssistantIndex] as MessageItem) : null;
+
+	const toolCount = executionItems.filter((i) => i.kind === "tool-group").length;
+	const thinkingCount = executionItems.filter((i) => i.kind === "thinking-group").length;
+	const interReplyCount = executionItems.filter(
+		(i) => i.kind === "message" && i.message.role === "assistant",
+	).length;
+
+	// 最终回答文本，用于判断自然完成 vs 手动中断。
+	// 提前定义以在 useEffect 中使用（auto-collapse 逻辑需要判断是否有最终文本回答）。
+	const finalTxt = finalMessageItem
+		? stripThinkingTags(stripAnsi(finalMessageItem.message.text)).trim()
+		: "";
+
+	// 执行过程默认展开（agent 处理中），输出完毕后自动折叠。
+	// 使用 agentRunning 而非 isStreaming：后者在多步工具调用之间会短暂 flicker 为 false，
+	// 导致过早折叠工具输出；agentRunning 在整个 agent 处理生命周期内始终为 true。
+	const [executionExpanded, setExecutionExpanded] = useState(
+		!isComplete || Boolean(props.agentRunning),
 	);
-	// 工具组
-	const toolGroups = run.items.filter(
-		(item): item is ToolGroupItem => item.kind === "tool-group",
-	);
-	// 优先使用运行结束时固化到 assistant 消息的摘要；若本轮没有 assistant 文本或历史 id 对不上，
-	// 则直接从本轮 tool 消息兜底提取，保证纯工具调用（如 write）也能在卡片里展示。
-	const toolMessages = run.items.flatMap((item) =>
-		item.kind === "tool-group" ? item.messages : [],
-	);
-	const fallbackFileSummary = collectModifiedFilesFromToolMessages(toolMessages);
-	const fileSummary = mergeModifiedFiles(
-		props.fileSummariesByMessage?.[assistantMessages[0]?.message.id],
-		fallbackFileSummary,
-	);
+	useEffect(() => {
+		if (props.agentRunning) {
+			setExecutionExpanded(true);
+		} else if (isComplete) {
+			setExecutionExpanded(false);
+		}
+	}, [isComplete, props.agentRunning]);
 
 	const rowRef = useRef<HTMLElement | null>(null);
-	const [collapsed, setCollapsed] = useState(false);
+	// 最终回答的思考文本与标记，在 useMemo 之前提取（useMemo 本身是 hook，
+	// 必须放在所有 early return 之前，否则 agentRunning 切换到 true 时
+	// 会因少执行一个 hook 而触发 "Rendered fewer hooks" 报错。）
+	const finalThinkingTxt = finalMessageItem?.message.thinking?.trim()
+		? stripAnsi(finalMessageItem.message.thinking)
+		: null;
+	const hasFinalThinking = Boolean(finalThinkingTxt && props.showThinking);
+	// 将最终消息的思考插入执行过程（放在工具之前），确保时序正确：思考→工具→文本
+	const executionItemsWithFinalThinking = useMemo(() => {
+		const items = [...executionItems];
+		if (hasFinalThinking && finalThinkingTxt && props.showThinking) {
+			const thinkingItem: ThinkingGroupItem = {
+				kind: "thinking-group",
+				id: `final-thinking-${finalMessageItem?.message.id ?? run.id}`,
+				messages: finalMessageItem?.message ? [finalMessageItem.message] : [],
+				text: finalThinkingTxt,
+				startedAt: run.startedAt,
+				endedAt: finalMessageItem?.message.timestamp ?? run.endedAt,
+			};
+			items.push(thinkingItem);
+		}
+		return items;
+	}, [executionItems, hasFinalThinking, finalThinkingTxt, props.showThinking,
+		finalMessageItem?.message.id, finalMessageItem?.message.timestamp,
+		finalMessageItem?.message, run.id, run.startedAt, run.endedAt,
+	]);
+
+	// 统计（在 early return 之前，确保 hook 数量一致）
+	const totalThinkingCount = executionItemsWithFinalThinking.filter((i) => i.kind === "thinking-group").length;
+	const totalToolCount = executionItemsWithFinalThinking.filter((i) => i.kind === "tool-group").length;
+	const totalInterReplyCount = executionItemsWithFinalThinking.filter(
+		(i) => i.kind === "message" && i.message.role === "assistant",
+	).length;
+	const summaryParts: string[] = [];
+	if (totalToolCount > 0) summaryParts.push(`${totalToolCount}个工具`);
+	if (totalThinkingCount > 0) summaryParts.push(`${totalThinkingCount}次思考`);
+	if (totalInterReplyCount > 0) summaryParts.push(`${totalInterReplyCount}次回答`);
+	const summaryText = summaryParts.length > 0 ? `执行过程: ${summaryParts.join(" ")}` : "";
+	const hasFoldableContent = executionItemsWithFinalThinking.length > 0 || run.items.some((i) => i.kind !== "message");
 
 	// 本轮没有任何可渲染内容时不输出空容器
 	const hasContent =
-		mergedText ||
-		mergedThinking ||
-		standaloneThinking.length > 0 ||
-		toolGroups.length > 0 ||
+		assistantMessages.length > 0 ||
+		run.items.some(item => item.kind === "thinking-group") ||
+		run.items.some(item => item.kind === "tool-group") ||
 		allImages.length > 0;
 	if (!hasContent) return null;
 
+	/** 渲染执行过程中的一个条目（thinking-group / tool-group / assistant message）。 */
+	const renderExecutionItem = (item: ThinkingGroupItem | ToolGroupItem | MessageItem) => {
+		if (item.kind === "thinking-group") {
+			if (!props.showThinking) return null;
+			return (
+				<ThinkingBlock
+					key={item.id}
+					text={item.text}
+					startedAt={item.startedAt}
+					endedAt={item.endedAt}
+					showThinking={props.showThinking}
+				/>
+			);
+		}
+		if (item.kind === "tool-group") {
+			return <ToolGroupCard key={item.id} group={item} onDiffFile={props.onDiffFile} />;
+		}
+		if (item.kind === "message" && item.message.role === "assistant") {
+			const txt = stripThinkingTags(stripAnsi(item.message.text)).trim();
+			if (!txt) return null;
+			return (
+				<AssistantText
+					key={item.message.id}
+					text={txt}
+					images={allImages}
+					onPreviewImage={props.onPreviewImage}
+					onOpenExternal={props.onOpenExternal}
+					onOpenFile={props.onOpenFile}
+					isStreaming={props.isStreaming ?? false}
+				/>
+			);
+		}
+		return null;
+	};
+
+	// Streaming 模式：agent 仍在执行中，按时间顺序渲染所有条目，
+	// 不把最后一条 assistant 回答分离到最底部，避免新的思考和工具出现在已回答文本之上。
+	if (props.agentRunning) {
+		const allItems = run.items as (ThinkingGroupItem | ToolGroupItem | MessageItem)[];
+		// 对最后一条 assistant 消息提取 thinking 作为独立的 thinking-group，
+		// 在时间线上插在回答文本之前（与已完成回合的 finalThinking 逻辑一致）。
+		const chronologicalItems = (() => {
+			if (allItems.length === 0) return allItems;
+			const last = allItems[allItems.length - 1];
+			if (
+				last?.kind === "message" &&
+				last.message.role === "assistant" &&
+				props.showThinking &&
+				last.message.thinking?.trim()
+			) {
+				const thinkingBlock: ThinkingGroupItem = {
+					kind: "thinking-group",
+					id: `streaming-thinking-${last.message.id}`,
+					messages: [last.message],
+					text: stripAnsi(last.message.thinking),
+					startedAt: run.startedAt,
+					endedAt: last.message.timestamp ?? run.endedAt,
+				};
+				return [...allItems.slice(0, -1), thinkingBlock, last];
+			}
+			return allItems;
+		})();
+
+		return (
+			<article ref={rowRef} className="turn-row" data-message-id={run.id}>
+				<div className="turn-row-body">
+					<div className="turn-row-meta">
+						<span className="turn-row-agent">pi</span>
+						<time>{formatTime(run.endedAt)}</time>
+					</div>
+					{/* 按时间顺序渲染所有条目，最新的活动在底部 */}
+					{chronologicalItems.map(renderExecutionItem)}
+				</div>
+			</article>
+		);
+	}
+
+
+
+	// 没有助手指令消息的情况：整轮只含工具/思考，用执行过程折叠渲染
+	if (lastAssistantIndex === -1) {
+		return (
+			<article ref={rowRef} className="turn-row" data-message-id={run.id}>
+				<div className="turn-row-body">
+					<div className="turn-row-meta">
+						<span className="turn-row-agent">pi</span>
+						<time>{formatTime(run.endedAt)}</time>
+						{showDuration && (
+							<span className="turn-row-duration">{formatDuration(duration)}</span>
+						)}
+					</div>
+					{/* 执行过程概要（含工具/思考），默认折叠 */}
+					{hasFoldableContent && summaryText && (
+						<div className="execution-summary">
+							<button
+								type="button"
+								className="execution-summary-toggle"
+								onClick={() => setExecutionExpanded((prev) => !prev)}
+								aria-expanded={executionExpanded}
+								title={executionExpanded ? t("common.collapse") : t("common.expand")}
+							>
+								{executionExpanded ? (
+									<ChevronDown size={14} aria-hidden="true" />
+								) : (
+									<ChevronRight size={14} aria-hidden="true" />
+								)}
+								<span>{summaryText}</span>
+							</button>
+							{executionExpanded && (
+								<div className="execution-summary-details">
+									{executionItemsWithFinalThinking.map(renderExecutionItem)}
+									<button
+										type="button"
+										className="execution-summary-collapse"
+										onClick={() => setExecutionExpanded(false)}
+										title={t("common.collapse")}
+									>
+										<ChevronUp size={12} aria-hidden="true" />
+										<span>{t("common.collapse")}</span>
+									</button>
+								</div>
+							)}
+						</div>
+					)}
+				</div>
+			</article>
+		);
+	}
+
 	return (
-		<article ref={rowRef} className={`turn-row${collapsed ? " collapsed" : ""}`} data-message-id={run.id}>
-			<button
-				className="turn-row-rail"
-				type="button"
-				onClick={() => setCollapsed((value) => !value)}
-				aria-expanded={!collapsed}
-				aria-label={collapsed ? t("common.expand") : t("common.collapse")}
-				title={collapsed ? t("common.expand") : t("common.collapse")}
-			/>
+		<article ref={rowRef} className="turn-row" data-message-id={run.id}>
 			<div className="turn-row-body">
 				<div className="turn-row-meta">
 					<span className="turn-row-agent">pi</span>
@@ -1637,68 +3422,133 @@ export const TurnRow = memo(function TurnRow(props: {
 						<span className="turn-row-duration">{formatDuration(duration)}</span>
 					)}
 				</div>
-				{collapsed ? (
-					<div className="turn-row-collapsed-summary" aria-hidden="true">
-						{mergedText ? summarizeMessage(mergedText) : t("common.expand")}
-					</div>
-				) : (
-					<>
-						{/* 思考过程：独立思考组在前 */}
-						{props.showThinking &&
-							standaloneThinking.map((g) => (
-								<ThinkingBlock
-									key={g.id}
-									text={g.text}
-									endedAt={g.endedAt}
-									showThinking={props.showThinking}
-								/>
-							))}
-						{/* 合并的思考（来自打包 thinking 的 assistant 消息）：也放在正文前，
-							保证思考块始终在回答上方，不受"打包 vs 独立"分组的影响 */}
-						{props.showThinking &&
-							mergedThinking &&
-							standaloneThinking.length === 0 && (
-							<ThinkingBlock
-								text={mergedThinking}
-								endedAt={run.endedAt}
-								showThinking={props.showThinking}
-							/>
+				{/* 执行过程概要（含工具/思考/中间回答），置于最终回答之前以保持调用顺序。 */}
+				{hasFoldableContent && summaryText && (
+					<div className="execution-summary">
+						<button
+							type="button"
+							className="execution-summary-toggle"
+							onClick={() => setExecutionExpanded((prev) => !prev)}
+							aria-expanded={executionExpanded}
+							title={executionExpanded ? t("common.collapse") : t("common.expand")}
+						>
+							{executionExpanded ? (
+								<ChevronDown size={14} aria-hidden="true" />
+							) : (
+								<ChevronRight size={14} aria-hidden="true" />
+							)}
+							<span>{summaryText}</span>
+						</button>
+						{executionExpanded && (
+							<div className="execution-summary-details">
+								{executionItemsWithFinalThinking.map(renderExecutionItem)}
+								<button
+									type="button"
+									className="execution-summary-collapse"
+									onClick={() => setExecutionExpanded(false)}
+									title={t("common.collapse")}
+								>
+									<ChevronUp size={12} aria-hidden="true" />
+									<span>{t("common.collapse")}</span>
+								</button>
+							</div>
 						)}
-						{/* 工具调用组 */}
-						{toolGroups.map((g) => (
-							<ToolGroupCard key={g.id} group={g} />
-						))}
-						{/* 助手正文 */}
-						{mergedText && (
+					</div>
+				)}
+				{/* 最终回答（始终可见）；最终思考已融入执行过程折叠区 */}
+				{finalMessageItem && (
+					<Fragment key={finalMessageItem.message.id}>
+						{editing ? (
+							<div className="turn-row-edit-area" ref={editAreaRef}>
+								<div className="edit-area-indicator">{t("common.edit")}</div>
+								<textarea
+									className="turn-row-edit-textarea"
+									value={editText}
+									onChange={(e) => setEditText(e.target.value)}
+									onKeyDown={(e) => {
+										if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+											e.preventDefault();
+											const targetId = assistantMessages.at(-1)?.message.id;
+											if (targetId && props.onEditMessage) {
+												props.onEditMessage(targetId, editText);
+												setEditing(false);
+											}
+										}
+										if (e.key === "Escape") setEditing(false);
+									}}
+									autoFocus
+								/>
+								<div className="turn-row-edit-actions">
+									<button className="turn-row-edit-btn primary" onClick={() => {
+										const targetId = assistantMessages.at(-1)?.message.id;
+										if (targetId && props.onEditMessage) {
+											props.onEditMessage(targetId, editText);
+											setEditing(false);
+										}
+									}}>{t("common.save")}</button>
+									<button className="turn-row-edit-btn" onClick={() => setEditing(false)}>{t("common.cancel")}</button>
+								</div>
+							</div>
+						) : finalTxt ? (
 							<AssistantText
-								text={mergedText}
+								text={finalTxt}
 								images={allImages}
 								onPreviewImage={props.onPreviewImage}
 								onOpenExternal={props.onOpenExternal}
 								onOpenFile={props.onOpenFile}
 								isStreaming={props.isStreaming ?? false}
 							/>
+						) : null}
+					</Fragment>
+				)}
+				{/* 操作栏 */}
+				{mergedText && !editing && (
+					<div className="turn-row-actions">
+						<CopyMenu text={stripMarkdown(mergedText)} markdown={mergedText} targetRef={rowRef} />
+						<button
+							className="turn-row-action-btn"
+							onClick={props.onEnterMultiSelect}
+						title={t("app.multiSelectEnter")}
+						>
+							<Share size={14} />
+						</button>
+						{!props.isStreaming && !props.agentRunning && assistantMessages.at(-1)?.message.id && (
+							<>
+								<button
+									className="turn-row-action-btn"
+									onClick={() => {
+										setEditText(mergedText);
+										setEditing(true);
+									}}
+								title={t("common.edit")}
+								>
+									<SquarePen size={14} />
+								</button>
+								<button
+									className="turn-row-action-btn"
+									onClick={() => {
+										const targetId = assistantMessages.at(-1)?.message.id;
+										if (targetId && props.onDeleteMessage) {
+											props.onDeleteMessage(targetId);
+										}
+									}}
+									title={t("common.delete")}
+								>
+									<Trash size={14} />
+								</button>
+							</>
 						)}
-						{/* 操作栏：hover/focus 显隐，复制整轮回答 */}
-						{mergedText && (
-							<div className="turn-row-actions">
-								<CopyMenu text={mergedText} markdown={mergedText} targetRef={rowRef} />
-							</div>
-						)}
-						{/* 本轮修改文件摘要 */}
-						{fileSummary && fileSummary.length > 0 && (
-							<SessionFileSummary
-								files={fileSummary}
-								onOpenFile={props.onOpenFile}
-								onDiffFile={props.onDiffFile}
-							/>
-						)}
-					</>
+					</div>
 				)}
 			</div>
 		</article>
 	);
-});
+}, (previous, next) =>
+	sameAgentRunForRender(previous.run, next.run) &&
+	previous.showThinking === next.showThinking &&
+	previous.isStreaming === next.isStreaming &&
+	previous.agentRunning === next.agentRunning,
+);
 
 /**
  * 从用户消息文本中提取 pi 展开后的 <skill name="..." location="...">...</skill> 块。
@@ -1717,15 +3567,35 @@ function extractSkillBlocks(text: string): { skills: string[]; text: string } {
 	return { skills, text: cleaned.trim() };
 }
 
-/** 用户消息：右对齐气泡 + 附件 + hover 显隐操作栏（复制/编辑/重发）。 */
+/** 用户消息：右对齐气泡 + 附件 + hover 显隐操作栏（复制/编辑/删除/重发/修改输入框）。
+ * 编辑分两种：原地编辑（修改 JSONL + 重载会话）和修改输入框（放回 composer 不自动发送）。 */
 export const UserBubble = memo(function UserBubble(props: {
 	message: ChatMessage;
 	onPreviewImage: (image: ImageContent) => void;
 	onOpenFile?: (path: string) => void;
 	onResendUserMessage?: (message: ChatMessage) => void;
+	onEditMessage?: (messageId: string, newText: string) => void;
+	onDeleteMessage?: (messageId: string) => void;
+	/** 附件（中止/失败）可重发时显示重发按钮 */
+	showResendButton?: boolean;
+	validCommandNames?: Set<string>;
+	validFilePaths?: Set<string>;
+	/** Agent 正在处理请求或流式输出中时禁用编辑/删除等操作按钮 */
+	agentRunning?: boolean;
+	/** 打开多选分享弹框 */
+	onEnterMultiSelect?: () => void;
 }) {
 	const { message } = props;
 	const rowRef = useRef<HTMLElement | null>(null);
+	const [editing, setEditing] = useState(false);
+	const [editText, setEditText] = useState("");
+	const editAreaRef = useRef<HTMLDivElement | null>(null);
+	// 激活编辑时自动滚动到编辑区
+	useEffect(() => {
+		if (editing && editAreaRef.current) {
+			editAreaRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+		}
+	}, [editing]);
 	// 提取 pi 展开后的 <skill> 块：渲染为 skill 徽标，并从正文里剥除 XML
 	const { skills, text: bodyText } = extractSkillBlocks(stripAnsi(message.text));
 	const cleanText = bodyText;
@@ -1740,8 +3610,15 @@ export const UserBubble = memo(function UserBubble(props: {
 			: deliveryBehavior === "followUp"
 				? t("app.messageDeliveryFollowUp")
 				: null;
-	const handleEdit = () => {
-		// 编辑只把原消息放回输入框，不自动发送，方便用户二次加工
+	/** 原地编辑不影响输入框；先提交给确认弹窗。 */
+	const handleSaveEdit = () => {
+		if (props.onEditMessage && editText.trim()) {
+			props.onEditMessage(message.id, editText);
+			setEditing(false);
+		}
+	};
+	/** 编辑后重发：放回 composer 输入框，由用户自行修改后发送。 */
+	const handleEditAndResend = () => {
 		document.querySelector<HTMLTextAreaElement>(".composer-box textarea")?.focus();
 		window.dispatchEvent(
 			new CustomEvent("user-message-edit", { detail: { text: message.text } }),
@@ -1772,10 +3649,36 @@ export const UserBubble = memo(function UserBubble(props: {
 					))}
 				</div>
 			)}
-			{cleanText && (
+			{cleanText && !editing && (
 				<div className="user-turn-bubble">
 					<div className="user-turn-text">
-						{renderChipText(cleanText)}
+						{renderChipText(cleanText, props.onOpenFile, props.validCommandNames, props.validFilePaths)}
+					</div>
+				</div>
+			)}
+			{editing && (
+				<div className="user-turn-edit-area" ref={editAreaRef}>
+					<div className="edit-area-indicator">{t("common.edit")}</div>
+					<textarea
+						className="message-edit-textarea"
+						value={editText}
+						onChange={(e) => setEditText(e.target.value)}
+						onKeyDown={(e) => {
+							if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+								e.preventDefault();
+								handleSaveEdit();
+							}
+							if (e.key === "Escape") setEditing(false);
+						}}
+						autoFocus
+					/>
+					<div className="message-edit-actions">
+						<button className="message-edit-btn primary" onClick={handleSaveEdit}>
+							{t("common.save")}
+						</button>
+						<button className="message-edit-btn" onClick={() => setEditing(false)}>
+							{t("common.cancel")}
+						</button>
 					</div>
 				</div>
 			)}
@@ -1797,21 +3700,57 @@ export const UserBubble = memo(function UserBubble(props: {
 				<time>{formatTime(message.timestamp)}</time>
 			</div>
 			<div className="user-turn-actions">
-				<CopyMenu text={cleanText} markdown={message.text} targetRef={rowRef} />
-				<button className="user-turn-action-btn" onClick={handleEdit}>
-					{t("common.edit")}
-				</button>
+				<CopyMenu text={stripMarkdown(cleanText)} markdown={message.text} targetRef={rowRef} />
 				<button
 					className="user-turn-action-btn"
-					onClick={() => props.onResendUserMessage?.(message)}
-					title={t("app.resendTitle")}
-				>
-					{t("app.resend")}
-				</button>
+					onClick={props.onEnterMultiSelect}
+					title={t("app.multiSelectEnter")}
+						>
+							<Share size={14} />
+						</button>
+				{!editing && !props.agentRunning && (
+					<>
+						<button className="user-turn-action-btn" onClick={() => {
+							setEditText(cleanText);
+							setEditing(true);
+						}} title={t("common.edit")}>
+							<SquarePen size={14} />
+						</button>
+						<button
+							className="user-turn-action-btn"
+							onClick={handleEditAndResend}
+							title={t("app.editAndResendTitle")}
+						>
+							<UserPen size={14} />
+						</button>
+						<button
+							className="user-turn-action-btn"
+							onClick={() => props.onDeleteMessage?.(message.id)}
+							title={t("common.delete")}
+						>
+							<Trash size={14} />
+						</button>
+						{props.showResendButton && (
+							<button
+								className="user-turn-action-btn"
+								onClick={() => props.onResendUserMessage?.(message)}
+								title={t("app.resendTitle")}
+							>
+								<Send size={14} />
+							</button>
+						)}
+					</>
+				)}
 			</div>
 		</article>
 	);
-});
+}, (previous, next) =>
+	sameChatMessageForRender(previous.message, next.message) &&
+	previous.showResendButton === next.showResendButton &&
+	previous.agentRunning === next.agentRunning &&
+	previous.validCommandNames === next.validCommandNames &&
+	previous.validFilePaths === next.validFilePaths,
+);
 
 /**
  * remark 插件：把助手正文里的裸文件路径转换成可点击的 file:// 链接。
@@ -1835,7 +3774,12 @@ const remarkLinkifyPaths = () => {
 		const visit = (node: any) => {
 			if (!node || typeof node !== "object") return;
 			const type: string = node.type;
-			if (type === "code" || type === "inlineCode" || type === "link") return;
+			if (type === "code" || type === "inlineCode") return;
+			if (type === "link") {
+				const fileHref = typeof node.url === "string" ? toInternalFileHref(node.url) : null;
+				if (fileHref) node.url = fileHref;
+				return;
+			}
 			if (type === "text" && typeof node.value === "string") {
 				const text: string = node.value;
 				FILE_PATH_RE.lastIndex = 0;
@@ -1948,10 +3892,24 @@ function stripThinkingTags(text: string): string {
 	return text.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "").trim();
 }
 
+/** 将 Markdown 语法转换为纯文本，保留可读的文字内容 */
+export function stripMarkdown(text: string): string {
+	return removeMarkdown(text, {
+		// 保留列表项文本，移除列表标记符号
+		stripListLeaders: true,
+		// 使用 Unicode 字符替换列表标记
+		listUnicodeChar: "",
+		// 启用 GFM 表格/任务列表等处理
+		gfm: true,
+		// 图片保留 alt 文本
+		useImgAltText: true,
+	});
+}
+
 /** 将消息文本中的 @path / /command 渲染为行内 chip（聊天区展示用，与输入框 chip 视觉一致）。
  * 可通过 onOpenFile 回调使 chip 可点击跳转。 */
-function renderChipText(text: string, onOpenFile?: (path: string) => void): ReactNode[] {
-	const chips = parseRichInputChips(text);
+function renderChipText(text: string, onOpenFile?: (path: string) => void, validCommandNames?: Set<string>, validFilePaths?: Set<string>): ReactNode[] {
+	const chips = parseRichInputChips(text, validCommandNames, validFilePaths);
 	if (chips.length === 0) return [text];
 	const nodes: ReactNode[] = [];
 	let cursor = 0;
@@ -1986,17 +3944,28 @@ function renderChipText(text: string, onOpenFile?: (path: string) => void): Reac
 function MathSpan(props: React.HTMLAttributes<HTMLSpanElement>) {
 	const { className, children, ...spanProps } = props;
 	const ref = useRef<HTMLSpanElement | null>(null);
+	const [copied, setCopied] = useState(false);
 	const isDisplayMath = /\bkatex-display\b/.test(className ?? "");
-	if (!isDisplayMath) return <span className={className} {...spanProps}>{children}</span>;
+	// 只对 KaTeX 最外层 span 添加复制按钮，内部嵌套的 katex-mathml / katex-html 等直接透传。
+	// 行内公式外层 class 精确为 "katex"，块级外层为 "katex-display"（可能同时含 "katex"）。
+	const isOuterKatex = isDisplayMath || className === "katex";
+	if (!isOuterKatex) return <span className={className} {...spanProps}>{children}</span>;
 	const copyMath = () => {
 		const annotation = ref.current?.querySelector('annotation[encoding="application/x-tex"]');
 		const source = annotation?.textContent || extractText(children);
-		void navigator.clipboard.writeText(`$$\n${source}\n$$`);
+		// 行内公式用 $...$ 包裹，块级公式用 $$...$$ 包裹
+		const texContent = isDisplayMath ? `$$\n${source}\n$$` : `$${source}$`;
+		void writeClipboard(texContent);
+		setCopied(true);
+		showNotice(t("app.latexCopied"), 1200);
+		setTimeout(() => setCopied(false), 1800);
 	};
 	return (
-		<span className="math-copy-wrap">
+		<span className={`math-copy-wrap${isDisplayMath ? "" : " math-copy-wrap--inline"}`}>
 			<span ref={ref} className={className} {...spanProps}>{children}</span>
-			<button className="math-copy-btn" type="button" onClick={copyMath}>{t("common.copy")}</button>
+			<button className={`math-copy-btn${isDisplayMath ? "" : " math-copy-btn--inline"}`} type="button" onClick={copyMath} title={t("common.copy")}>
+				{copied ? <Check size={isDisplayMath ? 12 : 10} /> : <Copy size={isDisplayMath ? 12 : 10} />}
+			</button>
 		</span>
 	);
 }
@@ -2008,16 +3977,24 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
 		: undefined;
 	const languageClass = codeProps?.className ?? "";
 	const text = extractText(codeProps?.children ?? props.children);
+	const [copied, setCopied] = useState(false);
 	if (/\blanguage-mermaid\b/i.test(languageClass)) {
 		return <MermaidDiagram chart={text} />;
 	}
+	const handleCopy = () => {
+		writeClipboard(text);
+		setCopied(true);
+		showNotice(t("app.codeCopied"), 1200);
+		setTimeout(() => setCopied(false), 1800);
+	};
 	return (
 		<div className="code-block-wrap">
 			<button
 				className="code-copy"
-				onClick={() => navigator.clipboard.writeText(text)}
+				onClick={handleCopy}
+				title={t("code.copy")}
 			>
-				{t("code.copy")}
+				{copied ? <Check size={14} /> : <Copy size={14} />}
 			</button>
 			<pre {...props}>{props.children}</pre>
 		</div>
@@ -2078,7 +4055,7 @@ function MermaidDiagram(props: { chart: string }) {
 			) : (
 				<>
 					<div className="mermaid-toolbar" aria-label="Mermaid diagram controls">
-						<button type="button" onClick={() => navigator.clipboard.writeText(`\`\`\`mermaid\n${props.chart}\n\`\`\``)}>{t("common.copy")}</button>
+						<button type="button" onClick={() => { writeClipboard(`\`\`\`mermaid\n${props.chart}\n\`\`\``); showNotice(t("app.mermaidCopied"), 1200); }} title={t("common.copy")}><Copy size={14} /></button>
 						<button type="button" onClick={() => setZoom((value) => Math.max(0.5, value - 0.1))}>−</button>
 						<span>{Math.round(zoom * 100)}%</span>
 						<button type="button" onClick={() => setZoom((value) => Math.min(2.5, value + 0.1))}>＋</button>
@@ -2103,9 +4080,10 @@ function MermaidMarkdownFallback(props: { chart: string; error: string }) {
 		<div className="code-block-wrap mermaid-fallback">
 			<button
 				className="code-copy"
-				onClick={() => navigator.clipboard.writeText(markdown)}
+				onClick={() => { writeClipboard(markdown); showNotice(t("app.codeCopied"), 1200); }}
+				title={t("code.copy")}
 			>
-				{t("code.copy")}
+				<Copy size={14} />
 			</button>
 			<pre>{markdown}</pre>
 			<small className="mermaid-error-message">Mermaid render failed: {props.error}</small>
@@ -2127,23 +4105,49 @@ function MarkdownLink(
 		onOpenFile?: (path: string) => void;
 	},
 ) {
-	const { onOpenExternal, onOpenFile, ...anchorProps } = props;
+	const { onOpenExternal, onOpenFile, children, className, title, ...anchorProps } = props;
+	const filePath = filePathFromHref(props.href);
+	const isFileLink = filePath !== null;
 	const handleClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
 		e.preventDefault();
 		if (!props.href) return;
-		
-		// 处理文件路径链接（file:// 协议）
-		if (props.href.startsWith('file://')) {
-			const filePath = decodeURIComponent(props.href.slice(7));
-			if (onOpenFile) {
-				void onOpenFile(filePath);
-			}
+
+		if (filePath !== null) {
+			if (onOpenFile) void onOpenFile(stripFileLocation(filePath));
 		} else {
-			// 普通 URL 链接用系统浏览器打开
 			void onOpenExternal(props.href);
 		}
 	};
-	return <a {...anchorProps} onClick={handleClick} />;
+	const handleContextMenu = (e: React.MouseEvent<HTMLAnchorElement>) => {
+		if (filePath === null) return;
+		e.preventDefault();
+		void writeClipboard(filePath).then(
+			() => showNotice(t("app.pathCopied"), 1200),
+			() => showNotice(t("copy.failed"), 2000, "error"),
+		);
+	};
+	const linkClass =
+		[className, isFileLink ? "markdown-link-file" : undefined]
+			.filter(Boolean)
+			.join(" ") || undefined;
+	return (
+		<a
+			{...anchorProps}
+			className={linkClass}
+			onClick={handleClick}
+			onContextMenu={handleContextMenu}
+			title={isFileLink ? filePath : title}
+		>
+			{isFileLink ? (
+				<>
+					<FileText size={12} className="markdown-link-file-icon" />
+					<span>{children}</span>
+				</>
+			) : (
+				children
+			)}
+		</a>
+	);
 }
 
 function extractText(node: ReactNode): string {
@@ -2173,30 +4177,309 @@ function formatTime(timestamp: number) {
 	});
 }
 
-export function buildOutline(messages: ChatMessage[]) {
-	// 会话定位只展示用户提问，每条代表一轮完整对话（用户提问 + 紧随其后的 AI 回答）。
-	// AI 回答不单独列出，避免列表冗长且与用户提问重复描述同一轮对话。
-	return messages
-		.filter((message) => message.role === "user")
-		.map((message) => ({
-			id: message.id,
-			role: message.role,
-			title: summarizeMessage(message.text),
-			time: formatTime(message.timestamp),
-		}))
-		.filter((item) => item.title);
+/** 收集所有可勾选的消息 ID（user + assistant） */
+function getSelectableMessageIds(
+	items: RenderMessage[],
+): string[] {
+	const ids: string[] = [];
+	for (const item of items) {
+		if (item.kind === "message" &&
+			(item.message.role === "user" || item.message.role === "assistant")) {
+			ids.push(item.message.id);
+		} else if (item.kind === "agent-run") {
+			for (const sub of item.items) {
+				if (sub.kind === "message" && sub.message.role === "assistant") {
+					ids.push(sub.message.id);
+				}
+			}
+		}
+	}
+	return ids;
 }
 
-function summarizeMessage(text: string) {
-	// 过滤 ANSI 转义码,避免 outline 标题显示乱码
-	const cleaned = text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
-	const firstLine =
-		cleaned
-			.replace(/```[\s\S]*?```/g, " ")
-			.split(/\r?\n/)
-			.map((line) => line.trim())
-			.find(Boolean) ?? "";
-	return firstLine.length > 48 ? `${firstLine.slice(0, 48)}...` : firstLine;
+/**
+ * 多选分享弹框：以会话树形式展示消息，用户勾选后复制分享。
+ * 支持按 agent-run 层级全选或逐条选择。
+ */
+export function MultiSelectModal(props: {
+	renderedRuns: RenderMessage[];
+	onClose: () => void;
+	onCopy: (
+		selectedIds: Set<string>,
+		kind: "text" | "markdown" | "image",
+	) => void;
+}) {
+	const [selectedIds, setSelectedIds] = useState<Set<string>>(
+		() => new Set(getSelectableMessageIds(props.renderedRuns)),
+	);
+	const [copying, setCopying] = useState<
+		"text" | "markdown" | "image" | null
+	>(null);
+
+	const allSelectableIds = useMemo(
+		() => getSelectableMessageIds(props.renderedRuns),
+		[props.renderedRuns],
+	);
+
+	const toggleMessage = useCallback((id: string) => {
+		setSelectedIds((prev) => {
+			const next = new Set(prev);
+			if (next.has(id)) next.delete(id);
+			else next.add(id);
+			return next;
+		});
+	}, []);
+
+	const isRunFullySelected = useCallback(
+		(run: AgentRunItem) => {
+			const ids = run.items
+				.filter(
+					(i): i is MessageItem =>
+						i.kind === "message" && i.message.role === "assistant",
+				)
+				.map((i) => i.message.id);
+			return ids.length > 0 && ids.every((id) => selectedIds.has(id));
+		},
+		[selectedIds],
+	);
+
+	const toggleRun = useCallback(
+		(run: AgentRunItem) => {
+			const ids = run.items
+				.filter(
+					(i): i is MessageItem =>
+						i.kind === "message" && i.message.role === "assistant",
+				)
+				.map((i) => i.message.id);
+			if (ids.length === 0) return;
+			const allSelected = ids.every((id) => selectedIds.has(id));
+			setSelectedIds((prev) => {
+				const next = new Set(prev);
+				for (const id of ids) {
+					if (allSelected) next.delete(id);
+					else next.add(id);
+				}
+				return next;
+			});
+		},
+		[selectedIds],
+	);
+
+	const selectAll = useCallback(() => {
+		setSelectedIds(new Set(allSelectableIds));
+	}, [allSelectableIds]);
+
+	const deselectAll = useCallback(() => {
+		setSelectedIds(new Set());
+	}, []);
+
+	/** 点击分享按钮：先显示脉冲动画，再执行复制关闭弹框 */
+	const handleCopy = useCallback(
+		async (kind: "text" | "markdown" | "image") => {
+			setCopying(kind);
+			// 让按钮脉冲动画渲染一帧后再执行复制
+			await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 120)));
+			setCopying(null);
+			props.onCopy(selectedIds, kind);
+		},
+		[selectedIds, props.onCopy],
+	);
+
+	const selectedCount = selectedIds.size;
+	const totalCount = allSelectableIds.length;
+
+	return (
+		<div
+			className="multi-select-modal-overlay"
+			onClick={props.onClose}
+		>
+			<div
+				className="multi-select-modal"
+				onClick={(e) => e.stopPropagation()}
+			>
+				{/* 标题栏 */}
+				<header className="multi-select-modal-header">
+					<h3>{t("app.multiSelectEnter")}</h3>
+					<button
+						className="multi-select-modal-close"
+						onClick={props.onClose}
+						aria-label={t("common.close")}
+					>
+						<X size={18} strokeWidth={2} />
+					</button>
+				</header>
+
+				{/* 树状列表 */}
+				<div className="multi-select-modal-tree">
+					{props.renderedRuns.map((item) => {
+						if (item.kind === "message") {
+							const msg = item.message;
+							if (msg.role === "user" || msg.role === "assistant") {
+								const isChecked = selectedIds.has(msg.id);
+								return (
+									<label
+										key={msg.id}
+										className={`multi-select-tree-node${isChecked ? " selected" : ""}`}
+									>
+										<input
+											type="checkbox"
+											checked={isChecked}
+											onChange={() => toggleMessage(msg.id)}
+										/>
+										<MessageCircle
+											size={14}
+											className="multi-select-node-icon user"
+										/>
+										<span className="multi-select-node-label">
+											<span className="multi-select-node-summary">
+												{summarizeMessage(stripAnsi(msg.text))}
+											</span>
+										</span>
+									</label>
+								);
+							}
+							return null;
+						}
+
+						if (item.kind === "agent-run") {
+							const runChecked = isRunFullySelected(item);
+							const runHasSome = item.items.some(
+								(i) =>
+									i.kind === "message" &&
+									i.message.role === "assistant" &&
+									selectedIds.has(i.message.id),
+							);
+							const runAnyChecked = runChecked || runHasSome;
+							const assistantMsgs = item.items.filter(
+								(i): i is MessageItem =>
+									i.kind === "message" && i.message.role === "assistant",
+							);
+							if (assistantMsgs.length === 0) return null;
+
+							return (
+								<div key={item.id} className="multi-select-tree-run">
+									<div
+										className={`multi-select-tree-node run-parent${runAnyChecked ? " selected" : ""}`}
+										onClick={() => toggleRun(item)}
+									>
+										<Brain size={15} className="multi-select-node-icon assistant" />
+										<span className="multi-select-node-label">
+											<span className="multi-select-node-run-label">pi</span>
+											<span className="multi-select-node-time">
+												{formatTime(item.endedAt)}
+											</span>
+										</span>
+										<span className="multi-select-node-assistant-count">
+											{assistantMsgs.length}
+										</span>
+									</div>
+									<div className="multi-select-run-children">
+										{assistantMsgs.map((sub) => {
+											const subChecked = selectedIds.has(sub.message.id);
+											return (
+												<label
+													key={sub.message.id}
+													className={`multi-select-tree-node run-child${subChecked ? " selected" : ""}`}
+												>
+													<input
+														type="checkbox"
+														checked={subChecked}
+														onChange={() =>
+															toggleMessage(sub.message.id)
+														}
+													/>
+													<FileText
+														size={14}
+														className="multi-select-node-icon child"
+													/>
+													<span className="multi-select-node-label">
+														<span className="multi-select-node-summary">
+															{summarizeMessage(
+																stripAnsi(sub.message.text),
+															)}
+														</span>
+													</span>
+												</label>
+											);
+										})}
+									</div>
+								</div>
+							);
+						}
+
+						return null;
+					})}
+				</div>
+
+				{/* 底部操作栏 */}
+				<footer className="multi-select-modal-footer">
+					<div className="multi-select-modal-footer-top">
+						<span className="multi-select-count">
+							{t("app.multiSelectCount", { count: selectedCount })}
+						</span>
+						<div className="multi-select-bulk-actions">
+							<button
+								className="multi-select-bulk-btn"
+								onClick={selectAll}
+								disabled={!totalCount}
+							>
+								{t("common.selectAll")}
+							</button>
+							<button
+								className="multi-select-bulk-btn"
+								onClick={deselectAll}
+								disabled={!selectedCount}
+							>
+								{t("common.deselectAll")}
+							</button>
+						</div>
+					</div>
+					<div className="multi-select-modal-footer-bottom">
+						<button
+							className={`multi-select-action-btn${copying === "text" ? " copying" : ""}`}
+							disabled={!selectedCount || !!copying}
+							onClick={() => handleCopy("text")}
+						>
+							{copying === "text" ? (
+								<Check size={14} strokeWidth={3} />
+							) : (
+								t("app.shareAsText")
+							)}
+						</button>
+						<button
+							className={`multi-select-action-btn${copying === "markdown" ? " copying" : ""}`}
+							disabled={!selectedCount || !!copying}
+							onClick={() => handleCopy("markdown")}
+						>
+							{copying === "markdown" ? (
+								<Check size={14} strokeWidth={3} />
+							) : (
+								t("app.shareAsMarkdown")
+							)}
+						</button>
+						<button
+							className={`multi-select-action-btn${copying === "image" ? " copying" : ""}`}
+							disabled={!selectedCount || !!copying}
+							onClick={() => handleCopy("image")}
+						>
+							{copying === "image" ? (
+								<Check size={14} strokeWidth={3} />
+							) : (
+								t("app.shareAsImage")
+							)}
+						</button>
+						<button
+							className="multi-select-action-btn primary"
+							onClick={props.onClose}
+							disabled={!!copying}
+						>
+							{t("app.multiSelectCancel")}
+						</button>
+					</div>
+				</footer>
+			</div>
+		</div>
+	);
 }
 
 export function RpcLogModal(props: {
@@ -2230,7 +4513,7 @@ export function RpcLogModal(props: {
 	}, [props.logs.length, visibleLogs.length]);
 
 	const copyLogs = (logs: typeof visibleLogs) =>
-		navigator.clipboard.writeText(logs.map(formatRpcLogForCopy).join("\n"));
+		writeClipboard(logs.map(formatRpcLogForCopy).join("\n"));
 
 	return (
 		<div className="modal-backdrop" onClick={props.onClose}>
@@ -2305,10 +4588,10 @@ export function RpcLogModal(props: {
 									</span>
 									<span className="log-summary">{log.summary}</span>
 									<div className="rpc-log-entry-actions" onClick={(event) => event.stopPropagation()}>
-										<button onClick={() => navigator.clipboard.writeText(formatRpcLogForCopy(log))}>
+										<button onClick={() => writeClipboard(formatRpcLogForCopy(log))}>
 											{t("common.copy")}
 										</button>
-										<button onClick={() => navigator.clipboard.writeText(jsonText)}>
+										<button onClick={() => writeClipboard(jsonText)}>
 											{t("rpc.copyJson")}
 										</button>
 									</div>
@@ -2346,9 +4629,22 @@ function formatRpcLogForCopy(log: {
 	});
 }
 
+type EntryAction = {
+	active?: boolean;
+	label: string;
+	onClick: (e: React.MouseEvent<HTMLButtonElement>) => void;
+	icon: ReactNode;
+};
+
 export function ConversationOutline(props: {
 	items: Array<{ id: string; role: string; title: string; time: string }>;
 	onJump: (id: string) => void;
+	/** 草稿本入口 */
+	extraAction?: EntryAction;
+	/** 终端入口 */
+	terminalAction?: EntryAction;
+	/** 外部编辑器打开入口 */
+	editorsAction?: EntryAction & { anchorRef?: React.RefObject<HTMLButtonElement | null> };
 }) {
 	const [expanded, setExpanded] = useState(false);
 	const [dragging, setDragging] = useState(false);
@@ -2398,16 +4694,19 @@ export function ConversationOutline(props: {
 	return (
 		<div
 			className={`outline-hover${dragging ? " dragging" : ""}`}
-			style={{ top }}
+			style={{ "--outline-top": `${top}px` } as React.CSSProperties}
 		>
-			<button
-				className="outline-trigger"
-				title={t("outline.trigger", { count: props.items.length })}
-				onPointerDown={startDrag}
-			>
-				☰
-			</button>
-			<nav className="conversation-outline">
+			<div className="outline-zone">
+				<button
+					className={`outline-trigger${props.items.length > 0 ? "" : " is-disabled"}`}
+					disabled={props.items.length === 0}
+					title={t("outline.trigger", { count: props.items.length })}
+					onPointerDown={props.items.length > 0 ? startDrag : undefined}
+				>
+					☰
+				</button>
+				{props.items.length > 0 && (
+				<nav className="conversation-outline">
 				<div className="outline-title">
 					<span
 						className="outline-drag-handle"
@@ -2441,7 +4740,43 @@ export function ConversationOutline(props: {
 						</button>
 					))}
 				</div>
-			</nav>
+				</nav>
+				)}
+			</div>
+			{/* 悬浮按钮组仅保留：会话大纲、草稿本、终端、编辑器打开；文件/Git/浏览器改到右侧 Tab 栏 */}
+			{props.extraAction && (
+				<button
+					type="button"
+					className={`scratch-pad-entry${props.extraAction.active ? " active" : ""}`}
+					title={props.extraAction.label}
+					aria-label={props.extraAction.label}
+					onClick={props.extraAction.onClick}
+				>
+					{props.extraAction.icon}
+				</button>
+			)}
+			{props.terminalAction && (
+				<button
+					type="button"
+					className={`terminal-entry${props.terminalAction.active ? " active" : ""}`}
+					title={props.terminalAction.label}
+					aria-label={props.terminalAction.label}
+					onClick={props.terminalAction.onClick}
+				>
+					{props.terminalAction.icon}
+				</button>
+			)}
+			{props.editorsAction && (
+				<button
+					type="button"
+					className={`editors-entry${props.editorsAction.active ? " active" : ""}`}
+					title={props.editorsAction.label}
+					aria-label={props.editorsAction.label}
+					onClick={props.editorsAction.onClick}
+				>
+					{props.editorsAction.icon}
+				</button>
+			)}
 		</div>
 	);
 }
@@ -2465,25 +4800,36 @@ export function DrawerContent(props: {
 	files: FileTreeNode[];
 	sessions: SessionSummary[];
 	sessionsLoading?: boolean;
-	/** Git 工作区中对比 HEAD 有变更的文件列表 */
-	gitChangedFiles: { path: string; status: string }[];
 	expandedDirs: Set<string>;
 	onToggleDirectory: (path: string) => void;
+	onCollapseAllDirectories: () => void;
+	onExpandAllDirectories?: () => void;
 	pinned: boolean;
 	onTogglePin: () => void;
 	onCollapse: () => void;
 	onClose: () => void;
+	/** 为 true 时隐藏内建 header（由右侧统一 Tab chrome 接管） */
+	hideChrome?: boolean;
 	onFileContextMenu: (node: FileTreeNode, x: number, y: number) => void;
 	onRefreshFiles: () => void;
+	onOpenFolder?: () => void;
 	onRefreshSessions: () => void;
 	onOpenSession: (session: SessionSummary) => void;
 	onRenameSession: (filePath: string, newName: string) => void;
 	onCopySession: (session: SessionSummary) => void | Promise<void>;
 	onExportSession: (session: SessionSummary) => void | Promise<void>;
 	onDeleteSession: (session: SessionSummary) => void | Promise<void>;
-	onDiffFile?: DiffFileHandler;
 	onOpenFile?: (path: string) => void;
 	onViewFile?: (path: string) => void;
+	onCreateItem?: (parentDir: string, name: string, type: "file" | "directory") => void;
+	/** 项目根目录路径 */
+	projectRoot?: string;
+	/** 从 OS 拖入文件到目录 */
+	onDropFiles?: (targetDir: string, files: FileList) => void;
+	/** 粘贴剪贴板文件到目标目录 */
+	onPasteFiles?: (targetDir: string) => void;
+	/** 内部拖拽移动文件到目标目录 */
+	onMoveFiles?: (sourcePaths: string[], targetDir: string) => void;
 }) {
 	const title =
 		props.panel === "files"
@@ -2493,51 +4839,47 @@ export function DrawerContent(props: {
 				: t("drawer.historyTitle");
 	return (
 		<>
-			<div className="drawer-header">
-				<strong>{title}</strong>
-				<div className="drawer-header-actions">
-					<button
-						className={props.pinned ? "active" : ""}
-						title={props.pinned ? t("drawer.unpin") : t("drawer.pin")}
-						aria-label={props.pinned ? t("drawer.unpin") : t("drawer.pin")}
-						onClick={props.onTogglePin}
-					>
-						<Pin size={15} />
-					</button>
-					<button
-						disabled={props.pinned}
-						title={props.pinned ? t("drawer.pinnedCannotCollapse") : t("drawer.collapsePanel")}
-						aria-label={t("drawer.collapsePanel")}
-						onClick={props.onCollapse}
-					>
-						<ChevronRight size={16} />
-					</button>
-					<button
-						disabled={props.pinned}
-						title={props.pinned ? t("drawer.pinnedCannotClose") : t("drawer.closePanel")}
-						aria-label={t("drawer.closePanel")}
-						onClick={props.onClose}
-					>
-						<X size={16} />
-					</button>
+			{/* 工具面板（文件等）由外层 drawer-chrome 提供 Tab 头，这里只在 sessions 等场景保留标题栏 */}
+			{!props.hideChrome && (
+				<div className="drawer-header">
+					<strong>{title}</strong>
+					<div className="drawer-header-actions">
+						<button
+							className={props.pinned ? "active" : ""}
+							title={props.pinned ? t("drawer.unpin") : t("drawer.pin")}
+							aria-label={props.pinned ? t("drawer.unpin") : t("drawer.pin")}
+							onClick={props.onTogglePin}
+						>
+							<Pin size={15} />
+						</button>
+						<button
+							disabled={props.pinned}
+							title={props.pinned ? t("drawer.pinnedCannotClose") : t("drawer.closePanel")}
+							aria-label={t("drawer.closePanel")}
+							onClick={props.onClose}
+						>
+							<X size={16} />
+						</button>
+					</div>
 				</div>
-			</div>
+			)}
 			{props.panel === "files" && (
 				<FilesPanel
 					files={props.files}
-					// 将 Git 变更文件列表转换为 SessionModifiedFile 格式传入 FilesPanel 展示
-					modifiedFiles={props.gitChangedFiles.map((f) => ({
-						path: f.path,
-						toolName: "git",
-						status: "done",
-					}))}
 					expandedDirs={props.expandedDirs}
 					onToggleDirectory={props.onToggleDirectory}
+					onCollapseAll={props.onCollapseAllDirectories}
+					onExpandAll={props.onExpandAllDirectories}
 					onFileContextMenu={props.onFileContextMenu}
 					onRefreshFiles={props.onRefreshFiles}
-					onDiffFile={props.onDiffFile}
+					onOpenFolder={props.onOpenFolder}
 					onOpenFile={props.onOpenFile}
 					onViewFile={props.onViewFile}
+					onCreateItem={props.onCreateItem}
+					currentProjectRoot={props.projectRoot}
+					onDropFiles={props.onDropFiles}
+					onPasteFiles={props.onPasteFiles}
+					onMoveFiles={props.onMoveFiles}
 				/>
 			)}
 			{props.panel === "sessions" && (
@@ -2555,100 +4897,190 @@ export function DrawerContent(props: {
 	);
 }
 
-const MODIFIED_FILES_PREVIEW_LIMIT = 5;
-
 function FilesPanel(props: {
 	files: FileTreeNode[];
-	/** Git 工作区中对比 HEAD 有变更的文件；会话卡片的修改摘要不使用该数据源。 */
-	modifiedFiles: SessionModifiedFile[];
 	expandedDirs: Set<string>;
 	onToggleDirectory: (path: string) => void;
 	onFileContextMenu: (node: FileTreeNode, x: number, y: number) => void;
 	onRefreshFiles: () => void;
-	onDiffFile?: DiffFileHandler;
+	/** 收起文件树中所有已展开的目录，清空 expandedDirs。 */
+	onCollapseAll?: () => void;
+	/** 展开文件树中所有目录 */
+	onExpandAll?: () => void;
+	onOpenFolder?: () => void;
 	onOpenFile?: (path: string) => void;
 	onViewFile?: (path: string) => void;
+	onCreateItem?: (parentDir: string, name: string, type: "file" | "directory") => void;
+	/** 项目根目录路径 */
+	currentProjectRoot?: string;
+	/** 从 OS 拖入文件到目录或面板空白区域 */
+	onDropFiles?: (targetDir: string, files: FileList) => void;
+	/** 粘贴剪贴板文件到目标目录（Ctrl+V / 工具栏按钮 / 右键菜单） */
+	onPasteFiles?: (targetDir: string) => void;
+	/** 内部拖拽移动文件/目录到目标目录 */
+	onMoveFiles?: (sourcePaths: string[], targetDir: string) => void;
 }) {
-	const [modifiedFilesExpanded, setModifiedFilesExpanded] = useState(false);
-	// 后端按修改时间升序传入；抽屉顶部优先展示最新文件，避免文件多时用户看不到刚改的内容。
-	const latestModifiedFiles = [...props.modifiedFiles].reverse();
-	const visibleModifiedFiles = modifiedFilesExpanded
-		? latestModifiedFiles
-		: latestModifiedFiles.slice(0, MODIFIED_FILES_PREVIEW_LIMIT);
-	const hiddenModifiedFileCount = Math.max(
-		0,
-		latestModifiedFiles.length - visibleModifiedFiles.length,
-	);
+	const panelRef = useRef<HTMLDivElement>(null);
+	const [showScrollTop, setShowScrollTop] = useState(false);
+	const [showScrollBottom, setShowScrollBottom] = useState(false);
+	// Electron renderer 不支持 window.prompt；新建文件/文件夹走应用内小弹层。
+	const [createItemOpen, setCreateItemOpen] = useState(false);
+	const [createItemName, setCreateItemName] = useState("");
+	/** 拖入高亮的目标目录路径（null = 拖在面板空白区域无高亮） */
+	const [dragOverDir, setDragOverDir] = useState<string | null>(null);
+	const [dragSourcePath, setDragSourcePath] = useState<string | null>(null);
+	const dragCountRef = useRef(0);
+
+	// 面板自身接受拖入：落在空白区域视为复制到项目根目录
+	const handlePanelDragOver = useCallback((e: React.DragEvent) => {
+		e.preventDefault();
+		e.dataTransfer.dropEffect = "copy";
+	}, []);
+	const handlePanelDrop = useCallback((e: React.DragEvent) => {
+		e.preventDefault();
+		setDragOverDir(null);
+		dragCountRef.current = 0;
+		if (e.dataTransfer.files.length > 0 && props.onDropFiles && props.currentProjectRoot) {
+			props.onDropFiles(props.currentProjectRoot, e.dataTransfer.files);
+		}
+	}, []);
+
+	const handleScroll = useCallback(() => {
+		const el = panelRef.current;
+		if (!el) return;
+		const threshold = 40;
+		setShowScrollTop(el.scrollTop > threshold);
+		setShowScrollBottom(el.scrollTop + el.clientHeight < el.scrollHeight - threshold);
+	}, []);
+
+	useEffect(() => {
+		const el = panelRef.current;
+		if (!el) return;
+		el.addEventListener("scroll", handleScroll, { passive: true });
+		handleScroll();
+		return () => el.removeEventListener("scroll", handleScroll);
+	}, [handleScroll, props.files, props.expandedDirs]);
+
+	const scrollToTop = useCallback(() => {
+		panelRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+	}, []);
+
+	const scrollToBottom = useCallback(() => {
+		const el = panelRef.current;
+		if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+	}, []);
+
+	// 判断是否所有目录都已展开，用于切换折叠/展开按钮状态
+	const allDirsList = useMemo(() => {
+		const dirs: string[] = [];
+		const collect = (nodes: FileTreeNode[]) => {
+			for (const n of nodes) {
+				if (n.type === "directory") {
+					dirs.push(n.path);
+					if (n.children) collect(n.children);
+				}
+			}
+		};
+		collect(props.files);
+		return dirs;
+	}, [props.files]);
+	const isAllExpanded = allDirsList.length > 0 && allDirsList.every((d) => props.expandedDirs.has(d));
 
 	return (
-		<div className="files-panel">
+		<div
+			className="files-panel"
+			ref={panelRef}
+			tabIndex={-1}
+			onDragOver={handlePanelDragOver}
+			onDragLeave={() => { setDragOverDir(null); dragCountRef.current = 0; }}
+			onDrop={handlePanelDrop}
+			onKeyDown={(e) => {
+				// Ctrl+V / Cmd+V 粘贴到项目根目录
+				if ((e.ctrlKey || e.metaKey) && e.key === "v") {
+					if (props.onPasteFiles && props.currentProjectRoot) {
+						props.onPasteFiles(props.currentProjectRoot);
+					}
+				}
+			}}
+			onContextMenu={(e) => {
+				// 仅面板背景本身被右键时触发（不拦截文件节点的右键事件）
+				if (e.target !== e.currentTarget) return;
+				e.preventDefault();
+				if (props.currentProjectRoot) {
+					props.onFileContextMenu(
+						{ path: props.currentProjectRoot, name: "", type: "directory", relativePath: "", children: undefined } as FileTreeNode,
+						e.clientX, e.clientY
+					);
+				}
+			}}
+		>
 			<div className="panel-action-row">
-				<span>{t("drawer.fileItems", { count: props.files.length })}</span>
-				<button onClick={props.onRefreshFiles}>{t("common.refresh")}</button>
-			</div>
-			{props.modifiedFiles.length > 0 && (
-				<div className="modified-files-section">
-					<div className="modified-files-header">
-						<span>{t("drawer.gitChangedFiles")}</span>
-						<small>{t("drawer.gitChangedFilesDesc")}</small>
-					</div>
-					{visibleModifiedFiles.map((file) => {
-						const fileName = file.path.split(/[/\\]/).pop() ?? file.path;
-						const isRunning = file.status === "running";
-						// 构造最小的 FileTreeNode 以复用右键菜单,保持修改清单和文件树相同的打开/定位入口。
-						const fakeNode: FileTreeNode = {
-							name: fileName,
-							path: file.path,
-							relativePath: file.path,
-							type: "file",
-						};
-						return (
-							<div
-								key={file.path}
-								className={`modified-file-row${isRunning ? " running" : ""}`}
-								title={file.path}
-								onContextMenu={(e) => {
-									e.preventDefault();
-									props.onFileContextMenu(fakeNode, e.clientX, e.clientY);
-								}}
-								onClick={() => props.onDiffFile?.(file.path, file.originalContent, file.content)}
-							>
-								<span
-									className={`modified-file-icon${isRunning ? "" : " done"}`}
-								>
-									{file.toolName === "git"
-										? gitStatusIcon(file.status)
-										: isRunning
-											? "◌"
-											: "✓"}
-								</span>
-								<span className="modified-file-name">{fileName}</span>
-								{file.toolName === "git" && file.status !== "deleted" && (
-									<span className="modified-file-lines">{file.status === "added" ? "新" : "改"}</span>
-								)}
-								{file.toolName !== "git" && Boolean(file.changedLines) && (
-									<span className="modified-file-lines">
-										{t("drawer.changedLines", {
-											count: file.changedLines ?? 0,
-										})}
-									</span>
-								)}
-								<span className="modified-file-tool">{file.toolName}</span>
-							</div>
-						);
-					})}
-					{latestModifiedFiles.length > MODIFIED_FILES_PREVIEW_LIMIT && (
+				<div className="panel-action-buttons">
+					{props.onOpenFolder && (
 						<button
-							className="modified-files-toggle"
-							type="button"
-							onClick={() => setModifiedFilesExpanded((current) => !current)}
+							className="icon-only"
+							onClick={props.onOpenFolder}
+							title={t("drawer.openFolder")}
+							aria-label={t("drawer.openFolder")}
 						>
-							{modifiedFilesExpanded
-								? t("common.collapse")
-								: t("drawer.moreFiles", { count: hiddenModifiedFileCount })}
+							<Folder size={14} />
+						</button>
+					)}
+					{props.onCreateItem && props.currentProjectRoot && (
+						<button
+							className="icon-only"
+							onClick={() => {
+								setCreateItemName("");
+								setCreateItemOpen(true);
+							}}
+							title={t("drawer.createItem")}
+							aria-label={t("drawer.createItem")}
+						>
+							<Plus size={14} />
+						</button>
+					)}
+					{/* 刷新与全部收起使用纯图标按钮，保持工具栏紧凑、与列表项字号对齐 */}
+					<button
+						className="icon-only"
+						onClick={props.onRefreshFiles}
+						title={t("common.refresh")}
+						aria-label={t("common.refresh")}
+					>
+						<RefreshCw size={14} />
+					</button>
+					{props.onCollapseAll && (
+						<button
+							className="icon-only"
+							onClick={props.onCollapseAll}
+							title={t("drawer.collapseAllDirs")}
+							aria-label={t("drawer.collapseAllDirs")}
+							disabled={props.expandedDirs.size === 0}
+						>
+							<ChevronsDownUp size={14} />
+						</button>
+					)}
+					{props.onExpandAll && (
+						<button
+							className="icon-only"
+							onClick={props.onExpandAll}
+							title={t("drawer.expandAllDirs")}
+							aria-label={t("drawer.expandAllDirs")}
+							disabled={isAllExpanded}
+						>
+							<ChevronsUpDown size={14} />
 						</button>
 					)}
 				</div>
+			</div>
+			{showScrollTop && (
+				<button
+					type="button"
+					className="drawer-scroll-btn drawer-scroll-top"
+					title={t("app.modelScrollToTop")}
+					onClick={scrollToTop}
+				>
+					<MoveUp size={14} strokeWidth={1.8} aria-hidden="true" />
+				</button>
 			)}
 			{props.files.map((node) => (
 				<FileNode
@@ -2659,72 +5091,241 @@ function FilesPanel(props: {
 					onFileContextMenu={props.onFileContextMenu}
 					onOpenFile={props.onOpenFile}
 					onViewFile={props.onViewFile}
-					onDiffFile={props.onDiffFile}
+					onDropFiles={props.onDropFiles}
+					onMoveFiles={props.onMoveFiles}
+					dragOverDir={dragOverDir}
+					onDragOverDirChange={setDragOverDir}
 				/>
 			))}
+			{showScrollBottom && (
+				<button
+					type="button"
+					className="drawer-scroll-btn drawer-scroll-bottom"
+					title={t("app.modelScrollToBottom")}
+					onClick={scrollToBottom}
+				>
+					<MoveDown size={14} strokeWidth={1.8} aria-hidden="true" />
+				</button>
+			)}
+			{/* 新建文件/文件夹：替代 window.prompt（Electron 下会抛 prompt is not supported） */}
+			{createItemOpen && props.onCreateItem && props.currentProjectRoot && (
+				<div
+					className="config-modal-overlay"
+					onClick={() => setCreateItemOpen(false)}
+				>
+					<div
+						className="config-modal-dialog drawer-create-item-dialog"
+						onClick={(e) => e.stopPropagation()}
+					>
+						<strong>{t("drawer.createItem")}</strong>
+						<p>{t("drawer.createItemPrompt")}</p>
+						<TextField
+							label={t("drawer.createItemName")}
+							value={createItemName}
+							onChange={setCreateItemName}
+							placeholder={t("drawer.createItemPlaceholder")}
+							onKeyDown={(e) => {
+								if (e.key === "Escape") {
+									e.preventDefault();
+									setCreateItemOpen(false);
+									return;
+								}
+								if (e.key !== "Enter") return;
+								e.preventDefault();
+								const name = createItemName.trim();
+								if (!name) return;
+								const isDir = name.endsWith("/") || name.endsWith("\\");
+								const finalName = isDir ? name.slice(0, -1).trim() : name;
+								if (!finalName) return;
+								props.onCreateItem?.(props.currentProjectRoot!, finalName, isDir ? "directory" : "file");
+								setCreateItemOpen(false);
+								setCreateItemName("");
+							}}
+						/>
+						<div className="config-modal-actions">
+							<button
+								className="config-btn"
+								onClick={() => {
+									setCreateItemOpen(false);
+									setCreateItemName("");
+								}}
+							>
+								{t("common.cancel")}
+							</button>
+							<button
+								className="config-btn primary"
+								disabled={!createItemName.trim()}
+								onClick={() => {
+									const name = createItemName.trim();
+									if (!name) return;
+									const isDir = name.endsWith("/") || name.endsWith("\\");
+									const finalName = isDir ? name.slice(0, -1).trim() : name;
+									if (!finalName) return;
+									props.onCreateItem?.(props.currentProjectRoot!, finalName, isDir ? "directory" : "file");
+									setCreateItemOpen(false);
+									setCreateItemName("");
+								}}
+							>
+								{t("common.confirm")}
+							</button>
+						</div>
+					</div>
+				</div>
+			)}
 		</div>
 	);
+}
+
+const SESSION_FILE_SUMMARY_COLLAPSED_KEY_PREFIX =
+	"pid:session-file-summary-collapsed:";
+const SESSION_FILE_SUMMARY_FILE_LIST_EXPANDED_KEY_PREFIX =
+	"pid:session-file-summary-file-list-expanded:";
+
+/** 读取指定 session 的折叠状态(无存储返回默认值) */
+function loadCollapsed(sessionKey: string | null): boolean {
+	if (!sessionKey || typeof window === "undefined") return true;
+	const stored = localStorage.getItem(
+		SESSION_FILE_SUMMARY_COLLAPSED_KEY_PREFIX + sessionKey,
+	);
+	return stored !== null ? stored === "true" : true;
+}
+
+function loadFileListExpanded(sessionKey: string | null): boolean {
+	if (!sessionKey || typeof window === "undefined") return false;
+	const stored = localStorage.getItem(
+		SESSION_FILE_SUMMARY_FILE_LIST_EXPANDED_KEY_PREFIX + sessionKey,
+	);
+	return stored !== null ? stored === "true" : false;
 }
 
 export function SessionFileSummary(props: {
 	files: SessionModifiedFile[];
 	onOpenFile?: (path: string) => void;
 	onDiffFile?: DiffFileHandler;
+	/** sessionIdOrPath: 会话唯一标识(如 sessionPath),用于按 agent/session 隔离折叠状态。
+	 *  组件卸载后再次挂载相同标识时,恢复之前保存的折叠偏好。 */
+	sessionIdOrPath?: string;
 }) {
-	const [expanded, setExpanded] = useState(false);
-	const totalLines = props.files.reduce(
-		(total, file) => total + (file.changedLines ?? 0),
-		0,
+	const [collapsed, setCollapsed] = useState(() =>
+		loadCollapsed(props.sessionIdOrPath ?? null),
 	);
-	const visibleFiles = expanded ? props.files : props.files.slice(0, 4);
+	const [fileListExpanded, setFileListExpanded] = useState(() =>
+		loadFileListExpanded(props.sessionIdOrPath ?? null),
+	);
+	const prevSessionRef = useRef(props.sessionIdOrPath);
+
+	// 当 sessionIdOrPath 变化时重新从 localStorage 读取
+	useEffect(() => {
+		if (prevSessionRef.current === props.sessionIdOrPath) return;
+		prevSessionRef.current = props.sessionIdOrPath;
+		setCollapsed(loadCollapsed(props.sessionIdOrPath ?? null));
+		setFileListExpanded(loadFileListExpanded(props.sessionIdOrPath ?? null));
+	}, [props.sessionIdOrPath]);
+
+	// 仅在用户主动点击时写 localStorage,不在 sessionIdOrPath 切换时误写
+	const handleToggleCollapsed = useCallback(() => {
+		setCollapsed((prev) => {
+			const next = !prev;
+			if (props.sessionIdOrPath) {
+				localStorage.setItem(
+					SESSION_FILE_SUMMARY_COLLAPSED_KEY_PREFIX + props.sessionIdOrPath,
+					String(next),
+				);
+			}
+			return next;
+		});
+	}, [props.sessionIdOrPath]);
+
+	const handleToggleFileList = useCallback(() => {
+		setFileListExpanded((prev) => {
+			const next = !prev;
+			if (props.sessionIdOrPath) {
+				localStorage.setItem(
+					SESSION_FILE_SUMMARY_FILE_LIST_EXPANDED_KEY_PREFIX +
+						props.sessionIdOrPath,
+					String(next),
+				);
+			}
+			return next;
+		});
+	}, [props.sessionIdOrPath]);
+
+	const visibleFiles = fileListExpanded ? props.files : props.files.slice(0, 4);
 	const hiddenCount = Math.max(0, props.files.length - visibleFiles.length);
+
+	// 无文件时不渲染
+	if (props.files.length === 0) return null;
+
 	return (
 		<section className="session-file-summary-list-card" aria-label={t("drawer.modifiedFilesAria")}>
-			<div className="session-file-summary-title">
-				<span>{t("drawer.modifiedFiles")}</span>
-				<small title={t("drawer.changedLinesEstimate")}>
+			<button
+				className="session-file-summary-header"
+				type="button"
+				onClick={handleToggleCollapsed}
+				aria-expanded={!collapsed}
+			>
+				<ChevronDown
+					size={14}
+					className={`session-file-summary-chevron${collapsed ? "" : " open"}`}
+				/>
+				<span className="session-file-summary-title-span">{t("drawer.modifiedFiles")}</span>
+				<small className="session-file-summary-count">
 					{props.files.length} {t("app.files")}
-					{totalLines > 0
-						? ` · ${t("drawer.changedLinesShort", { count: totalLines })}`
-						: ""}
 				</small>
-			</div>
-			<ul className="session-file-summary-list">
-				{visibleFiles.map((file) => {
-					const fileName = file.path.split(/[/\\]/).pop() ?? file.path;
-					return (
-						<li key={file.path}>
-							<button
-								className="session-file-summary-row"
-								type="button"
-								title={file.path}
-								onClick={() => props.onDiffFile?.(file.path, file.originalContent, file.content)}
-							>
-								<span className="session-file-summary-name">{fileName}</span>
-								<span
-									className="session-file-summary-lines"
-									title={t("drawer.changedLinesEstimate")}
-								>
-									{file.changedLines
-										? `~${t("drawer.changedLines", { count: file.changedLines })}`
-										: t("drawer.changed")}
-								</span>
-							</button>
-						</li>
-					);
-				})}
-			</ul>
-			{props.files.length > 4 && (
-				<button
-					className="session-file-summary-toggle"
-					type="button"
-					onClick={() => setExpanded((current) => !current)}
-				>
-					{expanded ? t("common.collapse") : t("drawer.moreFiles", { count: hiddenCount })}
-				</button>
+			</button>
+			{!collapsed && (
+				<>
+					<ul className="session-file-summary-list">
+						{visibleFiles.map((file) => {
+							const fileName = file.path.split(/[/\\]/).pop() ?? file.path;
+							return (
+								<li key={file.path}>
+									<button
+										className="session-file-summary-row"
+										type="button"
+										title={file.path}
+										onClick={() => props.onDiffFile?.(file.path, file.originalContent, file.content)}
+									>
+										<span className="session-file-summary-name">{fileName}</span>
+									</button>
+								</li>
+							);
+						})}
+					</ul>
+					{props.files.length > 4 && (
+						<button
+							className="session-file-summary-toggle"
+							type="button"
+							onClick={handleToggleFileList}
+						>
+							{fileListExpanded ? t("common.collapse") : t("drawer.moreFiles", { count: hiddenCount })}
+						</button>
+					)}
+				</>
 			)}
 		</section>
 	);
+}
+
+function fileIconElement(name: string, isDirectory: boolean, isExpanded: boolean) {
+	if (isDirectory) {
+		return isExpanded ? <FolderOpen size={16} /> : <Folder size={16} />;
+	}
+	try {
+		const { svg, colorName } = getFileIconSeti(name);
+		const color = getFileIconColor(colorName);
+		// SVG 只来自仓库内附带许可证的只读 Seti 数据快照，不接收文件内容或用户输入。
+		return (
+			<span
+				aria-hidden="true"
+				className="file-node-seti-icon"
+				style={{ color }}
+				dangerouslySetInnerHTML={{ __html: svg }}
+			/>
+		);
+	} catch {
+		return <FileText size={15} />;
+	}
 }
 
 function FileNode(props: {
@@ -2734,85 +5335,120 @@ function FileNode(props: {
 	onFileContextMenu: (node: FileTreeNode, x: number, y: number) => void;
 	onOpenFile?: (path: string) => void;
 	onViewFile?: (path: string) => void;
-	onDiffFile?: (path: string) => void;
 	depth?: number;
+	/** 拖入文件（仅目录节点使用） */
+	onDropFiles?: (targetDir: string, files: FileList) => void;
+	onMoveFiles?: (sourcePaths: string[], targetDir: string) => void;
+	dragOverDir?: string | null;
+	onDragOverDirChange?: (path: string | null) => void;
 }) {
 	const { node, expandedDirs, onToggleDirectory, depth = 0 } = props;
 	const expanded = expandedDirs.has(node.path);
-	// 每行保持同一个宽度，只通过 CSS 变量控制缩进；避免深层递归容器把最后一层可用宽度越压越窄。
+	const typeLabel = node.type === "file" ? getFileTypeLabel(node.name) : "";
 	const rowStyle = { "--file-depth-offset": `${depth * 16}px` } as CSSProperties;
 	const menu = (event: React.MouseEvent) => {
 		event.preventDefault();
 		props.onFileContextMenu(node, event.clientX, event.clientY);
 	};
+	const handleDragStart = useCallback((e: React.DragEvent) => {
+		e.dataTransfer.effectAllowed = "move";
+		e.dataTransfer.setData("text/pi-file-path", node.path);
+		// 设置拖拽图标
+		const ghost = e.currentTarget.cloneNode(true) as HTMLElement;
+		ghost.style.position = "absolute";
+		ghost.style.top = "-1000px";
+		ghost.style.opacity = "0.6";
+		ghost.style.pointerEvents = "none";
+		ghost.style.width = `${e.currentTarget.clientWidth}px`;
+		document.body.appendChild(ghost);
+		e.dataTransfer.setDragImage(ghost, 10, 10);
+		setTimeout(() => document.body.removeChild(ghost), 0);
+	}, [node.path]);
+	const handleDragOver = useCallback((e: React.DragEvent) => {
+		e.preventDefault();
+		e.stopPropagation();
+		e.dataTransfer.dropEffect = "move";
+		props.onDragOverDirChange?.(node.path);
+	}, [node.path]);
+	const handleDragLeave = useCallback(() => {
+		props.onDragOverDirChange?.(null);
+	}, []);
+	const handleDrop = useCallback((e: React.DragEvent) => {
+		e.preventDefault();
+		e.stopPropagation();
+		props.onDragOverDirChange?.(null);
+		// 内部拖拽移动：优先检查 pi-file-path
+		const sourcePath = e.dataTransfer.getData("text/pi-file-path");
+		if (sourcePath) {
+			if (sourcePath !== node.path && props.onMoveFiles) {
+				props.onMoveFiles([sourcePath], node.path);
+			}
+			return;
+		}
+		// 外部 OS 文件拖入
+		if (e.dataTransfer.files.length > 0 && props.onDropFiles) {
+			props.onDropFiles(node.path, e.dataTransfer.files);
+		}
+	}, [node.path, props.onDropFiles, props.onMoveFiles]);
 	if (node.type === "file")
 		return (
 			<div className="file-node" style={rowStyle}>
 				<button
 					className="file file-node-row"
 					style={rowStyle}
-					title={node.relativePath}
+					title={`${node.relativePath}\n${typeLabel}`}
+					draggable
+					onDragStart={handleDragStart}
 					onClick={() => props.onViewFile?.(node.path)}
 					onContextMenu={menu}
 				>
-					<span className="file-node-icon">{fileIcon(node.name)}</span>
+					<span className="file-node-icon">
+						{fileIconElement(node.name, false, false)}
+					</span>
 					<span className="file-node-name">{node.name}</span>
+					<span className="file-node-type-label">{typeLabel}</span>
 				</button>
 			</div>
 		);
+	const isDragOver = props.dragOverDir === node.path;
 	return (
 		<div className="file-node" style={rowStyle}>
 			<button
-				className="directory file-node-row"
+				className={`directory file-node-row${isDragOver ? " drag-over" : ""}`}
 				style={rowStyle}
+				draggable
+				onDragStart={handleDragStart}
 				onClick={() => onToggleDirectory(node.path)}
 				onContextMenu={menu}
+				onDragOver={handleDragOver}
+				onDragLeave={handleDragLeave}
+				onDrop={handleDrop}
 				title={node.relativePath}
 			>
 				<span className="file-node-icon">
-					{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+					{fileIconElement(node.name, true, expanded)}
 				</span>
 				<span className="file-node-name">{node.name}</span>
 			</button>
 			{expanded && node.children && node.children.length > 0 && (
 				<div className="file-children">
 					{node.children.map((child) => (
-						<FileNode
-							key={child.path}
-							node={child}
+						<FileNode key={child.path} node={child}
 							expandedDirs={expandedDirs}
 							onToggleDirectory={onToggleDirectory}
 							onFileContextMenu={props.onFileContextMenu}
 							onOpenFile={props.onOpenFile}
 							onViewFile={props.onViewFile}
-							onDiffFile={props.onDiffFile}
 							depth={depth + 1}
-						/>
+							onDropFiles={props.onDropFiles}
+							onMoveFiles={props.onMoveFiles}
+							dragOverDir={props.dragOverDir}
+							onDragOverDirChange={props.onDragOverDirChange} />
 					))}
 				</div>
 			)}
 		</div>
 	);
-}
-
-function fileIcon(name: string) {
-	if (/\.(ts|tsx|js|jsx)$/.test(name)) return "◇";
-	if (/\.(md|mdx)$/.test(name)) return "M";
-	if (/\.(json|yaml|yml)$/.test(name)) return "{}";
-	return "·";
-}
-
-function gitStatusIcon(status: string): string {
-	switch (status) {
-		case "added":
-			return "+";
-		case "deleted":
-			return "×";
-		case "renamed":
-			return "→";
-		default:
-			return "~";
-	}
 }
 
 function SessionsPanel(props: {
@@ -2826,10 +5462,7 @@ function SessionsPanel(props: {
 }) {
 	const [renamingPath, setRenamingPath] = useState<string | null>(null);
 	const [editValue, setEditValue] = useState("");
-	const [sessionActionNotice, setSessionActionNotice] = useState<{
-		filePath: string;
-		text: string;
-	} | null>(null);
+	/* sessionActionNotice 已改用 toast (sonner) 实现 */
 	const [sessionActionLoading, setSessionActionLoading] = useState<{
 		filePath: string;
 		action: "copy" | "export" | "delete";
@@ -2859,47 +5492,78 @@ function SessionsPanel(props: {
 		successText: string,
 	) {
 		setSessionActionLoading({ filePath: session.filePath, action: actionType });
-		setSessionActionNotice({
-			filePath: session.filePath,
-			text:
-				actionType === "copy"
-					? t("drawer.sessionActionCopying")
-					: actionType === "export"
-						? t("drawer.sessionActionExporting")
-						: t("drawer.sessionActionDeleting"),
-		});
+		showNotice(
+			actionType === "copy"
+				? t("drawer.sessionActionCopying")
+				: actionType === "export"
+					? t("drawer.sessionActionExporting")
+					: t("drawer.sessionActionDeleting"),
+			3500,
+		);
 		try {
 			await action();
-			setSessionActionNotice({ filePath: session.filePath, text: successText });
-			window.setTimeout(() => setSessionActionNotice(null), 1600);
+			showNotice(successText, 1600);
 		} catch (error) {
-			setSessionActionNotice({
-				filePath: session.filePath,
-				text: error instanceof Error ? error.message : t("drawer.sessionActionFailed"),
-			});
-			window.setTimeout(() => setSessionActionNotice(null), 2400);
+			showNotice(
+				error instanceof Error ? error.message : t("drawer.sessionActionFailed"),
+				2400,
+			);
 		} finally {
 			setSessionActionLoading(null);
 		}
 	}
 
+	// 计算子会话到父会话的分组映射；路径可能跨 Windows/WSL 或经过 IPC，统一分隔符和大小写。
+	const parentToChildren = useMemo(() => {
+		const map = new Map<string, SessionSummary[]>();
+		for (const s of props.sessions) {
+			const parentKey = normalizeSessionPathForCompare(s.parentSessionPath);
+			if (parentKey) {
+				const list = map.get(parentKey) ?? [];
+				list.push(s);
+				map.set(parentKey, list);
+			}
+		}
+		return map;
+	}, [props.sessions]);
+	// 仅显示顶层会话（非子会话）的计数
+	const parentSessions = useMemo(() =>
+		props.sessions.filter(s => !s.parentSessionPath),
+		[props.sessions],
+	);
+	const [expandedParents, setExpandedParents] = useState<Set<string>>(new Set());
+	const toggleParent = useCallback((filePath: string) => {
+		const key = normalizeSessionPathForCompare(filePath) ?? filePath;
+		setExpandedParents(prev => {
+			const next = new Set(prev);
+			if (next.has(key)) next.delete(key);
+			else next.add(key);
+			return next;
+		});
+	}, []);
+
 	return (
 		<div className="sessions-panel">
 			<div className="panel-action-row">
-				<span>{t("drawer.sessionCount", { count: props.sessions.length })}</span>
+				<span>{t("drawer.sessionCount", { count: parentSessions.length })}</span>
 				<button onClick={props.onRefresh}>{t("common.refresh")}</button>
 			</div>
-			{props.sessions.length === 0 && (
+			{parentSessions.length === 0 && (
 				<div className="sessions-empty">
 					<strong>{t("drawer.sessionEmptyTitle")}</strong>
 					<span>{t("drawer.sessionEmptyDesc")}</span>
 				</div>
 			)}
-			{props.sessions.map((session) => (
+			{parentSessions.map((session) => {
+				const children = parentToChildren.get(normalizeSessionPathForCompare(session.filePath) ?? "");
+				const normalizedPath = normalizeSessionPathForCompare(session.filePath) ?? session.filePath;
+				const isExpanded = expandedParents.has(normalizedPath);
+				return (
 				<div
 					key={session.filePath}
-					className="session-card"
+					className="session-card-group"
 				>
+					<div className="session-card">
 					{renamingPath === session.filePath ? (
 						<div className="session-rename-row">
 							<input
@@ -3015,14 +5679,50 @@ function SessionsPanel(props: {
 									</span>
 								</button>
 							</div>
-							{sessionActionNotice?.filePath === session.filePath && (
-								<div className="session-action-notice">{sessionActionNotice.text}</div>
-							)}
+							{/* sessionActionNotice 已改用 toast (sonner) 实现 */}
 						</div>
 					)}
 				</div>
-			))}
-			{deleteConfirmSession && (
+					{children && children.length > 0 && (
+						<div className="session-card-children-header">
+							<button
+								className="session-card-expand-btn"
+								title={isExpanded ? t("drawer.collapseSubagentSessions") : t("drawer.expandSubagentSessions")}
+								onClick={() => toggleParent(session.filePath)}
+							>
+								{isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+								<span>{t("drawer.subagentSessionCount", { count: children.length })}</span>
+							</button>
+						</div>
+					)}
+					{isExpanded && children?.map((child) => (
+						<div key={child.filePath} className="session-card session-card-child">
+							<div className="session-card-display">
+								<button
+									className="session-card-inner"
+									onClick={() => props.onOpen(child)}
+									title={child.filePath}
+								>
+									<div className="session-card-title">
+										<strong>{child.name || t("common.untitled")}</strong>
+										<span className="session-source-badge subagent">{t("drawer.subagentSession")}</span>
+										<small>
+											{new Date(child.updatedAt).toLocaleString()} ·{" "}
+											{t("drawer.sessionMessages", {
+												count: child.messageCount,
+											})}
+										</small>
+									</div>
+								</button>
+							</div>
+						</div>
+					))}
+				</div>
+				);
+			})}
+			{deleteConfirmSession && (() => {
+					const deleteChildren = parentToChildren.get(normalizeSessionPathForCompare(deleteConfirmSession.filePath) ?? "") ?? [];
+					return (
 				<div className="session-delete-confirm-backdrop" onClick={() => setDeleteConfirmSession(null)}>
 					<section
 						className="session-delete-confirm"
@@ -3030,9 +5730,14 @@ function SessionsPanel(props: {
 					>
 						<strong>{t("drawer.sessionDeleteTitle")}</strong>
 						<p>
-							{t("drawer.sessionDeleteBody", {
-								name: deleteConfirmSession.name || t("common.untitled"),
-							})}
+							{deleteChildren.length > 0
+								? t("drawer.sessionDeleteBodyWithChildren", {
+										name: deleteConfirmSession.name || t("common.untitled"),
+										count: deleteChildren.length,
+									})
+								: t("drawer.sessionDeleteBody", {
+										name: deleteConfirmSession.name || t("common.untitled"),
+									})}
 						</p>
 						<div className="session-delete-confirm-actions">
 							<button onClick={() => setDeleteConfirmSession(null)}>{t("common.cancel")}</button>
@@ -3054,7 +5759,8 @@ function SessionsPanel(props: {
 						</div>
 					</section>
 				</div>
-			)}
+			); })()
+		}
 		</div>
 	);
 }
@@ -3116,218 +5822,78 @@ export function SessionHistoryModal(props: {
 	);
 }
 
-export function flattenFiles(nodes: FileTreeNode[]): FileTreeNode[] {
-	return nodes.flatMap((node) =>
-		node.type === "file" ? [node] : flattenFiles(node.children ?? []),
+/** 创建 git worktree 的对话框 */
+export function WorktreeCreateDialog(props: {
+	projectId: string;
+	creating: boolean;
+	onCreate: (branchName: string) => void;
+	onClose: () => void;
+}) {
+	const [name, setName] = useState("");
+	const inputRef = useRef<HTMLInputElement>(null);
+
+	useEffect(() => {
+		inputRef.current?.focus();
+	}, []);
+
+	// 预览最终创建的分支名，与后端 WorktreeService.slugify 保持一致：
+	// 保留 Unicode 字母数字，其余字符替换为 -。让用户在提交前看到中文/特殊字符的实际结果，
+	// 避免输入与最终分支名脱节。
+	const previewSlug = useMemo(() => {
+		const slug = name
+			.trim()
+			.replace(/[^\p{L}\p{N}]+/gu, "-")
+			.replace(/^-+/, "")
+			.replace(/-+$/, "");
+		return slug || "workspace";
+	}, [name]);
+
+	return (
+		<div className="context-backdrop worktree-create-backdrop" onClick={props.onClose}>
+			<div
+				className="worktree-create-dialog"
+				onClick={(e) => e.stopPropagation()}
+			>
+				<h3>{t("app.worktreeCreateTitle")}</h3>
+				<input
+					ref={inputRef}
+					type="text"
+					className="worktree-create-input"
+					placeholder={t("app.worktreeCreatePlaceholder")}
+					value={name}
+					onChange={(e) => setName(e.target.value)}
+					onKeyDown={(e) => {
+						if (e.key === "Enter" && name.trim()) {
+							props.onCreate(name.trim());
+						}
+						if (e.key === "Escape") props.onClose();
+					}}
+					disabled={props.creating}
+				/>
+				{name.trim() && (
+					<p className="worktree-create-preview">
+						{t("app.worktreeBranchPreview", { name: previewSlug })}
+					</p>
+				)}
+				<div className="worktree-create-actions">
+					<button
+						className="worktree-create-cancel"
+						onClick={props.onClose}
+						disabled={props.creating}
+					>
+						{t("common.cancel")}
+					</button>
+					<button
+						className="worktree-create-confirm"
+						disabled={!name.trim() || props.creating}
+						onClick={() => props.onCreate(name.trim())}
+					>
+						{props.creating ? t("app.worktreeCreating") : t("app.worktreeCreate")}
+					</button>
+				</div>
+			</div>
+		</div>
 	);
-}
-
-export type ComposerSuggestionResult = {
-	text: string;
-	cursor: number;
-};
-
-export type ComposerTrigger = {
-	start: number;
-	char: string;
-	query: string;
-};
-
-/**
- * 在光标位置检测 @ / 触发器。
- *
- * 早期实现用「整段 prompt 最后一个空白分词」判定,完全忽略光标位置,
- * 导致光标停在文字中间时,末尾分词在光标之后,文件/skill 菜单无法弹出。
- * 这里改为以光标为锚:取光标前最后一个 @ 或 /,要求从该字符到光标之间
- * 连续无空白、无其它触发符,再要求触发符前一字符不是字母/数字(避免误判
- * email@host、路径 a/b、URL https://)。这样「写一段话@文件」「用/ppt」
- * 也能在文字中间唤出引用/命令菜单。
- */
-export function detectTrigger(
-	text: string,
-	cursor: number,
-): ComposerTrigger | null {
-	if (cursor < 0 || cursor > text.length) cursor = text.length;
-	const before = text.slice(0, cursor);
-	const atIdx = before.lastIndexOf("@");
-	const slashIdx = before.lastIndexOf("/");
-	const start = Math.max(atIdx, slashIdx);
-	if (start < 0) return null;
-	const char = before[start];
-	const segment = before.slice(start + 1);
-	// 触发符到光标之间必须连续(无空白、无其它 @ /),否则不是同一个触发上下文。
-	if (/[\s@/]/.test(segment)) return null;
-	const prevChar = start > 0 ? before[start - 1] : "";
-	if (prevChar) {
-		// 允许字母/数字前置(中文写作不打空格的习惯同样适用于英文上下文)。
-		// 仅 URL 协议(://)与路径分隔符(/usr/bin)不触发,
-		// email@host 的 @ 虽然会触发但不影响体验(选了文件后自然替换掉)。
-		if (/[:/]/.test(prevChar)) return null;
-	}
-	return { start, char, query: segment };
-}
-
-export function applySuggestion(
-	current: string,
-	cursor: number,
-	value: string,
-): ComposerSuggestionResult {
-	const trigger = detectTrigger(current, cursor);
-	if (!trigger) {
-		const text = `${current}${value} `;
-		return { text, cursor: text.length };
-	}
-	// 用选中项替换「触发符 .. 光标」这一段,保留光标之后的文本。
-	const text = `${current.slice(0, trigger.start)}${value} ${current.slice(cursor)}`;
-	return { text, cursor: trigger.start + value.length + 1 };
-}
-
-export function clearSuggestionTrigger(
-	current: string,
-	cursor: number,
-): ComposerSuggestionResult {
-	const trigger = detectTrigger(current, cursor);
-	if (!trigger) return { text: current, cursor };
-	const text = `${current.slice(0, trigger.start)}${current.slice(cursor)}`;
-	return { text, cursor: trigger.start };
-}
-
-export type SuggestionItem = {
-	key: string;
-	label: string;
-	description: string;
-	value: string;
-};
-
-export function buildSuggestionItems(
-	prompt: string,
-	cursor: number,
-	commands: PiCommand[],
-	files: FileTreeNode[],
-): SuggestionItem[] {
-	const allCommands = mergeCommands(commands);
-	const trigger = detectTrigger(prompt, cursor);
-	if (!trigger) return [];
-	const keyword = trigger.query.toLowerCase();
-	if (trigger.char === "/") {
-		return allCommands
-			.map((command, index) => ({ command, index }))
-			.filter(({ command }) => command.name.toLowerCase().includes(keyword))
-			.sort((a, b) => {
-				const aPinned = PINNED_COMMAND_NAMES.has(a.command.name);
-				const bPinned = PINNED_COMMAND_NAMES.has(b.command.name);
-				if (aPinned !== bPinned) return aPinned ? -1 : 1;
-				return a.index - b.index;
-			})
-			.map(({ command }) => ({
-				key: command.name,
-				label: `/${command.name}`,
-				description: command.description ?? "",
-				value: `/${command.name}`,
-			}));
-	}
-	if (trigger.char === "@") {
-		return files
-			.map((file) => ({
-				file,
-				score:
-					fuzzyScore(file.relativePath, keyword) +
-					fuzzyScore(file.name, keyword) * 2,
-			}))
-			.filter((item) => item.score > 0 || !keyword)
-			.sort((a, b) => b.score - a.score)
-			.slice(0, 8)
-			.map((item) => ({
-				key: item.file.path,
-				label: `@${item.file.name}`,
-				description: item.file.relativePath,
-				value: `@${item.file.relativePath}`,
-			}));
-	}
-	return [];
-}
-
-function mergeCommands(commands: PiCommand[]) {
-	const visibleCommands = commands.filter(isVisibleDesktopCommand);
-	const names = new Set(visibleCommands.map((command) => command.name));
-	const extras = getBuiltinCommands().filter(
-		(command) => !names.has(command.name) && isVisibleDesktopCommand(command),
-	);
-	return [...visibleCommands, ...extras];
-}
-
-const PINNED_COMMAND_NAMES = new Set<string>();
-const HIDDEN_DESKTOP_BUILTIN_COMMAND_NAMES = new Set([
-	"new",
-	"model",
-	"resume",
-	"fork",
-	"name",
-	"session",
-	"tree",
-	"clone",
-	"copy",
-	"export",
-	"share",
-	"settings",
-	"reload",
-	"hotkeys",
-	"login",
-	"logout",
-	// goal 模式暂不作为桌面端推荐命令展示,避免当前版本引导用户使用未稳定能力。
-	"goal",
-]);
-
-function isBuiltinDesktopCommand(command: PiCommand) {
-	// get_commands 可能返回 source 为空的 pi 内置命令;扩展/skill 命令通常带有自己的 source。
-	// Desktop 只隐藏 CLI 内置命令,避免误伤用户自己安装的同名扩展能力。
-	return command.source == null || command.source === "builtin";
-}
-
-function isVisibleDesktopCommand(command: PiCommand) {
-	return !(
-		isBuiltinDesktopCommand(command) &&
-		HIDDEN_DESKTOP_BUILTIN_COMMAND_NAMES.has(command.name.toLowerCase())
-	);
-}
-
-// pi 内置斜杠命令,get_commands 只返回扩展注册的命令,这些需要手动补充
-// desktop 已有独立 UI 入口或在 desktop 中不适合执行的命令由 HIDDEN_DESKTOP_COMMAND_NAMES 统一过滤。
-function getBuiltinCommands(): PiCommand[] {
-	return [
-	{
-		name: "session",
-		description: t("prompt.command.session.description"),
-		source: "builtin",
-	},
-	{
-		name: "tree",
-		description: t("prompt.command.tree.description"),
-		source: "builtin",
-	},
-	{ name: "clone", description: t("prompt.command.clone.description"), source: "builtin" },
-	{
-		name: "compact",
-		description: t("prompt.command.compact.description"),
-		source: "builtin",
-	},
-	{ name: "copy", description: t("prompt.command.copy.description"), source: "builtin" },
-	{ name: "export", description: t("prompt.command.export.description"), source: "builtin" },
-	{
-		name: "share",
-		description: t("prompt.command.share.description"),
-		source: "builtin",
-	},
-	{ name: "settings", description: t("prompt.command.settings.description"), source: "builtin" },
-	{ name: "reload", description: t("prompt.command.reload.description"), source: "builtin" },
-	{ name: "hotkeys", description: t("prompt.command.hotkeys.description"), source: "builtin" },
-	{
-		name: "login",
-		description: t("prompt.command.login.description"),
-		source: "builtin",
-	},
-	{ name: "logout", description: t("prompt.command.logout.description"), source: "builtin" },
-	];
 }
 
 export function PromptSuggestions(props: {
@@ -3343,6 +5909,8 @@ export function PromptSuggestions(props: {
 	const listRef = useRef<HTMLDivElement>(null);
 	// 头部标题类型由选中项推导:光标相关触发后,第一个候选的 value 前缀即代表当前是命令还是文件。
 	const isCommand = props.items[0]?.value.startsWith("/") ?? false;
+	const isSession = props.items[0]?.value.startsWith("&") ?? false;
+	const headerLabel = isCommand ? t("prompt.commands") : isSession ? t("prompt.sessions") : t("prompt.files");
 
 	// 滚动到选中项
 	useEffect(() => {
@@ -3365,7 +5933,7 @@ export function PromptSuggestions(props: {
 			onMouseDown={(e) => e.preventDefault()}
 		>
 			<div className="command-palette-header">
-				<span>{isCommand ? t("prompt.commands") : t("prompt.files")}</span>
+				<span>{headerLabel}</span>
 				<IconButton
 					className="command-palette-close"
 					label={t("common.close")}
@@ -3375,17 +5943,35 @@ export function PromptSuggestions(props: {
 				</IconButton>
 			</div>
 			<div className="command-palette-list" ref={listRef}>
-				{props.items.map((item, index) => (
+				{props.items.map((item, index) => {
+				const indent = item.treeDepth != null ? `${item.treeDepth * 20}px` : "0px";
+				if (item.disabled) {
+					// 目录树节点：缩进 + 文件夹图标，选中时加高亮背景
+					return (
+						<div
+							key={item.key}
+							className={`command-palette-tree-dir${index === props.selectedIndex ? " selected" : ""}`}
+							style={{ paddingLeft: `calc(12px + ${indent})` }}
+							onMouseEnter={() => props.onSelectedIndexChange(index)}
+						>
+							<Folder size={12} aria-hidden="true" />
+							<span>{item.label}</span>
+						</div>
+					);
+				}
+				return (
 					<button
 						key={item.key}
 						className={`command-palette-item${index === props.selectedIndex ? " selected" : ""}`}
+						style={{ paddingLeft: `calc(12px + ${indent})` }}
 						onMouseEnter={() => props.onSelectedIndexChange(index)}
 						onClick={() => props.onPick(item.value)}
 					>
 						<span className="command-palette-label">{item.label}</span>
 						<span className="command-palette-desc">{item.description}</span>
 					</button>
-				))}
+				);
+			})}
 			</div>
 			<div className="command-palette-footer">
 				<span>{t("prompt.selectHint")}</span>
@@ -3434,6 +6020,9 @@ export function FileContextMenu(props: {
 	onCopyPath: () => void;
 	onDelete?: () => void;
 	onRename?: () => void;
+	/** 剪贴板中有文件路径时显示「粘贴」选项 */
+	hasClipboardFiles?: boolean;
+	onPaste?: (targetDir: string) => void;
 }) {
 	const menuRef = useRef<HTMLDivElement | null>(null);
 	const [pos, setPos] = useState({ x: props.menu.x, y: props.menu.y });
@@ -3469,10 +6058,15 @@ export function FileContextMenu(props: {
 				<button onClick={props.onReveal}>{t("menu.revealFile")}</button>
 				<button onClick={props.onCopyPath}>{t("menu.copyPath")}</button>
 				{props.onRename && (
-					<button onClick={props.onRename}>{t("common.rename")}</button>
+					<button disabled={!props.menu.node.name} onClick={props.onRename}>{t("common.rename")}</button>
+				)}
+				{props.hasClipboardFiles && props.onPaste && (
+					<button onClick={() => { props.onPaste!(props.menu.node.path); }}>
+						{t("drawer.pasteFiles")}
+					</button>
 				)}
 				{props.onDelete && (
-					<button className="danger" onClick={props.onDelete}>
+					<button className="danger" disabled={!props.menu.node.name} onClick={props.onDelete}>
 						{t("common.delete")}
 					</button>
 				)}
@@ -3481,24 +6075,234 @@ export function FileContextMenu(props: {
 	);
 }
 
+/** 会话管理弹框：展示项目所有会话，支持多选删除、导出、重命名 */
+export function SessionManagerModal(props: {
+	sessions: SessionSummary[];
+	onClose: () => void;
+	onRename: (session: SessionSummary) => void;
+	onExport: (session: SessionSummary) => void;
+	onDelete: (sessions: SessionSummary[]) => void;
+}) {
+	const SOURCES = ["pi", "codex", "claude", "opencode"] as const;
+	const [activeSources, setActiveSources] = useState<Set<string>>(new Set(SOURCES));
+	const [selected, setSelected] = useState<Set<string>>(new Set());
+	const [selectAll, setSelectAll] = useState(false);
+
+	// 按来源过滤
+	const filteredSessions = props.sessions.filter((s) =>
+		activeSources.has(s.source ?? "pi"),
+	);
+
+	const toggleSource = (source: string) => {
+		setActiveSources((prev) => {
+			const next = new Set(prev);
+			if (next.has(source)) {
+				next.delete(source);
+			} else {
+				next.add(source);
+			}
+			return next;
+		});
+		setSelected(new Set());
+		setSelectAll(false);
+	};
+
+	// 全选/取消全选（只在当前过滤后的范围内）
+	const handleToggleAll = () => {
+		if (selectAll) {
+			setSelected(new Set());
+		} else {
+			setSelected(new Set(filteredSessions.map((s) => s.filePath)));
+		}
+		setSelectAll(!selectAll);
+	};
+
+	const handleToggle = (filePath: string) => {
+		setSelected((prev) => {
+			const next = new Set(prev);
+			if (next.has(filePath)) {
+				next.delete(filePath);
+			} else {
+				next.add(filePath);
+			}
+			setSelectAll(next.size === filteredSessions.length);
+			return next;
+		});
+	};
+
+	const handleDeleteSelected = () => {
+		const toDelete = props.sessions.filter((s) => selected.has(s.filePath));
+		if (toDelete.length === 0) return;
+		props.onDelete(toDelete);
+	};
+
+	return (
+		<div className="modal-backdrop" onClick={props.onClose}>
+			<section className="session-manager-modal" onClick={(e) => e.stopPropagation()}>
+				<header className="modal-header">
+					<div>
+						<strong>{t("menu.manageSessions")}</strong>
+						<small>{filteredSessions.length} / {props.sessions.length} sessions</small>
+					</div>
+					<button
+						className="modal-close"
+						onClick={props.onClose}
+						aria-label={t("common.close")}
+					>
+						<X size={18} strokeWidth={2} />
+					</button>
+				</header>
+
+				<div className="session-manager-toolbar">
+					<div className="session-manager-toolbar-left">
+						<label className="session-manager-select-all">
+							<input
+								type="checkbox"
+								checked={selectAll}
+								onChange={handleToggleAll}
+							/>
+							{t("common.selectAll")}
+						</label>
+						<div className="session-manager-source-filters">
+							{SOURCES.map((source) => (
+								<button
+									key={source}
+									className={`session-source-btn${activeSources.has(source) ? " active" : ""}`}
+									onClick={() => toggleSource(source)}
+								>
+									{t(`sessionSource.${source}` as any)}
+								</button>
+							))}
+						</div>
+					</div>
+					{selected.size > 0 && (
+						<button
+							className="session-manager-delete-btn"
+							onClick={handleDeleteSelected}
+						>
+							{t("common.deleteSelected", { count: selected.size })}
+						</button>
+					)}
+				</div>
+
+				<div className="session-manager-list">
+					{filteredSessions.map((session) => {
+						const isChecked = selected.has(session.filePath);
+						return (
+							<div
+								key={session.filePath}
+								className={`session-manager-row${isChecked ? " selected" : ""}`}
+							>
+								<label className="session-manager-row-checkbox">
+									<input
+										type="checkbox"
+										checked={isChecked}
+										onChange={() => handleToggle(session.filePath)}
+									/>
+								</label>
+								<div
+									className="session-manager-row-info"
+									onClick={() => handleToggle(session.filePath)}
+								>
+									<div className="session-manager-row-name">
+										{session.name || session.preview?.slice(0, 60) || t("common.untitled")}
+									</div>
+									{session.source && session.source !== "pi" && (
+										<span className={`session-source-badge ${session.source}`}>
+											{t(`sessionSource.${session.source}` as any)}
+										</span>
+									)}
+								</div>
+								<div className="session-manager-row-actions">
+									<button
+										className="session-manager-action-btn"
+										onClick={() => props.onRename(session)}
+										title={t("common.rename")}
+									>
+										{t("common.rename")}
+									</button>
+									<button
+										className="session-manager-action-btn"
+										onClick={() => props.onExport(session)}
+										title={t("menu.exportHtml")}
+									>
+										{t("menu.exportHtml")}
+									</button>
+									<button
+										className="session-manager-action-btn danger"
+										onClick={() => props.onDelete([session])}
+										title={t("common.delete")}
+									>
+										{t("common.delete")}
+									</button>
+								</div>
+							</div>
+						);
+					})}
+				</div>
+			</section>
+		</div>
+	);
+}
+
+/**
+ * 右键菜单定位：渲染后按真实尺寸修正位置。
+ * 当菜单超出视口底部/右侧时向上/向左翻转，仍放不下则夹紧到视口内，
+ * 保证整块菜单始终可见、不被屏幕裁切（不使用滚动）。
+ */
+function useMenuPosition(initial: { x: number; y: number }) {
+	const [pos, setPos] = useState(initial);
+	const ref = useRef<HTMLDivElement>(null);
+	useLayoutEffect(() => {
+		const el = ref.current;
+		if (!el) return;
+		const rect = el.getBoundingClientRect();
+		const vw = window.innerWidth;
+		const vh = window.innerHeight;
+		let { x, y } = initial;
+		// 下方空间不足时翻转到光标上方，仍放不下则夹紧到视口内
+		if (y + rect.height > vh) {
+			const flipped = y - rect.height;
+			y = flipped >= 8 ? flipped : Math.max(8, vh - rect.height - 8);
+		}
+		// 右侧空间不足时翻转到光标左侧，仍放不下则夹紧到视口内
+		if (x + rect.width > vw) {
+			const flipped = x - rect.width;
+			x = flipped >= 8 ? flipped : Math.max(8, vw - rect.width - 8);
+		}
+		if (x !== pos.x || y !== pos.y) setPos({ x, y });
+	}, [initial.x, initial.y]);
+	return { pos, ref };
+}
+
 export function ProjectContextMenu(props: {
 	menu: { x: number; y: number; project: Project };
 	onClose: () => void;
 	onRevealProject: () => void;
+	onOpenWithEditor: () => void;
 	onImportCodexSessions: () => void;
 	onImportClaudeSessions: () => void;
 	onImportOpenCodeSessions: () => void;
+	onManageProjectResources: () => void;
+	onManageSessions: () => void;
 	onFilterSessions: () => void;
+	onToggleWorktree: () => void;
+	onRefreshProject: () => void;
+	onCopyProjectPath: () => void;
 	onRemoveProject: () => void;
 }) {
+	const isWorktreeEnabled = props.menu.project.worktreeEnabled ?? false;
+	const { pos, ref } = useMenuPosition(props.menu);
 	return (
 		<div className="context-backdrop" onClick={props.onClose}>
 			<div
 				className="context-menu"
-				style={{ left: props.menu.x, top: props.menu.y }}
+				style={{ left: pos.x, top: pos.y }}
+				ref={ref}
 				onClick={(event) => event.stopPropagation()}
 			>
 				<button onClick={props.onRevealProject}>{t("menu.revealProject")}</button>
+				<button onClick={props.onOpenWithEditor}>{t("app.openWithEditor")}</button>
 				<button onClick={props.onImportCodexSessions}>
 					{t("menu.importCodex")}
 				</button>
@@ -3509,7 +6313,18 @@ export function ProjectContextMenu(props: {
 					{t("menu.importOpenCode")}
 				</button>
 				<hr className="context-separator" />
+				<button onClick={props.onManageProjectResources}>{t("menu.projectResources")}</button>
+				<button onClick={props.onManageSessions}>{t("menu.manageSessions")}</button>
+				<hr className="context-separator" />
 				<button onClick={props.onFilterSessions}>{t("menu.filterSessions")}</button>
+				<hr className="context-separator" />
+				<button onClick={props.onToggleWorktree}>
+					{isWorktreeEnabled ? t("menu.disableWorktree") : t("menu.enableWorktree")}
+				</button>
+				<hr className="context-separator" />
+				<button onClick={props.onCopyProjectPath}>{t("menu.copyProjectPath")}</button>
+				<hr className="context-separator" />
+				<button onClick={props.onRefreshProject}>{t("app.projectRefresh")}</button>
 				<hr className="context-separator" />
 				<button onClick={props.onRemoveProject}>{t("menu.removeProject")}</button>
 			</div>
@@ -3524,16 +6339,20 @@ export function AgentContextMenu(props: {
 	onRename: () => void;
 	onExport: () => void;
 	onCopySession: () => void;
+	onCopySessionFilePath: () => void;
 	onToggleRpcLogging?: () => void;
 	isRpcLogging?: boolean;
 	onOpenLogFile?: () => void;
+	onOpenSessionFile?: () => void;
 	onCloseAgent: () => void;
 }) {
+	const { pos, ref } = useMenuPosition(props.menu);
 	return (
 		<div className="context-backdrop" onClick={props.onClose}>
 			<div
 				className="context-menu"
-				style={{ left: props.menu.x, top: props.menu.y }}
+				style={{ left: pos.x, top: pos.y }}
+				ref={ref}
 				onClick={(event) => event.stopPropagation()}
 			>
 				<button disabled={Boolean(props.actionLoading)} onClick={props.onRename}>{t("common.rename")}</button>
@@ -3545,6 +6364,16 @@ export function AgentContextMenu(props: {
 					{props.actionLoading === "export" && <span className="mini-loader" />}
 					{props.actionLoading === "export" ? t("menu.exporting") : t("menu.exportHtml")}
 				</button>
+				{props.menu.agent.sessionPath && (
+					<>
+						<button disabled={Boolean(props.actionLoading)} onClick={props.onCopySessionFilePath}>
+							{t("menu.copySessionFilePath")}
+						</button>
+						<button disabled={Boolean(props.actionLoading)} onClick={props.onOpenSessionFile}>
+							{t("menu.openAgentSessionFile")}
+						</button>
+					</>
+				)}
 				<button disabled={Boolean(props.actionLoading)} onClick={props.onToggleRpcLogging}>
 					{props.isRpcLogging ? `✓ ${t("menu.rpcLoggingOn")}` : t("menu.rpcLogging")}
 				</button>
@@ -3566,14 +6395,18 @@ export function SessionContextMenu(props: {
 	onRename: () => void;
 	onExport: () => void;
 	onCopySession: () => void;
+	onCopySessionFilePath: () => void;
+	onOpenSessionFile?: () => void;
 	onShowLogs?: () => void;
 	onDeleteSession: () => void;
 }) {
+	const { pos, ref } = useMenuPosition(props.menu);
 	return (
 		<div className="context-backdrop" onClick={props.onClose}>
 			<div
 				className="context-menu"
-				style={{ left: props.menu.x, top: props.menu.y }}
+				style={{ left: pos.x, top: pos.y }}
+				ref={ref}
 				onClick={(event) => event.stopPropagation()}
 			>
 				<button disabled={Boolean(props.actionLoading)} onClick={props.onRename}>{t("common.rename")}</button>
@@ -3584,6 +6417,12 @@ export function SessionContextMenu(props: {
 				<button disabled={Boolean(props.actionLoading)} onClick={props.onExport}>
 					{props.actionLoading === "export" && <span className="mini-loader" />}
 					{props.actionLoading === "export" ? t("menu.exporting") : t("menu.exportHtml")}
+				</button>
+				<button disabled={Boolean(props.actionLoading)} onClick={props.onCopySessionFilePath}>
+					{t("menu.copySessionFilePath")}
+				</button>
+				<button disabled={Boolean(props.actionLoading)} onClick={props.onOpenSessionFile}>
+					{t("menu.openSessionFile")}
 				</button>
 				<button disabled={Boolean(props.actionLoading)} onClick={props.onShowLogs}>{t("menu.rpcLogs")}</button>
 				<button
@@ -3596,22 +6435,6 @@ export function SessionContextMenu(props: {
 			</div>
 		</div>
 	);
-}
-
-function fuzzyScore(value: string, keyword: string) {
-	if (!keyword) return 1;
-	const text = value.toLowerCase();
-	const query = keyword.toLowerCase();
-	if (text.includes(query)) return 100 + query.length;
-	let score = 0;
-	let pos = 0;
-	for (const ch of query) {
-		const found = text.indexOf(ch, pos);
-		if (found === -1) return 0;
-		score += found === pos ? 8 : 2;
-		pos = found + 1;
-	}
-	return score;
 }
 
 export function SettingsModal(props: {
@@ -3646,7 +6469,7 @@ export function SettingsModal(props: {
 	onClose: () => void;
 	onChange: (patch: Partial<AppSettings>) => void;
 }) {
-	const [activeTab, setActiveTab] = useState<SettingsTabId>("base");
+	const [activeTab, setActiveTab] = useState<SettingsTabId>("common");
 	const [webPortDraft, setWebPortDraft] = useState(String(props.settings.webServicePort));
 	const piPath = props.settings.customPiPath || props.piStatus?.command || "";
 	useEffect(() => {
@@ -3680,9 +6503,9 @@ export function SettingsModal(props: {
 		icon: ReactNode;
 	}> = [
 		{
-			id: "base",
-			label: t("settings.tabs.base"),
-			description: t("settings.tabs.baseDesc"),
+			id: "common",
+			label: t("settings.tabs.common"),
+			description: t("settings.tabs.commonDesc"),
 			icon: <Settings2 size={16} />,
 		},
 		{
@@ -3692,10 +6515,10 @@ export function SettingsModal(props: {
 			icon: <Network size={16} />,
 		},
 		{
-			id: "web",
-			label: t("settings.tabs.web"),
-			description: t("settings.tabs.webDesc"),
-			icon: <Globe2 size={16} />,
+			id: "appearance",
+			label: t("settings.tabs.appearance"),
+			description: t("settings.tabs.appearanceDesc"),
+			icon: <Brush size={16} />,
 		},
 		{
 			id: "dev",
@@ -3768,7 +6591,7 @@ export function SettingsModal(props: {
 						))}
 					</nav>
 					<div className="settings-panel">
-						{activeTab === "base" && (
+						{activeTab === "common" && (
 							<>
 								<SettingsSection title={t("settings.interface")}>
 									<SelectField
@@ -3838,14 +6661,6 @@ export function SettingsModal(props: {
 										checked={props.settings.enableNotifications}
 										onChange={(checked) =>
 											props.onChange({ enableNotifications: checked })
-										}
-									/>
-									<SettingSwitch
-										title={t("settings.showThinking")}
-										description={t("settings.showThinkingDesc")}
-										checked={props.settings.showThinking}
-										onChange={(checked) =>
-											props.onChange({ showThinking: checked })
 										}
 									/>
 									<SelectField
@@ -4005,7 +6820,7 @@ export function SettingsModal(props: {
 								</SettingsSection>
 							</>
 						)}
-						{activeTab === "web" && (
+						{activeTab === "appearance" && (
 							<SettingsSection
 								title={t("settings.webLocalService")}
 								description={t("settings.webLocalServiceDesc")}
@@ -4146,12 +6961,28 @@ export function SettingsModal(props: {
 											</small>
 										)}
 									</div>
-									<div className="setting-row">
+									<SettingSwitch
+									title={t("settings.disableUpdateCheck")}
+									description={t("settings.disableUpdateCheckDesc")}
+									checked={props.settings.disableUpdateCheck}
+									onChange={(checked) =>
+										props.onChange({ disableUpdateCheck: checked })
+									}
+								/>
+								<div className="setting-row">
 										<div>
 											<strong>{t("settings.currentVersion")}</strong>
 											<small>v{props.appInfo.version}</small>
 										</div>
-										<Button onClick={props.onCheckUpdate} loading={props.updateChecking}>{t("settings.checkUpdate")}</Button>
+										<Button
+											onClick={props.onCheckUpdate}
+											loading={props.updateChecking}
+											disabled={props.settings.disableUpdateCheck}
+										>
+											{props.settings.disableUpdateCheck
+												? t("settings.updateCheckDisabled")
+												: t("settings.checkUpdate")}
+										</Button>
 									</div>
 									<div className="setting-row">
 										<div>
@@ -4165,8 +6996,14 @@ export function SettingsModal(props: {
 											</small>
 										</div>
 										<div className="setting-inline-actions">
-											<Button onClick={props.onCheckPiUpdate} loading={props.piUpdateChecking}>{t("settings.checkPiUpdate")}</Button>
-											<Button onClick={props.onUpdatePi} loading={props.piUpdating} disabled={!props.piUpdateCheck?.hasUpdate}>{t("settings.updatePi")}</Button>
+											<Button onClick={props.onCheckPiUpdate} loading={props.piUpdateChecking} disabled={props.settings.disableUpdateCheck}>
+												{props.settings.disableUpdateCheck
+													? t("settings.updateCheckDisabled")
+													: t("settings.checkPiUpdate")}
+											</Button>
+											<Button onClick={props.onUpdatePi} loading={props.piUpdating} disabled={props.settings.disableUpdateCheck || !props.piUpdateCheck?.hasUpdate}>
+												{t("settings.updatePi")}
+											</Button>
 										</div>
 									</div>
 									{props.piUpdateResult && (
@@ -4735,7 +7572,7 @@ function formatBytes(value: number) {
 	return `${value} B`;
 }
 
-type SettingsTabId = "base" | "proxy" | "web" | "dev" | "pet";
+type SettingsTabId = "common" | "appearance" | "proxy" | "dev" | "pet";
 
 function SettingsSection(props: {
 	title: string;

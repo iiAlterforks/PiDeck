@@ -126,8 +126,11 @@ let previewSettings: AppSettings = {
 	lightBackground: "white",
 	language: "system",
 	piEnvironmentChecked: true,
+	enableGitManagement: true,
+	gitCommitMessagePrompt: "",
 	closeToTray: true,
 	enableNotifications: true,
+	// showThinking 由 pi agent 的 hideThinkingBlock 控制，运行时从主进程加载
 	showThinking: true,
 	showDevTools: false,
 	piProxyEnabled: false,
@@ -137,12 +140,16 @@ let previewSettings: AppSettings = {
 	desktopProxyUrl: "http://127.0.0.1:7890",
 	desktopProxyBypass: "localhost,127.0.0.1,::1",
 	customPiPath: "",
+	wslEnabled: false,
+	wslDistro: "Ubuntu",
+	wslUser: "root",
 	telemetryEnabled: true,
 	webServiceEnabled: false,
 	webServiceHost: "0.0.0.0",
 	webServicePort: 8765,
 	rpcTimeout: 600_000,
 	linkOpenMode: "external",
+	contentMaxWidth: 1400,
 	maxEditorFileSizeMB: 5,
 	externalEditors: createDefaultExternalEditorSettings(),
 
@@ -153,15 +160,30 @@ let previewSettings: AppSettings = {
 	petScale: 0.8,
 	petPatrolEnabled: true,
 	petPatrolPauseMin: 5,
+	favoriteModels: [],
+
+	fontSize: "default",
+	uiFontSize: null,
+	chatFontSize: null,
+	inputFontSize: null,
+	zoomFactor: 1,
+	fontFamilyBase: "system",
+	fontFamilyBaseCustom: "",
+	fontFamilyMono: "commit-mono",
+	fontFamilyMonoCustom: "",
+	removedBuiltInExtensions: [],
+	disableUpdateCheck: false,
 };
 
 export function createPreviewApi(): PiDesktopApi {
 	const noop = (() => () => undefined) as any;
-	const createTerminalTab = async (agentId: string) => {
+	const createTerminalTab = async (agentId: string, shell?: string, cwd?: string) => {
+		const shellName = shell ?? "powershell";
+		const displayName = shellName === "git-bash" ? "Git Bash" : shellName === "bash" ? "bash" : shellName === "cmd" ? "cmd" : "PowerShell";
 		const tab: TerminalTab = {
 			id: `preview-terminal-${terminalTabs.length + 1}`,
 			agentId,
-			title: `PowerShell ${terminalTabs.length + 1}`,
+			title: `${displayName} ${terminalTabs.length + 1}`,
 			cwd: "C:/Users/14012/preview-project",
 			shell: "powershell",
 			createdAt: Date.now(),
@@ -207,6 +229,57 @@ export function createPreviewApi(): PiDesktopApi {
 				return projects;
 			},
 			onChanged: noop,
+			listRoot: async () => projects,
+			listWorktreeChildren: async () => [],
+			toggleWorktreeEnabled: async () => projects[0],
+			chooseChatPath: async () => null,
+			setChatPath: async () => projects[0],
+			listModels: async () => [],
+		},
+		projectResources: {
+			list: async () => ({ skills: [], extensions: [] }),
+			createSkill: async (input) => ({
+				id: `project-pi:${input.name}`,
+				name: input.name,
+				description: input.description,
+				path: `C:/Users/preview/project/.pi/skills/${input.name}/SKILL.md`,
+				dir: `C:/Users/preview/project/.pi/skills/${input.name}`,
+				sourceId: "project-pi" as const,
+				sourceLabel: ".pi/skills",
+				type: "directory" as const,
+				enabled: true,
+				valid: true,
+				warnings: [],
+			}),
+			deleteSkill: async () => undefined,
+			deleteExtension: async () => undefined,
+			toggleExtension: async () => undefined,
+			renameSkill: async (_projectId, _skillPath, newName) => ({
+				id: `project-pi:${newName}`,
+				name: newName,
+				description: "",
+				path: `C:/Users/preview/project/.pi/skills/${newName}/SKILL.md`,
+				dir: `C:/Users/preview/project/.pi/skills/${newName}`,
+				sourceId: "project-pi" as const,
+				sourceLabel: ".pi/skills",
+				type: "directory" as const,
+				enabled: true,
+				valid: true,
+				warnings: [],
+			}),
+		toggleSkill: async (_projectId, _skillPath, enabled) => ({
+				id: "project-pi:preview-toggle",
+				name: "preview-skill",
+				description: "",
+				path: "C:/Users/preview/project/.pi/skills/preview-skill/SKILL.md",
+				dir: "C:/Users/preview/project/.pi/skills/preview-skill",
+				sourceId: "project-pi" as const,
+				sourceLabel: ".pi/skills",
+				type: "directory" as const,
+				enabled,
+				valid: true,
+				warnings: [],
+			}),
 		},
 		files: {
 			list: async () => files,
@@ -215,7 +288,12 @@ export function createPreviewApi(): PiDesktopApi {
 			readContent: async () => "",
 			writeContent: async () => undefined,
 			delete: async () => undefined,
+			copy: async () => [],
+			move: async () => [],
 			rename: async () => "",
+			create: async () => "",
+			getPathForFile: () => "",
+			getClipboardPaths: () => [],
 		},
 		sessions: {
 			list: async () => getSessions(),
@@ -226,6 +304,13 @@ export function createPreviewApi(): PiDesktopApi {
 			}),
 			exportHtml: async () => ({ path: "preview-session.html" }),
 			delete: async () => undefined,
+			// 预览模式下返回固定 mock 数据，真实环境由主进程从 JSONL 文件读取
+			readMessages: async () => [
+				{ role: "user", content: "Preview user message", timestamp: Date.now() - 60000 },
+				{ role: "assistant", content: "Preview assistant response", timestamp: Date.now() - 30000 },
+			],
+			readSessionMeta: async () => ({}),
+			readChatMessages: async () => [],
 		},
 		codexSessions: {
 			scan: async () => [],
@@ -251,7 +336,33 @@ export function createPreviewApi(): PiDesktopApi {
 			}),
 			// 预览环境无真实 Git，返回空原始内容，差异左侧显示为空。
 			originalContent: async () => "",
-			changedFiles: async () => [],
+			worktreeList: async () => [],
+			worktreeCreate: async (_projectId, branchName) => ({
+				path: `/tmp/worktree/${branchName}`,
+				branch: branchName,
+			}),
+			worktreeRemove: async () => true,
+				commitLog: async () => [],
+				refs: async () => [],
+				branchCompare: async () => ({ files: [], ahead: 0, behind: 0 }),
+				commitDetail: async () => null,
+				commitFileDiff: async () => null,
+				diffFileBetween: async () => "",
+				status: async () => ({ merge: [], index: [], workingTree: [], untracked: [] }),
+				workspaceFileDiff: async () => null,
+				stage: async () => {},
+				unstage: async () => {},
+				discard: async () => {},
+				commit: async () => {},
+				cherryPick: async () => {},
+				revert: async () => {},
+				reset: async () => {},
+				dropCommit: async () => {},
+				generateCommitMessage: async () => "",
+				init: async () => {},
+				push: async () => {},
+				pull: async () => {},
+				fetch: async () => {},
 		},
 		logs: {
 			list: async () => [],
@@ -268,7 +379,7 @@ export function createPreviewApi(): PiDesktopApi {
 			openFile: async () => undefined,
 		},
 		pi: {
-			check: async () => ({ 
+			check: async () => ({
 				installed: true,
 				command: "pi",
 				version: "preview",
@@ -290,12 +401,34 @@ export function createPreviewApi(): PiDesktopApi {
 				output: "Preview mode: pi update output",
 				updated: false,
 			}),
+			execInstall: async (_command) => ({
+				success: true,
+				exitCode: 0,
+				stdout: "preview: exec install output",
+				stderr: "",
+			}),
+			checkNpm: async () => ({
+				available: true,
+				version: "preview",
+			}),
+		},
+		wsl: {
+			listDistros: async () => ["Ubuntu", "Debian"],
+			validateConnection: async (_distro, _user) => ({
+				ok: true,
+				whoami: "preview",
+				piVersion: "preview",
+				error: "",
+			}),
 		},
 		app: {
 			info: async () => ({
 				version: "preview",
 				releasesUrl: "https://github.com/ayuayue/pi-desktop/releases",
+				platform: "win32" as NodeJS.Platform,
+				homeDir: "C:/Users/preview",
 			}),
+			preferredSystemLanguages: async () => navigator.languages?.length ? [...navigator.languages] : [navigator.language],
 			checkUpdate: async () => ({
 				currentVersion: "preview",
 				latestVersion: "preview",
@@ -311,6 +444,7 @@ export function createPreviewApi(): PiDesktopApi {
 			}),
 			installUpdate: async () => undefined,
 			onUpdateProgress: () => () => undefined,
+			onOpenInBrowser: () => () => undefined,
 			feedbackEnvironment: async () => ({
 				appVersion: "preview",
 				platform: "win32",
@@ -327,6 +461,12 @@ export function createPreviewApi(): PiDesktopApi {
 			}),
 			openExternal: async () => undefined,
 			restart: async () => undefined,
+			rendererLog: async (level, scope, message, detail) => {
+				console[level === "error" ? "error" : level === "warn" ? "warn" : "debug"](
+					`[${scope}] ${message}`,
+					detail,
+				);
+			},
 			minimizeWindow: async () => undefined,
 			toggleMaximizeWindow: async () => undefined,
 			toggleAlwaysOnTopWindow: async () => false,
@@ -373,9 +513,22 @@ export function createPreviewApi(): PiDesktopApi {
 			}),
 			delete: async () => undefined,
 			openFolder: async () => undefined,
+			rename: async (_skillPath, newName) => ({
+				id: `pi-global:preview/${newName}/SKILL.md`,
+				name: newName,
+				description: "Preview skill",
+				path: `C:/Users/preview/.pi/agent/skills/${newName}/SKILL.md`,
+				dir: `C:/Users/preview/.pi/agent/skills/${newName}`,
+				sourceId: "pi-global" as const,
+				sourceLabel: "~/.pi/agent/skills",
+				type: "directory" as const,
+				enabled: true,
+				valid: true,
+				warnings: [],
+			}),
 		},
 		extensions: {
-			list: async () => ({
+			list: async (_forceRefresh = false) => ({
 				extensions: [
 					{
 						id: "user:npm:preview-extension",
@@ -388,11 +541,94 @@ export function createPreviewApi(): PiDesktopApi {
 			}),
 			uninstall: async () => undefined,
 			install: async (_source: string) => "",
+			removeBuiltIn: async () => undefined,
+			restoreBuiltIn: async () => undefined,
 			update: async () => ({
 				command: "pi update --extensions --no-approve",
 				output: "Preview mode: extensions update output",
 				updated: false,
 			}),
+		},
+		prompts: {
+			list: async () => ({ templates: [], globalDir: "C:/Users/preview/.pi/agent/prompts" }),
+			create: async (input) => ({
+				name: input.name,
+				path: `C:/Users/preview/.pi/agent/prompts/${input.name}.md`,
+				description: input.description,
+				content: `---\ndescription: ${input.description}\n---\n`,
+				userCreated: true,
+			}),
+			delete: async () => undefined,
+			openFolder: async () => undefined,
+			edit: async (_filePath, _content?) => "---\ndescription: Preview\n---\n\nPreview content",
+			listByProject: async () => ({ templates: [], globalDir: "" }),
+			createInProject: async (_projectPath, input) => ({
+				name: input.name,
+				path: `project://${_projectPath}/.pi/prompts/${input.name}.md`,
+				description: input.description,
+				content: `---\ndescription: ${input.description}\n---\n`,
+				userCreated: true,
+				scope: "project",
+			}),
+			deleteFromProject: async () => undefined,
+			rename: async (_oldName, newName) => ({
+				name: newName,
+				path: `C:/Users/preview/.pi/agent/prompts/${newName}.md`,
+				description: "Renamed prompt",
+				content: `---\ndescription: Renamed prompt\n---\n`,
+				userCreated: true,
+			}),
+			renameInProject: async (_projectPath, _oldName, newName) => ({
+				name: newName,
+				path: `project://${_projectPath}/.pi/prompts/${newName}.md`,
+				description: "Renamed project prompt",
+				content: `---\ndescription: Renamed project prompt\n---\n`,
+				userCreated: true,
+				scope: "project",
+			}),
+		},
+		promptStore: {
+			search: async (_query, _opts) => ({ query: _query ?? "", count: 0, prompts: [] }),
+			get: async (_id) => ({ id: _id, title: "", description: "", content: "", type: "TEXT", author: "", category: "", tags: [], votes: 0, createdAt: "" }),
+			import: async (data) => ({
+				name: data.title.toLowerCase().replace(/[^\w-]+/g, "-"),
+				path: `C:/Users/preview/.pi/agent/prompts/${data.title.toLowerCase().replace(/[^\w-]+/g, "-")}.md`,
+				description: data.description,
+				content: data.content,
+				userCreated: true,
+			}),
+		},
+		yaoPrompts: {
+			list: async () => ({ categories: [], prompts: [], repoPath: "" }),
+			detail: async () => ({ title: "", description: "", promptContent: "", fullContent: "" }),
+			import: async (_slug, _category) => ({
+				name: _slug,
+				path: `C:/Users/preview/.pi/agent/prompts/${_slug}.md`,
+				description: "Preview import",
+				content: "Preview content",
+				userCreated: true,
+			}),
+		},
+		skillStore: {
+			search: async () => ({ query: "", count: 0, prompts: [] }),
+			import: async (data, _locationId) => ({
+				name: data.title.toLowerCase().replace(/[^\w-]+/g, "-"),
+				path: `C:/Users/preview/.pi/agent/skills/${data.title.toLowerCase().replace(/[^\w-]+/g, "-")}/SKILL.md`,
+				description: data.description,
+				enabled: true,
+				valid: true,
+				warnings: [],
+				id: `pi-global:preview`,
+				dir: "",
+				sourceId: "pi-global",
+				sourceLabel: "Preview",
+				type: "directory",
+			}),
+		},
+		skillHub: {
+			search: async () => ({ query: "", total: 0, items: [] }),
+			detail: async () => null,
+			install: async (slug) => ({ success: true, slug, installDir: "", message: "Preview install" }),
 		},
 		settings: {
 			get: async (): Promise<AppSettings> => ({ ...previewSettings }),
@@ -456,7 +692,7 @@ export function createPreviewApi(): PiDesktopApi {
 				return agent;
 			},
 			stop: async () => undefined,
-			prompt: async () => undefined,
+			prompt: async () => ({ accepted: true }),
 			abort: async () => undefined,
 			exportHtml: async () => ({ path: "preview.html" }),
 			getForkMessages: async () => [
@@ -505,6 +741,10 @@ export function createPreviewApi(): PiDesktopApi {
 				modelName: "Preview GPT",
 				thinkingLevel: "low",
 			}),
+			refreshModels: async () => ({
+				modelName: "Preview GPT",
+				thinkingLevel: "low",
+			}),
 			cycleThinking: async () => ({
 				modelName: "Preview GPT",
 				thinkingLevel: "medium",
@@ -516,6 +756,9 @@ export function createPreviewApi(): PiDesktopApi {
 			commands: async () => [
 				{ name: "reload", description: "Reload runtime", source: "builtin" },
 			],
+			editMessage: async () => undefined,
+			deleteMessage: async () => undefined,
+			prepareResend: async () => ({ text: "Preview prompt" }),
 			onState: noop,
 			onFocusTarget: noop,
 			onMessages: ((
@@ -531,6 +774,10 @@ export function createPreviewApi(): PiDesktopApi {
 			onThinking: noop,
 			onRpcLog: noop,
 			onRuntimeState: noop,
+			onUiRequest: noop,
+			sendUiResponse: async () => undefined,
+			onTrustRequest: noop,
+			respondTrustRequest: async () => undefined,
 		},
 		pet: {
 			onState: noop,
@@ -557,10 +804,10 @@ export function createPreviewApi(): PiDesktopApi {
 		terminal: {
 			list: async (agentId) =>
 				terminalTabs.filter((tab) => tab.agentId === agentId),
-			ensure: async (agentId) => {
+			ensure: async (agentId, cwd) => {
 				const existing = terminalTabs.filter((tab) => tab.agentId === agentId);
 				if (existing.length > 0) return existing;
-				return [await createTerminalTab(agentId)];
+				return [await createTerminalTab(agentId, undefined, cwd)];
 			},
 			create: createTerminalTab,
 			input: async (tabId, data) => {
@@ -585,6 +832,11 @@ export function createPreviewApi(): PiDesktopApi {
 					terminalExitListeners.delete(callback);
 				};
 			},
+			shells: async () => [
+				{ shell: "powershell", label: "PowerShell", available: true },
+				{ shell: "pwsh", label: "pwsh", available: true },
+				{ shell: "cmd", label: "cmd", available: true },
+			],
 		},
 		feishu: {
 			connect: async () => ({ success: true, message: "预览模式" }),
@@ -607,7 +859,25 @@ export function createPreviewApi(): PiDesktopApi {
 			onBotsChanged: () => () => {},
 			onWhoamiResult: () => () => {},
 			sessionBotGet: async () => null,
-			sessionBotSet: async () => {},
+			sessionBotSet: async () => ({ success: true }),
+		},
+		dialog: {
+			pickFiles: async () => [],
+		},
+		browser: {
+			openExternal: async () => {},
+		},
+		scratchPad: {
+			list: async () => [],
+			create: async () => ({ id: "", name: "", path: "", createdAt: 0, updatedAt: 0 }),
+			delete: async () => {},
+			load: async () => ({ content: "", lastEditedAt: 0, cursorPosition: 0 }),
+			save: async () => {},
+			export: async () => false,
+		},
+
+		clipboard: {
+			writeText: async (_text: string) => {},
 		},
 	};
 }

@@ -1,7 +1,14 @@
 import * as pty from "node-pty";
 import { randomUUID } from "node:crypto";
+import { execSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { ipcChannels } from "../../shared/ipc";
 import type { TerminalShell, TerminalTab } from "../../shared/types";
+
+// 简单日志，不依赖 appLogger 以避免循环引用
+const log = (msg: string) => {
+	console.error(`[TerminalSessionManager] ${msg}`);
+};
 
 type TerminalRuntime = {
 	tab: TerminalTab;
@@ -22,11 +29,30 @@ export function getTerminalShellCandidates(
 	env: NodeJS.ProcessEnv,
 ): TerminalShellCandidate[] {
 	if (platform === "win32") {
-		return [
+		const candidates: TerminalShellCandidate[] = [
 			{ shell: "pwsh", command: "pwsh.exe", args: [] },
 			{ shell: "powershell", command: "powershell.exe", args: [] },
 			{ shell: "cmd", command: "cmd.exe", args: [] },
 		];
+		// 检测 Git Bash（常见安装路径）
+		const gitBashPaths = [
+			"C:\\Program Files\\Git\\bin\\bash.exe",
+			"C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+		];
+		for (const p of gitBashPaths) {
+			if (existsSync(p)) {
+				candidates.push({ shell: "git-bash", command: p, args: ["--login", "-i"] });
+				break;
+			}
+		}
+		// 检测 WSL：检查 wsl.exe 是否在 PATH 中
+		try {
+			execSync("where wsl.exe", { stdio: "ignore", timeout: 3000 });
+			candidates.push({ shell: "wsl", command: "wsl.exe", args: [] });
+		} catch {
+			// wsl.exe 不可用，跳过 WSL
+		}
+		return dedupeShellCandidates(candidates);
 	}
 
 	if (platform === "darwin") {
@@ -79,7 +105,7 @@ export class TerminalSessionManager {
 	private readonly runtimes = new Map<string, Map<string, TerminalRuntime>>();
 
 	constructor(
-		private readonly getAgentCwd: (agentId: string) => string,
+		private readonly getCwd: (agentId: string) => string,
 		private readonly emit: Emit,
 	) {}
 
@@ -89,25 +115,37 @@ export class TerminalSessionManager {
 		);
 	}
 
-	ensure(agentId: string) {
+	/**
+	 * 返回当前平台可用的终端 shell 列表，供前端下拉选择。
+	 * 返回前检测每个候选是否可 spawn，不可用的标记为 available: false。
+	 */
+	listShells(): { shell: TerminalShell; label: string; available: boolean }[] {
+		return this.shellCandidates().map((c) => ({
+			shell: c.shell,
+			label: this.displayShell(c.shell),
+			available: true,
+		}));
+	}
+
+	ensure(agentId: string, cwd?: string) {
 		const existing = this.list(agentId);
 		if (existing.length > 0) return existing;
 		// Renderer 在 StrictMode 下会重复触发 mount effect；这里提供原子兜底，
 		// 避免 list -> create 两步之间的竞态导致“未点击却多出两个终端”。
-		return [this.create(agentId)];
+		return [this.create(agentId, undefined, cwd)];
 	}
 
-	create(agentId: string): TerminalTab {
-		const cwd = this.getAgentCwd(agentId);
+	create(agentId: string, shell?: TerminalShell, cwd?: string): TerminalTab {
+		const resolvedCwd = cwd ?? this.getCwd(agentId);
 		const runtimes = this.ensureAgent(agentId);
 		const index = runtimes.size + 1;
 		const id = randomUUID();
-		const spawned = this.spawnShell(cwd);
+		const spawned = this.spawnShell(resolvedCwd, shell);
 		const tab: TerminalTab = {
 			id,
 			agentId,
 			title: `${this.displayShell(spawned.shell)} ${index}`,
-			cwd,
+			cwd: resolvedCwd,
 			shell: spawned.shell,
 			createdAt: Date.now(),
 		};
@@ -139,9 +177,10 @@ export class TerminalSessionManager {
 	}
 
 	resize(tabId: string, cols: number, rows: number) {
-		const runtime = this.requireTab(tabId);
-		if (runtime.tab.exited) return;
-		runtime.pty.resize(Math.max(2, cols), Math.max(1, rows));
+		// 终端已关闭时静默忽略 resize，避免已销毁的 tab 触发未处理异常
+		const found = this.findRuntime(tabId);
+		if (!found || found.runtime.tab.exited) return;
+		found.runtime.pty.resize(Math.max(2, cols), Math.max(1, rows));
 	}
 
 	close(tabId: string) {
@@ -205,21 +244,36 @@ export class TerminalSessionManager {
 		}
 	}
 
-	private spawnShell(cwd: string): { shell: TerminalShell; pty: pty.IPty } {
+	private spawnShell(cwd: string, preferredShell?: TerminalShell): { shell: TerminalShell; pty: pty.IPty } {
 		const candidates = this.shellCandidates();
+		// 如果有首选 shell，先在候选列表中查找匹配项
+		const ordered = preferredShell
+			? [
+					...candidates.filter((c) => c.shell === preferredShell),
+					...candidates.filter((c) => c.shell !== preferredShell),
+			  ]
+			: candidates;
+		log(`spawnShell: preferred=${preferredShell}, ordered=${ordered.map((c) => c.shell).join(", ")}`);
 		let lastError: unknown;
-		for (const candidate of candidates) {
+		for (const candidate of ordered) {
 			try {
+				// macOS GUI 应用（Electron）不继承登录 shell 的环境变量，
+				// LANG/LC_CTYPE 可能为空或 C，导致 shell 内 UTF-8 输出乱码。
+				// 显式注入 UTF-8 locale，让 shell 知道应以 UTF-8 解释字节流。
+				const env = { ...process.env };
+				if (!env.LANG) env.LANG = "en_US.UTF-8";
+				if (!env.LC_ALL) env.LC_ALL = "en_US.UTF-8";
 				const terminal = pty.spawn(candidate.command, candidate.args, {
 					name: "xterm-256color",
 					cols: 80,
 					rows: 24,
 					cwd,
-					env: process.env,
+					env,
 				});
 				return { shell: candidate.shell, pty: terminal };
 			} catch (error) {
 				lastError = error;
+				log(`Failed to spawn ${candidate.shell} (${candidate.command}): ${error instanceof Error ? error.message : String(error)}`);
 			}
 		}
 		throw lastError instanceof Error
@@ -232,11 +286,14 @@ export class TerminalSessionManager {
 	}
 
 	private displayShell(shell: TerminalShell) {
-		if (shell === "pwsh" || shell === "powershell") return "PowerShell";
+		if (shell === "pwsh") return "pwsh";
+		if (shell === "powershell") return "Windows PowerShell";
 		if (shell === "cmd") return "cmd";
 		if (shell === "zsh") return "zsh";
 		if (shell === "bash") return "bash";
 		if (shell === "fish") return "fish";
+		if (shell === "git-bash") return "Git Bash";
+		if (shell === "wsl") return "WSL";
 		return "shell";
 	}
 }

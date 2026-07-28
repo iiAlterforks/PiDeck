@@ -28,7 +28,9 @@ jobs:
         run: npm run make-icon
 
       - name: Build macOS arm64 package
-        run: npm run build && npx electron-builder --mac dmg zip --arm64 --publish never
+        run: npm run build:fast && npx electron-builder --mac dmg zip --arm64 --publish never
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
 
       - name: Upload macOS test artifact
         uses: actions/upload-artifact@v4

@@ -1,5 +1,10 @@
 import type { PiDesktopApi } from "../../preload";
-import type { AgentTab, ChatMessage, SendPromptInput } from "../../shared/types";
+import type {
+	AgentTab,
+	ChatMessage,
+	SendPromptInput,
+	SendPromptResult,
+} from "../../shared/types";
 import { t } from "./i18n";
 import { createPreviewApi } from "./previewApi";
 
@@ -18,25 +23,48 @@ const stateListeners = new Set<(tabs: AgentTab[]) => void>();
 const messageListeners = new Set<(payload: { agentId: string; messages: ChatMessage[] }) => void>();
 let lastMessages = new Map<string, string>();
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// Vite dev 会把未知 /api/* 回退到 index.html，写入状态前必须确认是真正的 Web 服务载荷。
+function isWebState(value: unknown): value is WebState {
+	if (!isRecord(value)) return false;
+	return (
+		Array.isArray(value.projects) &&
+		Array.isArray(value.agents) &&
+		isRecord(value.messagesByAgent)
+	);
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	const response = await fetch(path, {
 		headers: { "content-type": "application/json" },
 		...init,
 	});
-	const data = await response.json().catch(() => ({
-		error: t("errors.nonJsonResponse", {
-			status: response.status,
-			statusText: response.statusText,
-		}),
-	}));
-	if (!response.ok || data?.ok === false) {
-		throw new Error(data?.error ?? response.statusText);
+	let data: unknown;
+	try {
+		data = await response.json();
+	} catch {
+		throw new Error(
+			t("errors.nonJsonResponse", {
+				status: response.status,
+				statusText: response.statusText,
+			}),
+		);
+	}
+	if (!response.ok || (isRecord(data) && data.ok === false)) {
+		throw new Error(isRecord(data) && typeof data.error === "string" ? data.error : response.statusText);
 	}
 	return data as T;
 }
 
 async function refreshState() {
-	state = await request<WebState>("/api/state");
+	const nextState = await request<unknown>("/api/state");
+	if (!isWebState(nextState)) {
+		throw new Error("Invalid web service state payload");
+	}
+	state = nextState;
 	connected = true;
 	for (const listener of stateListeners) listener(state.agents);
 	for (const [agentId, messages] of Object.entries(state.messagesByAgent)) {
@@ -124,11 +152,17 @@ export function createBrowserApi(): PiDesktopApi {
 				await refreshState();
 			},
 			prompt: async (input: SendPromptInput) => {
-				await request(`/api/agents/${encodeURIComponent(input.agentId)}/prompt`, {
-					method: "POST",
-					body: JSON.stringify({ message: input.message, streamingBehavior: input.streamingBehavior }),
-				});
-				await refreshState();
+				const response = await request<{ result: SendPromptResult }>(
+					`/api/agents/${encodeURIComponent(input.agentId)}/prompt`,
+					{
+						method: "POST",
+						body: JSON.stringify(input),
+					},
+				);
+				// The SendPromptResult is already authoritative. State refresh is best-effort and
+				// must not turn an explicit semantic rejection into an indeterminate delivery.
+				void refreshState().catch(() => undefined);
+				return response.result;
 			},
 			runtimeState: async (agentId) => {
 				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["runtimeState"]>> }>(
@@ -153,6 +187,13 @@ export function createBrowserApi(): PiDesktopApi {
 				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["setModel"]>> }>(
 					`/api/agents/${encodeURIComponent(agentId)}/model`,
 					{ method: "POST", body: JSON.stringify({ provider, modelId }) },
+				);
+				return result.state;
+			},
+			refreshModels: async (agentId) => {
+				const result = await request<{ state: Awaited<ReturnType<PiDesktopApi["agents"]["refreshModels"]>> }>(
+					`/api/agents/${encodeURIComponent(agentId)}/refresh-models`,
+					{ method: "POST", body: "{}" },
 				);
 				return result.state;
 			},

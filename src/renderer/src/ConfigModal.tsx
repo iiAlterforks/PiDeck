@@ -1,3 +1,4 @@
+import { showNotice } from "./utils/notice";
 import { Component, useState, useEffect, useCallback, type ReactNode } from "react";
 import type { PiDesktopApi } from "../../preload";
 import { AuthTab } from "./config/AuthTab";
@@ -5,6 +6,7 @@ import { ModelsTab } from "./config/ModelsTab";
 import { RawTab } from "./config/RawTab";
 import { TrustTab } from "./config/TrustTab";
 import { SettingsTab } from "./config/SettingsTab";
+import { PromptsTab } from "./config/PromptsTab";
 import { SkillsTab } from "./config/SkillsTab";
 import { ExtensionsTab } from "./config/ExtensionsTab";
 import { EditorsTab } from "./config/EditorsTab";
@@ -12,6 +14,8 @@ import { ImTab } from "./config/ImTab";
 import { LogsTab } from "./config/LogsTab";
 import { CloseIconButton } from "./components/ui/IconButton";
 import { t } from "./i18n";
+import { LazyMonacoEditor } from "./components/ui/LazyMonacoEditor";
+import { translateBuiltinPromptDescription } from "./composerBehavior";
 import type {
 	AuthFile,
 	ConfigTab,
@@ -19,8 +23,8 @@ import type {
 	ModelsFile,
 	SettingsFile,
 } from "./config/configTypes";
-import type { ConfigFileDiagnostic, PiExtensionListResult, PiExtensionSummary, PiSkillListResult, PiSkillLocation, PiSkillSummary } from "../../shared/types";
-import { getProviderHeaders } from "./config/providerHeaders";
+import type { ConfigFileDiagnostic, CreatePiPromptTemplateInput, PiExtensionListResult, PiExtensionSummary, PiPromptTemplateListResult, PiPromptTemplateSummary, PiSkillListResult, PiSkillLocation, PiSkillSummary } from "../../shared/types";
+import { getProviderHeaders, KNOWN_PROVIDER_ENDPOINTS } from "./config/providerHeaders";
 
 const api: PiDesktopApi = (window as unknown as { piDesktop: PiDesktopApi })
 	.piDesktop;
@@ -57,8 +61,13 @@ function normalizeModelsFile(value: unknown): ModelsFile {
 		providers[name] = {
 			...provider,
 			models: Array.isArray(rawModels)
-				? rawModels.filter((model): model is ModelItem =>
-						Boolean(model) && typeof model === "object" && !Array.isArray(model),
+				? rawModels
+					.filter((model): model is ModelItem | string =>
+						Boolean(model) &&
+						(typeof model === "object" && !Array.isArray(model) || typeof model === "string"),
+					)
+					.map((model) =>
+						typeof model === "string" ? { id: model } : model,
 					)
 				: [],
 		};
@@ -169,18 +178,22 @@ export function ConfigModal(props: ConfigModalProps) {
 
 function ConfigModalContent(props: ConfigModalProps) {
 	const { open, onClose, onSaved } = props;
-	const [section, setSection] = useState<"config" | "skills" | "extensions" | "editors" | "im" | "logs">("config");
+	const [section, setSection] = useState<"config" | "skills" | "prompts" | "extensions" | "editors" | "im" | "logs">("config");
 	const [tab, setTab] = useState<ConfigTab>("models");
 	const [loading, setLoading] = useState(false);
 	const [saving, setSaving] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [configDiagnostic, setConfigDiagnostic] = useState<ConfigFileDiagnostic | null>(null);
-	const [toast, setToast] = useState<string | null>(null);
+	/* toast 已改用 sonner 实现 */
 
 	// 各 tab 的数据
 	const [modelsData, setModelsData] = useState<ModelsFile>({ providers: {} });
 	const [authData, setAuthData] = useState<AuthFile>({});
 	const [settingsData, setSettingsData] = useState<SettingsFile>({});
+	/** 自动发现的模型：auth-only 供应商通过已知端点获取的模型列表 */
+	const [discoveredModels, setDiscoveredModels] = useState<
+		Record<string, Array<{ id: string; name?: string }>>
+	>({});
 	const [trustData, setTrustData] = useState<Record<string, boolean>>({});
 	const [skillsData, setSkillsData] = useState<PiSkillListResult>({
 		locations: [],
@@ -197,6 +210,24 @@ function ConfigModalContent(props: ConfigModalProps) {
 	const [newSkillDescription, setNewSkillDescription] = useState("");
 	const [newSkillLocationId, setNewSkillLocationId] = useState<PiSkillLocation["id"]>("pi-global");
 	const [deleteSkillConfirm, setDeleteSkillConfirm] = useState<PiSkillSummary | null>(null);
+	const [editingGlobalSkill, setEditingGlobalSkill] = useState<PiSkillSummary | null>(null);
+	const [editGlobalContent, setEditGlobalContent] = useState("");
+	const [editGlobalLoading, setEditGlobalLoading] = useState(false);
+	const [editGlobalSaving, setEditGlobalSaving] = useState(false);
+	const [editGlobalSaved, setEditGlobalSaved] = useState(false);
+	const [promptsData, setPromptsData] = useState<PiPromptTemplateListResult>({
+		templates: [],
+		globalDir: "",
+	});
+	const [creatingPrompt, setCreatingPrompt] = useState(false);
+	const [newPromptName, setNewPromptName] = useState("");
+	const [newPromptDescription, setNewPromptDescription] = useState("");
+	const [editingPrompt, setEditingPrompt] = useState<PiPromptTemplateSummary | null>(null);
+	const [editPromptContent, setEditPromptContent] = useState("");
+	const [editPromptLoading, setEditPromptLoading] = useState(false);
+	const [editPromptSaving, setEditPromptSaving] = useState(false);
+	/** 用户已删除的内置模板名称（仅当前会话有效） */
+	const [deletedBuiltinNames, setDeletedBuiltinNames] = useState<Set<string>>(new Set());
 	const [uninstallExtensionConfirm, setUninstallExtensionConfirm] = useState<PiExtensionSummary | null>(null);
 	const [rawContent, setRawContent] = useState("");
 	const [rawFileName, setRawFileName] = useState("models.json");
@@ -290,11 +321,71 @@ function ConfigModalContent(props: ConfigModalProps) {
 					setRawFileName("auth.json");
 					setConfigDiagnostic(res.diagnostic ?? null);
 				} else if (target === "settings") {
-					const res = await api.config.getSettings();
-					setSettingsData(res.parsed as SettingsFile);
-					setRawContent(res.raw);
+					// 同时加载 settings、auth 和 models 数据，确保 defaultProvider / defaultModel 下拉能聚合所有可用信息
+					const [settingsRes, authRes, modelsRes] = await Promise.all([
+						api.config.getSettings(),
+						api.config.getAuth(),
+						api.config.getModels(),
+					]);
+					setSettingsData(settingsRes.parsed as SettingsFile);
+					setAuthData(authRes.parsed as AuthFile);
+					setModelsData(normalizeModelsFile(modelsRes.parsed));
+					setRawContent(settingsRes.raw);
 					setRawFileName("settings.json");
-					setConfigDiagnostic(res.diagnostic ?? null);
+					setConfigDiagnostic(settingsRes.diagnostic ?? null);
+
+					// 对于 auth 中有但 models 中没有模型的供应商，自动尝试获取模型列表
+					const authProviders = authRes.parsed as AuthFile;
+					const modelsProviders = normalizeModelsFile(modelsRes.parsed).providers;
+					const discovered: Record<string, Array<{ id: string; name?: string }>> = {};
+					const fetchPromises: Array<Promise<void>> = [];
+
+					for (const [providerName, authEntry] of Object.entries(authProviders)) {
+						// 跳过已有模型的供应商
+						if (modelsProviders[providerName]?.models?.length) continue;
+						const apiKey =
+							typeof authEntry.key === "string" ? authEntry.key : "";
+						if (!apiKey) continue;
+
+						// 情况1：从 KNOWN_PROVIDER_ENDPOINTS 获知该供应商的 API 端点
+						const knownEndpoint = KNOWN_PROVIDER_ENDPOINTS[providerName];
+						// 情况2：从 models.json 中该供应商的配置获知 baseUrl
+						const modelsProvider = modelsProviders[providerName];
+						const modelsBaseUrl =
+							modelsProvider && typeof modelsProvider.baseUrl === "string"
+								? modelsProvider.baseUrl
+								: undefined;
+						const baseUrl = knownEndpoint?.baseUrl ?? modelsBaseUrl;
+						if (!baseUrl) continue;
+
+						const apiType =
+							knownEndpoint?.apiType ??
+							(typeof modelsProvider?.api === "string"
+								? modelsProvider.api
+								: undefined);
+
+						fetchPromises.push(
+							api.config
+								.fetchModels(baseUrl, apiKey, apiType)
+								.then((result) => {
+									if (result.success && result.models) {
+										discovered[providerName] = result.models;
+									}
+								})
+								.catch(() => {
+									// 静默失败，不阻塞 UI
+								}),
+						);
+					}
+
+					if (fetchPromises.length > 0) {
+						// 不 await，在后台获取后更新状态即可
+						void Promise.allSettled(fetchPromises).then(() => {
+							if (Object.keys(discovered).length > 0) {
+								setDiscoveredModels(discovered);
+							}
+						});
+					}
 				} else if (target === "trust") {
 					const res = await api.config.getTrust();
 					setTrustData(res.parsed as Record<string, boolean>);
@@ -338,8 +429,13 @@ function ConfigModalContent(props: ConfigModalProps) {
 			void refreshSkills();
 			return;
 		}
+		if (section === "prompts") {
+			void refreshPrompts();
+			return;
+		}
 		if (section === "extensions") {
-			void refreshExtensions();
+			// 切到扩展页默认吃缓存；只有点刷新按钮才 forceRefresh。
+			void refreshExtensions(false);
 			return;
 		}
 		if (section === "editors") return;
@@ -348,8 +444,58 @@ function ConfigModalContent(props: ConfigModalProps) {
 	}, [open, section, tab, loadConfig]);
 
 	const showToast = (msg: string) => {
-		setToast(msg);
-		setTimeout(() => setToast(null), 2500);
+		showNotice(msg, 2500);
+	};
+
+	/** 去掉 Electron IPC 包装前缀，只保留真正业务错误，方便 toast 阅读。 */
+	const formatIpcError = (error: unknown): string => {
+		const raw = error instanceof Error ? error.message : String(error);
+		const matched = raw.match(
+			/Error invoking remote method '[^']+':\s*(?:Error:\s*)?([\s\S]+)$/i,
+		);
+		return (matched?.[1] ?? raw).trim();
+	};
+
+	/**
+	 * 模型配置保存后，通知所有运行中的 Agent 尝试刷新模型配置。
+	 *
+	 * 当前仅尝试 reload_config RPC（策略 1），pi 0.80.10 尚未支持此命令，
+	 * 因此实际为 no-op。进程重启方案（策略 2）已注释，原因：
+	 *   - 运行中重启会打断用户对话/工具执行
+	 *   - 涉及 exit 事件竞态、模型恢复等复杂边界
+	 *
+	 * pi 合并 https://github.com/earendil-works/pi/issues/6890 后自动生效。
+	 */
+	const refreshRunningAgents = async () => {
+		try {
+			const agents = await api.agents.list();
+			// 只刷新状态为 running 或 idle 的活跃 Agent（排除 closed/error/starting）
+			const activeAgents = agents.filter(
+				(agent) => agent.status === "running" || agent.status === "idle",
+			);
+			if (activeAgents.length === 0) return;
+
+			let refreshed = 0;
+			let failed = 0;
+			for (const agent of activeAgents) {
+				try {
+					await api.agents.refreshModels(agent.id);
+					refreshed++;
+				} catch {
+					failed++;
+				}
+			}
+
+			// pi 官方尚未支持 reload_config RPC，刷新实际为 no-op，先注释提示避免误导
+			// if (refreshed > 0 && failed === 0) {
+			// 	showToast(t("config.modelsRefreshed", { count: refreshed }));
+			// } else if (refreshed > 0) {
+			// 	showToast(t("config.modelsRefreshedPartial", { refreshed, failed }));
+			// }
+		} catch {
+			// 获取 agent 列表失败时静默忽略，模型配置已保存，下次启动 agent 生效
+		}
+
 	};
 
 	const saveAndReload = async (
@@ -462,6 +608,36 @@ function ConfigModalContent(props: ConfigModalProps) {
 		setExpandedProvider(newName);
 	};
 
+	/**
+	 * 检测成功且实际走通 /v1（或 /v1beta）时，把表单里的 baseUrl 自动改成带版本路径。
+	 * 原因：检测侧会兼容补路径，但 pi 会话会原样读 models.json；不改写则「测试正常、会话 404」。
+	 * 仅改内存表单，需用户点保存后才写入磁盘。
+	 * 后端仅在确实需要改写时返回 suggestedBaseUrl，前端直接应用即可。
+	 */
+	const applySuggestedBaseUrl = useCallback(
+		(providerName: string, suggestedBaseUrl?: string) => {
+			if (!suggestedBaseUrl) return false;
+			const next = suggestedBaseUrl.replace(/\/+$/, "");
+			if (!next) return false;
+			// 函数式更新，避免 async 返回时闭包拿到旧 modelsData。
+			setModelsData((prev) => {
+				const provider = prev.providers[providerName];
+				if (!provider) return prev;
+				const current = (provider.baseUrl ?? "").replace(/\/+$/, "");
+				if (current === next) return prev;
+				return {
+					...prev,
+					providers: {
+						...prev.providers,
+						[providerName]: { ...provider, baseUrl: next },
+					},
+				};
+			});
+			return true;
+		},
+		[],
+	);
+
 	// 从 provider 的 baseUrl + apiKey 拉取可用模型列表
 	const handleFetchModels = async (providerName: string) => {
 		const provider = modelsData.providers[providerName];
@@ -492,7 +668,19 @@ function ConfigModalContent(props: ConfigModalProps) {
 					...prev,
 					[providerName]: undefined,
 				}));
-				showToast(t("config.fetchedModels", { count: result.models.length }));
+				const normalized = applySuggestedBaseUrl(
+					providerName,
+					result.suggestedBaseUrl,
+				);
+				if (normalized && result.suggestedBaseUrl) {
+					showToast(
+						t("config.baseUrlAutoNormalized", {
+							url: result.suggestedBaseUrl,
+						}),
+					);
+				} else {
+					showToast(t("config.fetchedModels", { count: result.models.length }));
+				}
 			} else {
 				// 根据 API 类型提供不同的错误提示
 				const apiTypeHint = getFetchModelsHintByApi(provider.api as string | undefined, provider.baseUrl);
@@ -539,6 +727,20 @@ function ConfigModalContent(props: ConfigModalProps) {
 				getProviderHeaders(provider.headers),
 			);
 			setTestResult({ providerName, ...result });
+			// 测试成功且走通版本路径时，自动把根路径 baseUrl 改成 /v1 等，避免会话侧失败。
+			if (result.success && result.suggestedBaseUrl) {
+				const normalized = applySuggestedBaseUrl(
+					providerName,
+					result.suggestedBaseUrl,
+				);
+				if (normalized) {
+					showToast(
+						t("config.baseUrlAutoNormalized", {
+							url: result.suggestedBaseUrl,
+						}),
+					);
+				}
+			}
 		} catch (e) {
 			setTestResult({
 				providerName,
@@ -587,6 +789,52 @@ function ConfigModalContent(props: ConfigModalProps) {
 		});
 	};
 
+	const handleUpdateModelXhigh = (
+		providerName: string,
+		index: number,
+		value: "" | "xhigh" | "max",
+	) => {
+		const provider = modelsData.providers[providerName];
+		const currentModel = provider?.models[index];
+		if (!provider || !currentModel) return;
+		const models = [...provider.models];
+		const nextThinkingLevelMap = {
+			...(currentModel.thinkingLevelMap ?? {}),
+		};
+		if (value) nextThinkingLevelMap.xhigh = value;
+		else delete nextThinkingLevelMap.xhigh;
+		const nextModel = {
+			...currentModel,
+			// xhigh 只有 reasoning 模型才有意义；打开映射时同步开启，避免保存后 UI 看似配置成功但 pi 仍不展示思考档位。
+			reasoning: value ? true : currentModel.reasoning,
+		};
+		if (Object.keys(nextThinkingLevelMap).length > 0) {
+			nextModel.thinkingLevelMap = nextThinkingLevelMap;
+		} else {
+			delete nextModel.thinkingLevelMap;
+		}
+		models[index] = nextModel;
+
+		const nextProvider = value
+			? {
+				...provider,
+				compat: {
+					supportsDeveloperRole: false,
+					...(provider.compat ?? {}),
+					// xhigh 映射必须最终发送给上游；自动打开可减少用户遗漏 provider 兼容开关导致回退 high。
+					supportsReasoningEffort: true,
+				},
+			}
+			: { ...provider };
+		setModelsData({
+			...modelsData,
+			providers: {
+				...modelsData.providers,
+				[providerName]: { ...nextProvider, models },
+			},
+		});
+	};
+
 	const handleDeleteModel = (providerName: string, index: number) => {
 		const provider = modelsData.providers[providerName];
 		if (!provider) return;
@@ -611,11 +859,32 @@ function ConfigModalContent(props: ConfigModalProps) {
 	};
 
 	const handleSaveModels = async () => {
+		// 保存前规范化所有供应商的 compat 字段，确保布尔值显式写入而不依赖后端默认值
+		const normalizedData = {
+			...modelsData,
+			providers: Object.fromEntries(
+				Object.entries(modelsData.providers).map(([name, provider]) => [
+					name,
+					{
+						...provider,
+						compat: {
+							supportsDeveloperRole: false,
+							supportsReasoningEffort: false,
+							...(provider.compat as Record<string, unknown> | undefined),
+						},
+					},
+				]),
+			),
+		};
 		await saveAndReload(
-			() => api.config.saveModels(modelsData),
-			t("config.modelsSavedRestartHint"),
+			() => api.config.saveModels(normalizedData),
+			t("config.modelsSaved"),
 		);
 		await loadConfig("models");
+
+		// 保存后自动刷新所有运行中的 Agent，使模型配置实时生效
+		// pi 官方尚未支持，先注释
+		// void refreshRunningAgents();
 	};
 
 	// ── Auth 操作 ────────────────────────────────────────
@@ -731,10 +1000,14 @@ function ConfigModalContent(props: ConfigModalProps) {
 		const isModelsFile = rawFileName === "models.json";
 		await saveAndReload(
 			() => api.config.saveRaw(rawFileName, rawContent),
-			isModelsFile ? t("config.modelsSavedRestartHint") : undefined,
+			isModelsFile ? t("config.modelsSaved") : undefined,
 		);
-		if (isModelsFile) await loadConfig("models");
-		else if (rawFileName === "auth.json") await loadConfig("auth");
+		if (isModelsFile) {
+			await loadConfig("models");
+			// Raw 保存也触发模型刷新，确保运行中的 Agent 实时生效
+			// pi 官方尚未支持，先注释
+			// void refreshRunningAgents();
+		} else if (rawFileName === "auth.json") await loadConfig("auth");
 		else if (rawFileName === "trust.json") await loadConfig("trust");
 		else await loadConfig("settings");
 	};
@@ -777,6 +1050,148 @@ function ConfigModalContent(props: ConfigModalProps) {
 			showToast(t("config.exported"));
 		} catch (e) {
 			setError(e instanceof Error ? e.message : String(e));
+		}
+	};
+
+	/** 刷新 prompt templates 列表 */
+	const refreshPrompts = async () => {
+		const res = await api.prompts.list();
+		// 过滤掉用户已删除的内置模板，同时翻译内置模板的 description
+		res.templates = res.templates
+			.filter((t) => t.userCreated || !deletedBuiltinNames.has(t.name))
+			.map((tpl) => ({
+				...tpl,
+				description: translateBuiltinPromptDescription(tpl),
+			}));
+		setPromptsData(res);
+	};
+
+	/** 创建新 prompt template */
+	const handleCreatePrompt = async () => {
+		setCreatingPrompt(true);
+		setError(null);
+		try {
+			await api.prompts.create({
+				name: newPromptName,
+				description: newPromptDescription,
+			});
+			setNewPromptName("");
+			setNewPromptDescription("");
+			await refreshPrompts();
+			showToast(t("config.promptCreatedToast"));
+		} catch (e) {
+			setError(e instanceof Error ? e.message : String(e));
+		} finally {
+			setCreatingPrompt(false);
+		}
+	};
+
+	/** 确认删除 prompt template */
+	const confirmDeletePrompt = async (target: PiPromptTemplateSummary) => {
+		setError(null);
+		if (target.userCreated) {
+			try {
+				await api.prompts.delete(target.path);
+				await refreshPrompts();
+				showToast(t("config.promptDeletedToast"));
+			} catch (e) {
+				setError(e instanceof Error ? e.message : String(e));
+			}
+		} else {
+			// 内置模板：从显示列表中移除
+			setDeletedBuiltinNames((prev) => new Set(prev).add(target.name));
+			showToast(t("config.promptDeletedToast"));
+		}
+	};
+
+	/** 打开 prompt template 编辑器 */
+	const handleEditPrompt = async (template: PiPromptTemplateSummary) => {
+		// 内置模板直接使用预加载的 content，无需从文件读取
+		if (!template.userCreated) {
+			setEditingPrompt(template);
+			setEditPromptContent(template.content);
+			setEditPromptLoading(false);
+			setError(null);
+			return;
+		}
+		setEditingPrompt(template);
+		setEditPromptContent("");
+		setEditPromptLoading(true);
+		setError(null);
+		try {
+			const content = await api.prompts.edit(template.path);
+			setEditPromptContent(content as string);
+		} catch (err) {
+			setError(err instanceof Error ? err.message : String(err));
+			setEditingPrompt(null);
+		} finally {
+			setEditPromptLoading(false);
+		}
+	};
+
+	/** 取消编辑 prompt template */
+	const handleCancelEditPrompt = () => {
+		setEditingPrompt(null);
+		setEditPromptContent("");
+	};
+
+	/** 保存 prompt template 编辑器内容 */
+	const handleSaveEditPrompt = async () => {
+		if (!editingPrompt || editPromptSaving) return;
+		setEditPromptSaving(true);
+		setError(null);
+		try {
+			if (!editingPrompt.userCreated) {
+				// 内置模板：先创建用户副本，再写入编辑内容
+				const created = await api.prompts.create({
+					name: editingPrompt.name,
+					description: editingPrompt.description,
+				});
+				await api.prompts.edit(created.path, editPromptContent);
+			} else {
+				await api.prompts.edit(editingPrompt.path, editPromptContent);
+			}
+			showToast(t("config.promptSavedToast"));
+			setEditingPrompt(null);
+			await refreshPrompts();
+		} catch (err) {
+			setError(err instanceof Error ? err.message : String(err));
+		} finally {
+			setEditPromptSaving(false);
+		}
+	};
+
+	/** Ctrl+S 快速保存：保存但不关闭弹框、不弹提示 */
+	const handleRenamePrompt = async (template: { name: string; path: string }, newName: string) => {
+		setError(null);
+		try {
+			await api.prompts.rename(template.name, newName);
+			await refreshPrompts();
+			showToast(t("config.promptRenamedToast"));
+		} catch (e) {
+			setError(e instanceof Error ? e.message : String(e));
+		}
+	};
+
+	const handleQuickSavePrompt = async () => {
+		if (!editingPrompt || editPromptSaving) return;
+		setEditPromptSaving(true);
+		setError(null);
+		try {
+			if (!editingPrompt.userCreated) {
+				const created = await api.prompts.create({
+					name: editingPrompt.name,
+					description: editingPrompt.description,
+				});
+				await api.prompts.edit(created.path, editPromptContent);
+			} else {
+				await api.prompts.edit(editingPrompt.path, editPromptContent);
+			}
+			await refreshPrompts();
+		} catch (err) {
+			setError(err instanceof Error ? err.message : String(err));
+		} finally {
+			setEditPromptSaving(false);
 		}
 	};
 
@@ -834,11 +1249,73 @@ function ConfigModalContent(props: ConfigModalProps) {
 		}
 	};
 
-	const refreshExtensions = async () => {
+	const handleRenameGlobalSkill = async (skill: PiSkillSummary, newName: string) => {
+		setError(null);
+		try {
+			await api.skills.rename(skill.path, newName);
+			await refreshSkills();
+			showToast(t("config.skillRenamedToast"));
+		} catch (e) {
+			setError(e instanceof Error ? e.message : String(e));
+		}
+	};
+
+	const handleEditGlobalSkill = async (skill: PiSkillSummary) => {
+		setEditingGlobalSkill(skill);
+		setEditGlobalContent("");
+		setEditGlobalLoading(true);
+		setError(null);
+		try {
+			const content = await window.piDesktop.files.readContent(skill.path);
+			setEditGlobalContent(content);
+		} catch (err) {
+			setError(err instanceof Error ? err.message : String(err));
+			setEditingGlobalSkill(null);
+		} finally {
+			setEditGlobalLoading(false);
+		}
+	};
+
+	// Ctrl+S / Cmd+S 快捷键保存 skill 编辑器
+	useEffect(() => {
+		const handleKeyDown = (e: KeyboardEvent) => {
+			if ((e.ctrlKey || e.metaKey) && e.key === "s" && editingGlobalSkill && !editGlobalSaving) {
+				e.preventDefault();
+				void saveGlobalSkillEditor();
+			}
+		};
+		if (editingGlobalSkill) {
+			window.addEventListener("keydown", handleKeyDown);
+			return () => window.removeEventListener("keydown", handleKeyDown);
+		}
+	}, [editingGlobalSkill, editGlobalSaving]);
+
+	const saveGlobalSkillEditor = async () => {
+		if (!editingGlobalSkill || editGlobalSaving) return;
+		setEditGlobalSaving(true);
+		setError(null);
+		try {
+			await window.piDesktop.files.writeContent(editingGlobalSkill.path, editGlobalContent);
+			setEditGlobalSaved(true);
+			window.setTimeout(() => setEditGlobalSaved(false), 2000);
+			await refreshSkills();
+		} catch (err) {
+			setError(err instanceof Error ? err.message : String(err));
+		} finally {
+			setEditGlobalSaving(false);
+		}
+	};
+
+	/**
+	 * 加载扩展列表。
+	 * - forceRefresh=false：优先用主进程缓存（启动预热后通常秒开）
+	 * - forceRefresh=true：手动刷新时强制重扫，并查询 npm 更新信息
+	 */
+	const refreshExtensions = async (forceRefresh = false) => {
 		setExtensionsLoading(true);
 		setError(null);
 		try {
-			const res = await api.extensions.list();
+			const res = await api.extensions.list(forceRefresh);
 			setExtensionsData(res);
 		} catch (e) {
 			setError(e instanceof Error ? e.message : String(e));
@@ -856,14 +1333,26 @@ function ConfigModalContent(props: ConfigModalProps) {
 			return;
 		}
 		setUninstallExtensionConfirm(null);
+		// 立刻进入卸载态以触发卡片退场动画，同时发起真实卸载；两者并行，避免“删完才闪一下”。
 		setUninstallingExtensionSource(target.source);
-		setError(null);
+		const exitAnimation = new Promise<void>((resolve) => {
+			window.setTimeout(resolve, 280);
+		});
 		try {
-			await api.extensions.uninstall(target.source, target.scope);
-			await refreshExtensions();
+			await Promise.all([
+				api.extensions.uninstall(target.source, target.scope),
+				exitAnimation,
+			]);
+			// 与禁用/手动刷新一致：强制重扫并跳过可能残留的 in-flight 缓存结果。
+			await refreshExtensions(true);
 			showToast(t("config.extensionUninstalledToast"));
 		} catch (e) {
-			setError(e instanceof Error ? e.message : String(e));
+			// 配置页顶部红字容易被滚出视口；卸载失败用 error toast，用户能立刻看到。
+			showNotice(
+				t("config.extensionUninstallFailed", { error: formatIpcError(e) }),
+				4500,
+				"error",
+			);
 		} finally {
 			setUninstallingExtensionSource(null);
 		}
@@ -956,6 +1445,12 @@ function ConfigModalContent(props: ConfigModalProps) {
 							>
 								{t("config.nav.skills")}
 							</button>
+							<button
+								className={section === "prompts" ? "active" : ""}
+								onClick={() => setSection("prompts")}
+							>
+								{t("config.nav.prompts")}
+							</button>
 						</div>
 						<div className="config-sidebar-group">
 							<span>{t("config.group.im")}</span>
@@ -1029,9 +1524,10 @@ function ConfigModalContent(props: ConfigModalProps) {
 							onCancelRename={handleCancelRename}
 							onDeleteProvider={handleDeleteProvider}
 							onDuplicateProvider={handleDuplicateProvider}
-						onDeleteProviders={handleDeleteProviders}
+							onDeleteProviders={handleDeleteProviders}
 							onAddModel={handleAddModel}
 							onUpdateModel={handleUpdateModel}
+							onUpdateModelXhigh={handleUpdateModelXhigh}
 							onDeleteModel={handleDeleteModel}
 							onFetchModels={handleFetchModels}
 							onTestProvider={handleTestProvider}
@@ -1064,6 +1560,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 							addingAuth={addingAuth}
 							newAuthName={newAuthName}
 							saving={saving}
+							modelsData={modelsData}
 							onToggleAuth={(name) =>
 								setExpandedAuth(expandedAuth === name ? null : name)
 							}
@@ -1086,6 +1583,9 @@ function ConfigModalContent(props: ConfigModalProps) {
 						<SettingsTab
 							data={settingsData}
 							saving={saving}
+							modelsData={modelsData}
+							authData={authData}
+							discoveredModels={discoveredModels}
 							onChange={setSettingsData}
 							onSave={handleSaveSettings}
 						/>
@@ -1100,7 +1600,30 @@ function ConfigModalContent(props: ConfigModalProps) {
 					)}
 
 					{section === "skills" && !loading && (
-						<SkillsTab
+						editingGlobalSkill ? (
+							<div className="prompts-editor-backdrop" onClick={() => setEditingGlobalSkill(null)}>
+								<div className="prompts-editor-modal" onClick={(e) => e.stopPropagation()}>
+									<div className="file-diff-header">
+										<span className="file-diff-header-file">{editingGlobalSkill.name} · SKILL.md</span>
+										<div className="file-diff-header-actions">
+											<CloseIconButton label={t("common.close")} onClick={() => setEditingGlobalSkill(null)} />
+										</div>
+									</div>
+									{editGlobalLoading ? (
+										<div className="config-empty">{t("common.loading")}</div>
+									) : (
+										<div className="prompts-monaco-wrap">
+											<LazyMonacoEditor
+												value={editGlobalContent}
+												onChange={setEditGlobalContent}
+											/>
+									</div>
+								)}
+								{editGlobalSaved && <span className="file-diff-hint saved">{t("config.promptSavedHint")}</span>}
+							</div>
+						</div>
+					) : (
+							<SkillsTab
 							data={skillsData}
 							loading={loading}
 							creating={creatingSkill}
@@ -1115,7 +1638,35 @@ function ConfigModalContent(props: ConfigModalProps) {
 							onCreate={handleCreateSkill}
 							onToggle={(skill, enabled) => handleToggleSkill(skill.path, enabled)}
 							onDelete={setDeleteSkillConfirm}
-							onOpenFolder={(skill) => api.skills.openFolder(skill.path)}
+							onEdit={handleEditGlobalSkill}
+							onRename={handleRenameGlobalSkill}
+						/>
+						)
+					)}
+
+					{section === "prompts" && !loading && (
+						<PromptsTab
+							data={promptsData}
+							loading={loading}
+							creating={creatingPrompt}
+							newName={newPromptName}
+							newDescription={newPromptDescription}
+							editingTemplate={editingPrompt}
+							editContent={editPromptContent}
+							editLoading={editPromptLoading}
+							editSaving={editPromptSaving}
+							onRefresh={refreshPrompts}
+							onOpenRoot={() => api.prompts.openFolder()}
+							onChangeNewName={setNewPromptName}
+							onChangeNewDescription={setNewPromptDescription}
+							onCreate={handleCreatePrompt}
+							onDelete={confirmDeletePrompt}
+							onEdit={handleEditPrompt}
+							onRename={handleRenamePrompt}
+							onQuickSave={handleQuickSavePrompt}
+							onCancelEdit={handleCancelEditPrompt}
+							onChangeEditContent={setEditPromptContent}
+							onSaveEdit={handleSaveEditPrompt}
 						/>
 					)}
 
@@ -1124,7 +1675,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 							data={extensionsData}
 							loading={extensionsLoading}
 							uninstallingSource={uninstallingExtensionSource}
-							onRefresh={refreshExtensions}
+							onRefresh={() => void refreshExtensions(true)}
 							onUninstall={setUninstallExtensionConfirm}
 						/>
 					)}
@@ -1194,8 +1745,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 					</div>
 				)}
 
-				{toast && <div className="config-toast">{toast}</div>}
-
+				{/* toast 已改用 sonner */}
 				{deleteConfirm && (
 					<div className="config-modal-overlay" onClick={() => setDeleteConfirm(null)}>
 						<div className="config-modal-dialog" onClick={(e) => e.stopPropagation()}>

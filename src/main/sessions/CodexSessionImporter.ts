@@ -8,6 +8,7 @@ import type {
 	CodexImportStatus,
 	CodexSessionSummary,
 } from "../../shared/types";
+import { getCodexSessionThreadInfo } from "../../shared/codexSessionMeta";
 
 type ParsedCodexSession = {
 	meta: Record<string, any>;
@@ -102,6 +103,7 @@ export class CodexSessionImporter {
 				: "outdated";
 
 		const originalTimestamp = Date.parse(String(session.meta.timestamp ?? "")) || session.sourceMtime;
+		const threadInfo = getCodexSessionThreadInfo(session.meta);
 		return {
 			id: String(session.meta.id ?? session.sourcePath),
 			sourcePath: session.sourcePath,
@@ -115,16 +117,22 @@ export class CodexSessionImporter {
 			status,
 			sourceSize: session.sourceSize,
 			importedSourceMtime: importMeta?.sourceMtime,
+			threadSource: threadInfo.threadSource,
+			parentThreadId: threadInfo.parentThreadId,
+			agentRole: threadInfo.agentRole,
+			agentNickname: threadInfo.agentNickname,
 		};
 	}
 
 	private convertToPiSession(projectPath: string, session: ParsedCodexSession) {
 		const sessionId = String(session.meta.id ?? this.hash(session.sourcePath));
+		const threadInfo = getCodexSessionThreadInfo(session.meta);
 		const timestamp = new Date(
 			Date.parse(String(session.meta.timestamp ?? "")) || session.sourceMtime,
 		).toISOString();
 		const titleState = { title: "", preview: "" };
 		const toolNames = new Map<string, string>();
+		const toolStartedAt = new Map<string, number>();
 		const lines: string[] = [];
 		let parentId: string | null = null;
 		let sequence = 0;
@@ -184,6 +192,10 @@ export class CodexSessionImporter {
 			sourceMtime: session.sourceMtime,
 			sourceSize: session.sourceSize,
 			importedAt: new Date().toISOString(),
+			threadSource: threadInfo.threadSource,
+			parentThreadId: threadInfo.parentThreadId,
+			agentRole: threadInfo.agentRole,
+			agentNickname: threadInfo.agentNickname,
 		});
 		const modelChangeId = this.makeId(sessionId, sequence++);
 		pushEntry({
@@ -239,6 +251,8 @@ export class CodexSessionImporter {
 				const callId = String(payload.call_id ?? payload.id ?? this.makeId(sessionId, sequence));
 				const toolName = String(payload.name ?? "tool");
 				toolNames.set(callId, toolName);
+				const callStartedAt = this.parseTimestamp(entry.timestamp);
+				if (callStartedAt !== undefined) toolStartedAt.set(callId, callStartedAt);
 				const args = this.parseArguments(payload.arguments);
 				const content = [
 					...(pendingThinking
@@ -264,6 +278,8 @@ export class CodexSessionImporter {
 			if (payload.type === "function_call_output") {
 				const callId = String(payload.call_id ?? payload.id ?? this.makeId(sessionId, sequence));
 				const output = this.extractToolOutput(payload);
+				const completedAt = this.parseTimestamp(entry.timestamp);
+				const startedAt = toolStartedAt.get(callId);
 				pushMessage(
 					"toolResult",
 					[{ type: "text", text: output }],
@@ -271,6 +287,12 @@ export class CodexSessionImporter {
 						toolCallId: callId,
 						toolName: toolNames.get(callId) ?? "tool",
 						isError: Boolean(payload.is_error),
+						// Codex 历史只有 function_call / output 时间戳，导入时保存派生耗时，
+						// 让桌面端工具卡片与原生 pi 会话保持一致。
+						...(startedAt !== undefined ? { startedAt } : {}),
+						...(startedAt !== undefined && completedAt !== undefined
+							? { durationMs: Math.max(0, completedAt - startedAt) }
+							: {}),
 					},
 					entry.timestamp,
 				);

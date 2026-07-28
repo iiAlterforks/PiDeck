@@ -9,6 +9,7 @@ import {
 	getHeaderValue,
 	setHeaderValue,
 } from "./providerHeaders";
+import { buildModelsFromFetchedSelection } from "./modelsUtils";
 
 type FetchedModel = { id: string; name?: string };
 
@@ -38,51 +39,29 @@ const KNOWN_MODEL_FIELDS = new Set([
 	"compat",
 ]);
 
-export function buildModelsFromFetchedSelection(
-	fetchedModels: FetchedModel[],
-	selectedModelIds: string[],
-	existingModels: ModelItem[],
-): ModelItem[] {
-	const existingIds = new Set(existingModels.map((model) => model.id));
-	const selectedIds = new Set(selectedModelIds);
-	return fetchedModels
-		.filter((model) => selectedIds.has(model.id) && !existingIds.has(model.id))
-		.map((model) => ({
-			id: model.id,
-			name: model.name ?? model.id,
-			contextWindow: 1000000,
-			maxTokens: 128000,
-			reasoning: true,
-		}));
-}
-
 function FetchedModelCombobox(props: {
 	models: FetchedModel[];
 	value: string[];
 	existingModelIds: string[];
 	onChange: (value: string[]) => void;
 }) {
-	const [open, setOpen] = useState(true);
+	const [filter, setFilter] = useState("");
 	const inputRef = useRef<HTMLInputElement | null>(null);
 	const existingModelIdSet = new Set(props.existingModelIds);
-	const selectableModels = props.models.filter((model) => !existingModelIdSet.has(model.id));
 	const selectedModelIdSet = new Set(props.value);
+	const normalizedFilter = filter.trim().toLowerCase();
+	const visibleModels = normalizedFilter
+		? props.models.filter((model) =>
+			[model.id, model.name]
+				.filter(Boolean)
+				.some((text) => text!.toLowerCase().includes(normalizedFilter)),
+		)
+		: props.models;
+	const selectableVisibleModels = visibleModels.filter((model) => !existingModelIdSet.has(model.id));
 	const selectedModels = props.models.filter((model) => selectedModelIdSet.has(model.id));
 	const allSelectableSelected =
-		selectableModels.length > 0 &&
-		selectableModels.every((model) => selectedModelIdSet.has(model.id));
-	const displayValue =
-		selectedModels.length === 0
-			? ""
-			: selectedModels.length <= 2
-				? selectedModels
-						.map((model) =>
-							model.name && model.name !== model.id
-								? `${model.name} / ${model.id}`
-								: model.id,
-						)
-						.join(", ")
-				: t("config.modelSelectedCount", { count: selectedModels.length });
+		selectableVisibleModels.length > 0 &&
+		selectableVisibleModels.every((model) => selectedModelIdSet.has(model.id));
 
 	useEffect(() => {
 		inputRef.current?.focus();
@@ -97,82 +76,69 @@ function FetchedModelCombobox(props: {
 	}
 
 	return (
-		<div
-			className="config-combobox config-model-combobox"
-			onBlur={() => {
-				// 让菜单项的 mouseDown 先完成选中，再关闭弹层，保持和 API 类型下拉一致。
-				window.setTimeout(() => setOpen(false), 80);
-			}}
-		>
-			<input
-				ref={inputRef}
-				readOnly
-				value={displayValue}
-				onFocus={() => setOpen(true)}
-				placeholder={t("config.modelSelectPlaceholder")}
-			/>
-			<button
-				type="button"
-				className="config-combobox-toggle"
-				onMouseDown={(e) => {
-					e.preventDefault();
-					setOpen((current) => !current);
-				}}
-				title={t("config.modelOptionExpand")}
-			>
-				<ChevronDown size={14} />
-			</button>
-			{open && (
-				<div className="config-combobox-menu config-model-combobox-menu">
-					<div className="config-model-combobox-menu-actions">
-						<button
-							type="button"
-							onMouseDown={(e) => {
-								e.preventDefault();
-								props.onChange(
-									allSelectableSelected
-										? []
-										: selectableModels.map((model) => model.id),
-								);
-							}}
-							disabled={selectableModels.length === 0}
-						>
-							{allSelectableSelected ? t("common.deselectAll") : t("common.selectAll")}
-						</button>
-						<span>{t("config.modelSelectedCount", { count: selectedModels.length })}</span>
-					</div>
-					{props.models.map((model) => {
-						const selected = selectedModelIdSet.has(model.id);
-						const configured = existingModelIdSet.has(model.id);
-						return (
-							<button
-								key={model.id}
-								type="button"
-								className={`config-model-combobox-option${selected ? " active" : ""}`}
-								onMouseDown={(e) => {
-									e.preventDefault();
-									toggleModel(model.id);
-								}}
-								disabled={configured}
-								aria-pressed={selected}
-							>
-								<span className={`config-model-combobox-check${selected ? " checked" : ""}`}>
-									{selected && <Check size={12} />}
-								</span>
-								<span className="config-model-combobox-text">
-									<span>{model.name ?? model.id}</span>
-									{model.name && model.name !== model.id && <small>{model.id}</small>}
-								</span>
-								{configured && (
-									<span className="config-model-combobox-badge">
-										{t("config.configured")}
-									</span>
-								)}
-							</button>
-						);
+		<div className="config-model-combobox">
+			<div className="config-model-combobox-toolbar">
+				<input
+					ref={inputRef}
+					value={filter}
+					onChange={(e) => setFilter(e.target.value)}
+					placeholder={t("config.modelSearchPlaceholder")}
+				/>
+				<button
+					type="button"
+					className="config-btn small"
+					onClick={() => {
+						// 全选只作用于当前筛选结果，方便大列表按关键字批量选择，同时不会误选已配置模型。
+						const visibleIds = selectableVisibleModels.map((model) => model.id);
+						if (allSelectableSelected) {
+							props.onChange(props.value.filter((id) => !visibleIds.includes(id)));
+						} else {
+							props.onChange([...new Set([...props.value, ...visibleIds])]);
+						}
+					}}
+					disabled={selectableVisibleModels.length === 0}
+				>
+					{allSelectableSelected ? t("common.deselectAll") : t("common.selectAll")}
+				</button>
+			</div>
+			<div className="config-model-combobox-summary">
+				<span>
+					{t("config.modelFetchSelectionSummary", {
+						selected: selectedModels.length,
+						total: props.models.length,
 					})}
-				</div>
-			)}
+				</span>
+			</div>
+			<div className="config-model-chip-list">
+				{visibleModels.map((model) => {
+					const selected = selectedModelIdSet.has(model.id);
+					const configured = existingModelIdSet.has(model.id);
+					return (
+						<button
+							key={model.id}
+							type="button"
+							className={`config-model-chip${selected ? " selected" : ""}${configured ? " configured" : ""}`}
+							onClick={() => toggleModel(model.id)}
+							disabled={configured}
+							aria-pressed={selected}
+						>
+							<span className="config-model-chip-label">{model.name ?? model.id}</span>
+							{model.name && model.name !== model.id && (
+								<span className="config-model-chip-id">{model.id}</span>
+							)}
+							{selected && !configured && <Check size={12} className="config-model-chip-check" />}
+							{configured && (
+								<span className="config-model-combobox-badge">
+									{t("config.configured")}
+								</span>
+							)}
+						</button>
+					);
+				})}
+				{visibleModels.length === 0 && (
+					<div className="config-model-combobox-empty">{t("app.modelPickerEmpty")}</div>
+				)}
+			</div>
 		</div>
 	);
 }
@@ -220,6 +186,11 @@ export function ModelsTab(props: {
 		field: string,
 		value: unknown,
 	) => void;
+	onUpdateModelXhigh: (
+		providerName: string,
+		index: number,
+		value: "" | "xhigh" | "max",
+	) => void;
 	onDeleteModel: (providerName: string, index: number) => void;
 	onFetchModels: (providerName: string) => void;
 	onTestProvider: (providerName: string) => void;
@@ -230,19 +201,26 @@ export function ModelsTab(props: {
 }) {
 	const { data, expandedProvider, saving } = props;
 	const providerNames = Object.keys(data.providers);
-	// 当前正在下拉选模型的 provider（null = 手动输入模式）
-	const [addingModelDropdown, setAddingModelDropdown] = useState<string | null>(null);
-	const [addingModelIds, setAddingModelIds] = useState<string[]>([]);
+	// 自动获取后的待保存选择：与 provider 分开存储，避免多个 provider 同时展开时选中状态互相污染。
+	const [selectedFetchedModelIds, setSelectedFetchedModelIds] = useState<Record<string, string[]>>({});
 	const [pendingModelFocusKey, setPendingModelFocusKey] = useState<string | null>(null);
 	const [showGuide, setShowGuide] = useState(false);
 	const [batchMode, setBatchMode] = useState(false);
 	const [selectedProviders, setSelectedProviders] = useState(new Set());
+	const setSelectedFetchedModels = (providerName: string, modelIds: string[]) => {
+		setSelectedFetchedModelIds((current) => ({
+			...current,
+			[providerName]: modelIds,
+		}));
+	};
 	const modelIdInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 	const getModelInputKey = (providerName: string, index: number) =>
 		`${providerName}\u0000${index}`;
-	const getCompat = (providerName: string) =>
-		(data.providers[providerName].compat as Record<string, unknown> | undefined) ??
-		{};
+	const getCompat = (providerName: string) => ({
+		supportsDeveloperRole: false,
+		supportsReasoningEffort: false,
+		...(data.providers[providerName].compat as Record<string, unknown> | undefined),
+	});
 
 	useLayoutEffect(() => {
 		if (!pendingModelFocusKey) return;
@@ -380,11 +358,11 @@ export function ModelsTab(props: {
 						<p className="config-auth-guide-note">
 							{t("config.providerGuideNote")}{" "}
 							<a href="https://pi.dev/docs/latest/models" target="_blank" rel="noreferrer">
-								models docs <ExternalLink size={12} />
+								{t("config.modelsDocs")} <ExternalLink size={12} />
 							</a>
 							{" · "}
 							<a href="https://pi.dev/docs/latest/providers" target="_blank" rel="noreferrer">
-								providers docs <ExternalLink size={12} />
+								{t("config.providersDocs")} <ExternalLink size={12} />
 							</a>
 						</p>
 					</div>
@@ -558,17 +536,21 @@ export function ModelsTab(props: {
 									<div className="config-provider-form">
 										<div className="config-form-row">
 											<label>{t("config.field.baseUrl")}</label>
-											<input
-												value={provider.baseUrl ?? ""}
-												onChange={(e) =>
-													props.onChangeProvider(
-														name,
-														"baseUrl",
-														e.target.value,
-													)
-												}
-												placeholder="https://api.openai.com/v1"
-											/>
+											<div className="config-base-url-field">
+												<input
+													value={provider.baseUrl ?? ""}
+													onChange={(e) =>
+														props.onChangeProvider(
+															name,
+															"baseUrl",
+															e.target.value,
+														)
+													}
+													placeholder="https://api.openai.com/v1"
+												/>
+												{/* 说明检测兼容补路径 vs 会话原样使用 baseUrl 的差异 */}
+												<span className="config-field-hint">{t("config.baseUrlHint")}</span>
+											</div>
 										</div>
 										<div className="config-form-row">
 											<label>{t("config.field.apiType")}</label>
@@ -770,30 +752,40 @@ export function ModelsTab(props: {
 										<div className="config-form-row">
 											<label>{t("config.compatibility")}</label>
 											<div className="config-compat-group">
-												<label className="config-checkbox-label">
-													<input
-														type="checkbox"
-														checked={getCompat(name).supportsDeveloperRole === true}
-														onChange={(e) => {
-															const compat = { ...getCompat(name) };
-															compat.supportsDeveloperRole = e.target.checked;
-															props.onChangeProvider(name, "compat", compat);
-														}}
-													/>
-													<span>{t("config.developerRole")}</span>
-												</label>
-												<label className="config-checkbox-label">
-													<input
-														type="checkbox"
-														checked={getCompat(name).supportsReasoningEffort === true}
-														onChange={(e) => {
-															const compat = { ...getCompat(name) };
-															compat.supportsReasoningEffort = e.target.checked;
-															props.onChangeProvider(name, "compat", compat);
-														}}
-													/>
-													<span>{t("config.reasoningEffort")}</span>
-												</label>
+												<div className="config-compat-item">
+													<label className="config-checkbox-label">
+														<input
+															type="checkbox"
+															checked={getCompat(name).supportsDeveloperRole === true}
+															onChange={(e) => {
+																const compat = { ...getCompat(name) };
+																compat.supportsDeveloperRole = e.target.checked;
+																// 确保两个兼容性字段都显式写入，避免序列化后 JSON 为空导致 pi 后端无法正确判断
+																compat.supportsReasoningEffort ??= false;
+																props.onChangeProvider(name, "compat", compat);
+															}}
+														/>
+														<span>{t("config.developerRole")}</span>
+													</label>
+													<small className="config-compat-item-desc">{t("config.developerRoleDesc")}</small>
+												</div>
+												<div className="config-compat-item">
+													<label className="config-checkbox-label">
+														<input
+															type="checkbox"
+															checked={getCompat(name).supportsReasoningEffort === true}
+															onChange={(e) => {
+																const compat = { ...getCompat(name) };
+																compat.supportsReasoningEffort = e.target.checked;
+																// 确保两个兼容性字段都显式写入，避免序列化后 JSON 为空导致 pi 后端无法正确判断
+																compat.supportsDeveloperRole ??= false;
+																props.onChangeProvider(name, "compat", compat);
+															}}
+														/>
+														<span>{t("config.reasoningEffort")}</span>
+													</label>
+													<small className="config-compat-item-desc">{t("config.reasoningEffortDesc")}</small>
+												</div>
 											</div>
 										</div>
 
@@ -821,32 +813,18 @@ export function ModelsTab(props: {
 										<div className="config-models-header">
 											<span>{t("config.modelList")}</span>
 											<div className="config-model-list-actions">
-																	<button
-																		className="config-btn small"
-																		onClick={() => props.onFetchModels(name)}
-																		disabled={props.fetchingProvider === name}
-																	>
-																		{props.fetchingProvider === name
-																			? t("config.fetchingModels")
-																			: t("config.fetchModels")}
-																	</button>
-												{props.fetchedModels[name] &&
-												props.fetchedModels[name].length > 0 &&
-												addingModelDropdown !== name && (
-													<button
-														className="config-btn small"
-														onClick={() => {
-															setAddingModelDropdown(name);
-															setAddingModelIds([]);
-														}}
-													>
-														{t("config.addModelFromList")}
-													</button>
-												)}
+												<button
+													className="config-btn small"
+													onClick={() => props.onFetchModels(name)}
+													disabled={props.fetchingProvider === name}
+												>
+													{props.fetchingProvider === name
+														? t("config.fetchingModels")
+														: t("config.fetchModels")}
+												</button>
 												<button
 													className="config-btn small"
 													onClick={() => {
-														setAddingModelDropdown(null);
 														setPendingModelFocusKey(
 															getModelInputKey(name, provider.models.length),
 														);
@@ -855,68 +833,55 @@ export function ModelsTab(props: {
 												>
 													{t("config.addModelManual")}
 												</button>
+											</div>
 										</div>
-									</div>
 
-									{props.fetchModelsErrorByProvider[name] && (
-										<div className="config-error">{props.fetchModelsErrorByProvider[name]}</div>
-									)}
+										{props.fetchModelsErrorByProvider[name] && (
+											<div className="config-error">{props.fetchModelsErrorByProvider[name]}</div>
+										)}
 
-									{/* 下拉选择模型 */}
-
-										{addingModelDropdown === name &&
-											props.fetchedModels[name] && (
-												<div className="config-model-dropdown-row">
-													<FetchedModelCombobox
-														models={props.fetchedModels[name]}
-														value={addingModelIds}
-														existingModelIds={provider.models.map((model) => model.id)}
-														onChange={setAddingModelIds}
-													/>
+										{/* 自动获取后直接在同一区块勾选保存，保留手动添加作为兜底入口。 */}
+										{props.fetchedModels[name] && props.fetchedModels[name].length > 0 && (
+											<div className="config-model-dropdown-row">
+												<FetchedModelCombobox
+													models={props.fetchedModels[name]}
+													value={selectedFetchedModelIds[name] ?? []}
+													existingModelIds={provider.models.map((model) => model.id)}
+													onChange={(modelIds) => setSelectedFetchedModels(name, modelIds)}
+												/>
+												<div className="config-model-dropdown-actions">
 													<button
 														className="config-btn primary small"
 														onClick={() => {
-															const provider =
-																data.providers[name];
-															if (!provider) return;
-															const newModels = buildModelsFromFetchedSelection(
-																props.fetchedModels[name],
-																addingModelIds,
-																provider.models,
-															);
-															if (newModels.length === 0) return;
-															props.onChangeProvider(
-																name,
-																"models",
-																[
-																	...provider.models,
-																	...newModels,
-																],
-															);
-															setAddingModelDropdown(null);
-															setAddingModelIds([]);
-														}}
-														disabled={addingModelIds.length === 0}
-													>
-														{t("common.add")}
-													</button>
-													<button
-														className="config-btn small"
-														onClick={() => {
-															setAddingModelDropdown(null);
-															setAddingModelIds([]);
-														}}
-													>
-														{t("common.cancel")}
-													</button>
-												</div>
-											)}
+														const currentProvider = data.providers[name];
+														if (!currentProvider) return;
+														const selectedIds = selectedFetchedModelIds[name] ?? [];
+														const newModels = buildModelsFromFetchedSelection(
+															props.fetchedModels[name],
+															selectedIds,
+															currentProvider.models,
+														);
+														if (newModels.length === 0) return;
+														props.onChangeProvider(name, "models", [
+															...currentProvider.models,
+															...newModels,
+														]);
+														setSelectedFetchedModels(name, []);
+													}}
+													disabled={(selectedFetchedModelIds[name] ?? []).length === 0}
+												>
+													{t("config.saveSelectedModels")}
+												</button>
+											</div>
+										</div>
+										)}
 										<div className="config-models-grid-header">
 											<span>{t("config.modelId")}</span>
 											<span>{t("config.modelDisplayName")}</span>
 											<span>{t("config.contextWindow")}</span>
 											<span>{t("config.maxTokens")}</span>
 											<span>{t("config.reasoning")}</span>
+											<span>{t("config.xhigh")}</span>
 											<span>{t("config.inputTypeImage")}</span>
 											<span></span>
 										</div>
@@ -924,8 +889,15 @@ export function ModelsTab(props: {
 											const modelAdvancedFields = Object.keys(m).filter(
 												(key) => !KNOWN_MODEL_FIELDS.has(key),
 											);
+											const xhighValue =
+												m.thinkingLevelMap?.xhigh === "xhigh" || m.thinkingLevelMap?.xhigh === "max"
+													? m.thinkingLevelMap.xhigh
+													: "";
+											const hasOnlyManagedThinkingLevelMap =
+												m.thinkingLevelMap &&
+												Object.keys(m.thinkingLevelMap).every((key) => key === "xhigh");
 											const modelComplexFields = ["api", "baseUrl", "thinkingLevelMap", "cost", "headers", "compat"].filter(
-												(key) => m[key] !== undefined,
+												(key) => m[key] !== undefined && (key !== "thinkingLevelMap" || !hasOnlyManagedThinkingLevelMap),
 											);
 											return (
 											<div
@@ -997,6 +969,23 @@ export function ModelsTab(props: {
 														}
 													/>
 												</label>
+												<div className="config-xhigh-cell" title={t("config.xhighDesc")}>
+													<ConfigSelect
+														value={xhighValue}
+														options={[
+															{ value: "", label: t("config.xhighOff") },
+															{ value: "xhigh", label: "xhigh" },
+															{ value: "max", label: "max" },
+														]}
+														onChange={(value) =>
+															props.onUpdateModelXhigh(
+																name,
+																i,
+																value as "" | "xhigh" | "max",
+															)
+														}
+													/>
+												</div>
 													<div className="config-input-cell">
 														<label className="config-input-option">
 															<input

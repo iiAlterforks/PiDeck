@@ -8,7 +8,21 @@
 ![License](https://img.shields.io/badge/license-MIT-blue)
 ![Electron](https://img.shields.io/badge/Electron-38-47848f)
 ![React](https://img.shields.io/badge/React-19-61dafb)
-![Version](https://img.shields.io/badge/version-0.6.3-green)
+![Version](https://img.shields.io/badge/version-0.6.6-yellow)
+
+
+<!-- star-history:start -->
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/star-history/star-history-dark.svg">
+  <img alt="Star history" src="assets/star-history/star-history-light.svg">
+</picture>
+<!-- star-history:end -->
+
+---
+
+**PiDeck** 是一个开源的Pi桌面工作台，用于在本地项目目录中统一管理 pi Agent 会话，并支持导入 Codex、Claude 本地会话以便统一浏览和恢复。基于 Electron + TypeScript 构建，提供多项目工作区、AI 会话管理、Git 集成、内置终端、模型配置和插件扩展能力，让本地 AI 编码助手在多项目环境中保持统一、可追溯、可配置。
+
+**适合谁用：** 希望在桌面端同时管理多个本地项目的 AI 编程助手会话、需要统一查看会话历史与 Git 状态、并希望以图形化方式管理 pi 配置的开发者。
 
 `PiDeck` **不是** pi 的分支。它是一个轻量 Electron 外壳，通过启动多个 `pi --mode rpc` 进程，将项目管理、会话管理、对话界面、配置管理和工具编排整合到一个原生桌面应用中——所有 Agent 能力由 pi 原生提供。
 
@@ -16,16 +30,21 @@
 
 ## 📋 更新日志
 
-> **最新版本 v0.6.3**（2026-06-28）
+> **最新版本 v0.6.6**（2026-07-24）
 
-### v0.6.3 更新
-- 🚀 桌面宠物系统：透明悬浮窗、Canvas 动画、巡游/逗弄/Review 交互
-- 🚀 Chip 输入系统：`@`路径和 `/` 命令可视化为交互式 chip，可点击打开文件
-- 🚀 居中模态对话框：设置/配置/反馈改为覆盖模态框
-- 🚀 支持 OpenCode 会话导入和批量模型选择
-- ✨ 会话统计、模型折叠、加载动画等 UI 优化
-- 🐛 修复 macOS 终端权限、宠物 IPC 时序、换行丢失等 20+ 项问题
-- 🔧 流式卡顿修复、宠物代码精简 41%
+### v0.6.6 更新亮点
+- 🚀 **侧栏品牌区重新设计**：Pi 官方 canvas logo 裁掉空边 + Plantin 字标，agent 启停动画
+- 🚀 **多 Tab 文件编辑器**：最多 5 个并发 Tab，弹框/侧栏双模式，Diff 差异对比
+- 🚀 **& 会话引用**：键入 & 弹出会话列表，选择特定消息或引用全部上下文
+- 🚀 **飞书/Lark 集成**：双向对话、流式卡片、自动拉群、成员管理
+- 🚀 **Git 大重构**：VS Code 风格 3 Tab 面板 + AI 提交摘要 + Git 图形历史 + 复杂操作
+- 🚀 **XuePrompt 中文提示词精选**：SQLite 存储 4000+ 提示词，分类/搜索/一键导入
+- 🚀 **Composer 重新设计**：OpenCode 风格底部操作栏，模式/Prompt/附件/模型/Think
+- 🚀 **客户端消息队列**：Agent 忙碌时可排队，可撤回编辑
+- 🚀 **Git Push / Pull**：变更面板直接推拉
+- ✨ 设置页重构（全局保存/取消）、字号分区配置、文件侧栏增强、Diff 分栏修复
+- 🐛 大量 Bug 修复（Monaco CSP、白屏崩溃、WSL 路径、中文乱码等）
+- 🧪 WSL 实验性支持
 
 [查看完整更新日志 →](CHANGELOG.zh-CN.md)
 
@@ -37,7 +56,13 @@
 |---|---|
 | **多项目工作区** | 添加、搜索、拖动排序和切换本地项目目录，同时运行多个 pi Agent，项目间完全隔离。 |
 | **内置 Chat 对话区** | 项目列表顶部固定 Chat 入口，写入应用用户目录，适合无需绑定代码项目的通用对话。 |
+| **计划模式 (Plan Mode)** | Composer 工具栏切换计划模式，Agent 先生成计划，逐条确认后执行，取消后返回选单。 |
+| **消息编辑/删除** | AI 回答和用户消息均支持复制、编辑和删除，编辑后回填到输入框重新发送。 |
+| **草稿本 (ScratchPad)** | 浮层式草稿本，支持内容预览、勾选映射和动画，颜色使用主题语义 token。 |
+| **内容行宽限制** | 可拖拽的内容宽度滑块，默认不限宽，往左拖逐渐变窄，适应长行代码阅读或紧凑布局需求。 |
 | **配置、Skill 与 Extension 管理** | 可视化编辑器管理 pi 的 `models.json`、`auth.json`、`settings.json`，并可管理全局 Skills 与 Extensions。 |
+| **扩展启用/禁用** | 支持禁用/启用内置扩展，项目级技能/扩展管理，区分全局与项目级配置。 |
+| **信任确认系统** | 桌面端拦截信任确认，不信任仍可打开项目；有 Agent 运行时禁止删除项目。 |
 | **代理设置** | 独立管理 pi agent 子进程代理和桌面端代理，模型拉取与连接测试可走桌面端代理。 |
 | **斜线命令 & `!` Shell** | 内置斜线命令建议（`/compact`、`/session` 等），支持 `!command` / `!!command` 在聊天输入框直接执行 Shell 命令。 |
 | **内嵌终端 Dock** | 当前 Agent 绑定独立终端 tab，支持 PowerShell/cmd/sh fallback、多 tab、主题切换、拖拽高度、右键复制选区和关闭确认。 |
@@ -46,6 +71,9 @@
 | **Git 集成** | 实时显示当前分支，支持本地 + 远程分支选择器、分支数量徽章、分支切换和新建分支。 |
 | **局域网 Web 服务** | 可在设置中启动本机 Web 服务，局域网设备可通过电脑 IP 和端口访问。 |
 | **会话活动轨迹** | 思考、工具调用和回答片段按流程聚合展示，工具详情可展开复制，状态和退出码清晰标识。 |
+| **内置浏览器预览** | 右侧抽屉内置浏览器，支持多标签、地址栏、全屏以及 PC/手机/平板视口预设，便于边对话边查看网页。HTML 文件预览也走内置浏览器，不受 iframe sandbox 限制。 |
+| **中文提示词精选** | 内置 XuePrompt 数据库（4000+ 中文提示词），支持分类/搜索/分页浏览，一键导入到本地模板。 |
+| **Prompt & Skill 商店** | prompts.chat 国际商店 + skills.sh 社区技能商店，在线搜索、浏览详情、一键安装到本地。 |
 | **回答级修改摘要** | Agent 每轮回答完成后在对应回答下方以紧凑列表展示本轮修改文件名和修改行数，Files 面板保留本次会话总览。 |
 | **上下文感知输入** | `@` 文件引用建议、`!` Shell 执行、`/` 斜线命令和命令历史——统一在同一个输入框中。 |
 | **应用更新提示** | 定时检查 GitHub Release，发现新版本后展示发布日志和推荐下载入口，下载交由系统默认浏览器处理。 |

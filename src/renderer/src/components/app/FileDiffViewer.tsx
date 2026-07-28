@@ -2,20 +2,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { DiffEditor, Editor } from "@monaco-editor/react";
 import type * as Monaco from "monaco-editor";
 import { t } from "../../i18n";
-import { Columns3, Edit3, Maximize2, X } from "lucide-react";
+import { ArrowLeft, Edit3, Maximize, Minimize2, SquareSplitHorizontal, X, Eye, FileCode } from "lucide-react";
 import { setupMonaco } from "../../utils/monacoSetup";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeKatex from "rehype-katex";
+import { defaultUrlTransform } from "react-markdown";
 
-const BINARY_EXTENSIONS = new Set([
-	"png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg",
-	"mp3", "wav", "ogg", "flac", "m4a",
-	"mp4", "avi", "mkv", "mov", "webm",
-	"zip", "tar", "gz", "bz2", "7z", "rar",
-	"exe", "dll", "so", "dylib", "wasm",
-	"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-	"ttf", "otf", "woff", "woff2", "eot",
-	"o", "a", "lib", "obj", "class", "pyc", "pyo",
-	"db", "sqlite", "sqlite3",
-]);
+import { isBinaryExtension } from "../../utils/isTextFile";
 
 let monacoSetupOnce = false;
 function ensureMonaco() {
@@ -29,7 +23,21 @@ type ViewMode = "view" | "diff";
 export function FileDiffViewer(props: {
 	filePath: string;
 	mode?: ViewMode;
+	/** 展示模式：弹框（modal）或侧栏（drawer） */
+	displayMode?: "modal" | "drawer";
+	/** 在弹框/侧栏之间切换 */
+	onToggleMode?: () => void;
+	/** 返回按钮回调（侧栏模式时提供，点击返回上一面板） */
+	onBack?: () => void;
 	onClose: () => void;
+	/** 多 tab 支持：全部 tab 列表 */
+	tabs?: { id: string; filePath: string; label?: string }[];
+	/** 当前活跃 tab ID */
+	activeTabId?: string | null;
+	/** 切换到指定 tab */
+	onSelectTab?: (id: string) => void;
+	/** 关闭指定 tab */
+	onCloseTab?: (id: string) => void;
 	readContent: (path: string) => Promise<string>;
 	/** 从会话消息 meta 中提取的工具执行前原始内容，优先于 Git HEAD。 */
 	originalContent?: string;
@@ -38,6 +46,8 @@ export function FileDiffViewer(props: {
 	/** 读取文件的 Git HEAD 原始内容，供差异模式左侧基准列使用。 */
 	readOriginalContent?: (path: string) => Promise<string>;
 	saveContent?: (path: string, content: string) => Promise<void>;
+	/** HTML 文件点击预览时，切换到内置浏览器面板预览。 */
+	onPreviewHtml?: (filePath: string) => void;
 	theme?: "light" | "dark";
 	/** 单个文件超过此大小（MB）时不加载编辑器。默认 5MB。 */
 	maxFileSizeMB?: number;
@@ -49,9 +59,8 @@ export function FileDiffViewer(props: {
 	const [original, setOriginal] = useState("");
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState<string | null>(null);
-	const [sideBySide, setSideBySide] = useState(true);
+	const [sideBySide, setSideBySide] = useState(props.displayMode !== "drawer");
 	const [readOnly, setReadOnly] = useState(true);
-	const [loadedPath, setLoadedPath] = useState<string | null>(null);
 	const [dirty, setDirty] = useState(false);
 	const [saving, setSaving] = useState(false);
 	const [showHint, setShowHint] = useState(false);
@@ -60,10 +69,25 @@ export function FileDiffViewer(props: {
 	const diffEditorRef = useRef<Monaco.editor.IStandaloneDiffEditor | null>(null);
 
 	const isDiffMode = props.mode === "diff";
+	const fileName = props.filePath.split(/[/\\]/).pop() ?? props.filePath;
+	const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
+	const isMarkdown = ext === "md" || ext === "mdx";
+	const isHtml = ext === "html" || ext === "htm";
+	// 只读视图下 markdown 文件默认启用预览；html 走内置浏览器，不在 iframe 内预览。
+	const [preview, setPreview] = useState(isMarkdown && !isDiffMode && readOnly);
+
+	useEffect(() => {
+		// 每个 tab 都从只读模式开始，尤其不能把工作区文件的编辑状态带入历史提交 Diff。
+		setReadOnly(true);
+		setDirty(false);
+		setShowHint(false);
+		// 文件类型切换时重置预览状态，防止跨文件残留导致内容区域空白
+		const isMd = ext === "md" || ext === "mdx";
+		setPreview(isMd && props.mode !== "diff");
+	}, [props.activeTabId, props.filePath, props.mode]);
 
 	useEffect(() => {
 		ensureMonaco();
-		if (loadedPath === props.filePath) return;
 
 		let cancelled = false;
 		async function load() {
@@ -72,8 +96,7 @@ export function FileDiffViewer(props: {
 			setDirty(false);
 			try {
 				// 检查文件扩展名是否属于二进制/不可编辑类型
-				const ext = (props.filePath.split(".").pop() ?? "").toLowerCase();
-				if (BINARY_EXTENSIONS.has(ext)) {
+				if (isBinaryExtension(props.filePath)) {
 					setError(t("editor.binaryFileNotSupported", { ext }));
 					setLoading(false);
 					return;
@@ -85,7 +108,7 @@ export function FileDiffViewer(props: {
 					? Promise.resolve(props.modifiedContent)
 					: props.readContent(props.filePath);
 				const originalPromise =
-					isDiffMode && props.originalContent
+					isDiffMode && props.originalContent !== undefined
 						? Promise.resolve(props.originalContent)
 						: isDiffMode && props.readOriginalContent
 							? props.readOriginalContent(props.filePath).catch(() => "")
@@ -95,11 +118,12 @@ export function FileDiffViewer(props: {
 					originalPromise,
 				]);
 				if (!cancelled) {
-					// 文件内容超过上限时不加载编辑器，防止 Monaco 处理大文件卡死
-					if (result.length > maxFileSize) {
+					const largestContentSize = Math.max(result.length, originalResult.length);
+					// Diff 任一侧超过上限都不加载 Monaco；删除文件虽右侧为空，左侧仍可能很大。
+					if (largestContentSize > maxFileSize) {
 						setError(
 							t("editor.fileTooLarge", {
-								size: (result.length / 1024 / 1024).toFixed(1),
+								size: (largestContentSize / 1024 / 1024).toFixed(1),
 								max: (maxFileSize / 1024 / 1024).toFixed(0),
 							}),
 						);
@@ -108,11 +132,6 @@ export function FileDiffViewer(props: {
 					}
 					setContent(result);
 					setOriginal(originalResult);
-					setLoadedPath(props.filePath);
-					if (result === "" && !loading) {
-						// 文件可能已被删除或为空
-						setError(t("config.fileDeletedOrEmpty"));
-					}
 				}
 			} catch (e) {
 				if (!cancelled) setError(e instanceof Error ? e.message : String(e));
@@ -122,7 +141,10 @@ export function FileDiffViewer(props: {
 		}
 		void load();
 		return () => { cancelled = true; };
-	}, [props.filePath, props.readContent, props.readOriginalContent, props.originalContent, isDiffMode, loadedPath]);
+	// readContent/readOriginalContent 是稳定的 API 回调（上层已 useCallback），
+	// 不参与 effect deps，避免父组件因其他状态变化重渲染时反复加载文件导致编辑器重置到顶部。
+	// 两侧缓存内容都需要监听：同一路径可在多个历史提交 Diff tab 之间切换。
+	}, [props.filePath, props.originalContent, props.modifiedContent, isDiffMode]);
 
 	const handleClose = useCallback(() => {
 		props.onClose();
@@ -213,8 +235,6 @@ export function FileDiffViewer(props: {
 		};
 	}, []);
 
-	const fileName = props.filePath.split(/[/\\]/).pop() ?? props.filePath;
-	const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
 	const language = extToMonacoLanguage(ext);
 
 	const editorOptions: Monaco.editor.IStandaloneEditorConstructionOptions = {
@@ -239,6 +259,8 @@ export function FileDiffViewer(props: {
 		...editorOptions,
 		readOnly,
 		renderSideBySide: sideBySide,
+		// 0 = 关闭 Monaco 的「窄宽自动合并」；分栏/合并完全由 UI 按钮控制
+		renderSideBySideInlineBreakpoint: 0,
 		// 显示真实差异，包括行尾空格差异
 		ignoreTrimWhitespace: false,
 		// 大文件时折叠未变化区域，只显示有变动的代码段；最小上下文 3 行
@@ -252,54 +274,132 @@ export function FileDiffViewer(props: {
 		compactMode: true,
 	};
 
-	return (
-		<div className="modal-backdrop" onClick={readOnly ? handleClose : undefined}>
-			<div className="file-diff-modal" onClick={(e) => e.stopPropagation()}>
-				<div className="file-diff-header">
-					<span className="file-diff-title" title={props.filePath}>
-						{fileName}
-						{dirty && " · 未保存"}
-						{showHint && <span className="file-diff-hint">{t("app.saveFileShortcut")}</span>}
-					</span>
-					<div className="file-diff-header-actions">
-						{isDiffMode && !loading && !error && (
+	const displayMode = props.displayMode ?? "drawer";
+	const headerContent = (
+		<>
+			{props.tabs && props.tabs.length > 1 && (
+				<div className="file-diff-tab-bar">
+					{props.tabs.map((tab) => (
+						<div
+							key={tab.id}
+							role="tab"
+							aria-selected={tab.id === props.activeTabId}
+							className={`file-diff-tab${tab.id === props.activeTabId ? " active" : ""}`}
+							onClick={() => props.onSelectTab?.(tab.id)}
+							onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); props.onSelectTab?.(tab.id); } }}
+							title={tab.label ?? tab.filePath}
+							tabIndex={0}
+						>
+							<span>{tab.label ?? tab.filePath.split(/[/\\]/).pop()}</span>
 							<button
-								className="file-diff-toggle-btn"
-								title={sideBySide ? t("app.showSingle") : t("app.showSplit")}
-								onClick={() => setSideBySide(!sideBySide)}
+								type="button"
+								className="file-diff-tab-close"
+								onClick={(e) => { e.stopPropagation(); props.onCloseTab?.(tab.id); }}
+								aria-label={t("common.close")}
 							>
-								{sideBySide ? <Maximize2 size={15} /> : <Columns3 size={15} />}
+								<X size={11} />
 							</button>
-						)}
-						{props.saveContent && readOnly && (
-							<button
-								className="file-diff-toggle-btn"
-								title={t("app.editFile")}
-								onClick={handleEditToggle}
-							>
-								<Edit3 size={15} />
-							</button>
-						)}
-						{!readOnly && props.saveContent && (
-							<button
-								className="file-diff-toggle-btn"
-								title={t("app.exitEdit")}
-								onClick={handleExitEdit}
-							>
-								<X size={15} />
-							</button>
-						)}
-						<button className="file-diff-close" onClick={handleClose} aria-label={t("common.close")}>
-							<X size={18} />
-						</button>
-					</div>
+						</div>
+					))}
 				</div>
-				<div className="file-diff-body">
-					{loading && <div className="file-diff-loading">{t("common.loading")}</div>}
-					{error && <div className="file-diff-error">{error}</div>}
-					{!loading && !error && (
-						<>
-							<div style={{ display: isDiffMode ? "none" : "flex", height: "100%", flexDirection: "column" }}>
+			)}
+			<div className="file-diff-header">
+				{props.onBack && displayMode === "drawer" && (
+					<button
+						className="file-diff-close"
+						onClick={props.onBack}
+						title={t("common.back")}
+						aria-label={t("common.back")}
+					>
+						<ArrowLeft size={18} />
+					</button>
+				)}
+				<span className="file-diff-title" title={props.filePath}>
+					{fileName}
+					{dirty && " · 未保存"}
+					{showHint && <span className="file-diff-hint">{t("app.saveFileShortcut")}</span>}
+				</span>
+				<div className="file-diff-header-actions">
+					{(isMarkdown || isHtml) && !isDiffMode && !loading && !error && (
+						<button
+							className="file-diff-toggle-btn"
+							title={preview ? t("editor.source") : t("editor.preview")}
+							onClick={() => {
+								if (isHtml && props.onPreviewHtml) {
+									props.onPreviewHtml(props.filePath);
+								} else {
+									setPreview(!preview);
+								}
+							}}
+						>
+							{preview ? <FileCode size={15} /> : <Eye size={15} />}
+						</button>
+					)}
+					{isDiffMode && !loading && !error && displayMode !== "drawer" && (
+						<button
+							className="file-diff-toggle-btn"
+							title={sideBySide ? t("app.showSingle") : t("app.showSplit")}
+							onClick={() => setSideBySide(!sideBySide)}
+						>
+							<SquareSplitHorizontal size={15} />
+						</button>
+					)}
+					{props.saveContent && readOnly && (
+						<button
+							className="file-diff-toggle-btn"
+							title={t("app.editFile")}
+							onClick={handleEditToggle}
+						>
+							<Edit3 size={15} />
+						</button>
+					)}
+					{!readOnly && props.saveContent && (
+						<button
+							className="file-diff-toggle-btn"
+							title={t("app.exitEdit")}
+							onClick={handleExitEdit}
+						>
+							<X size={15} />
+						</button>
+					)}
+					{props.onToggleMode && (
+						<button
+							className="file-diff-toggle-btn"
+							title={displayMode === "modal" ? t("app.minimizeToDrawer") : t("app.expandToModal")}
+							onClick={props.onToggleMode}
+						>
+							{displayMode === "modal" ? <Minimize2 size={15} /> : <Maximize size={15} />}
+						</button>
+					)}
+					<button className="file-diff-close" onClick={handleClose} aria-label={t("common.close")}>
+						<X size={18} />
+					</button>
+				</div>
+			</div>
+			<div className="file-diff-body">
+				{loading && <div className="file-diff-loading">{t("common.loading")}</div>}
+				{error && <div className="file-diff-error">{error}</div>}
+				{!loading && !error && (
+					<>
+						{/* Markdown 预览：仅 view 模式且 preview 启用 */}
+						{!isDiffMode && preview && isMarkdown && (
+							<div className="file-diff-preview">
+								<ReactMarkdown
+									remarkPlugins={[remarkGfm]}
+									rehypePlugins={[rehypeKatex]}
+									urlTransform={defaultUrlTransform}
+								>
+									{content}
+								</ReactMarkdown>
+							</div>
+						)}
+						{/* HTML 预览：仅 view 模式且 preview 启用 */}
+						{!isDiffMode && preview && isHtml && (
+							<HtmlPreview content={content} />
+						)}
+						{/* view 模式、非预览：常规 Editor */}
+						{!isDiffMode && !preview && (
+							<div style={{ height: "100%", flexDirection: "column" }}>
 								<Editor
 									value={content}
 									language={language}
@@ -309,8 +409,14 @@ export function FileDiffViewer(props: {
 									onChange={handleEditorChange}
 								/>
 							</div>
-							<div style={{ display: !isDiffMode ? "none" : "flex", height: "100%", flexDirection: "column" }}>
+						)}
+						{/* diff 模式：仅 DiffEditor（不与 Editor 同时渲染，避免 Monaco 模型销毁竞态） */}
+						{isDiffMode && (
+							<div style={{ height: "100%", flexDirection: "column" }}>
 								<DiffEditor
+									key={sideBySide ? "split" : "unified"}
+									keepCurrentOriginalModel
+									keepCurrentModifiedModel
 									original={original}
 									modified={content}
 									language={language}
@@ -319,10 +425,26 @@ export function FileDiffViewer(props: {
 									onMount={handleDiffEditorMount}
 								/>
 							</div>
-						</>
-					)}
+						)}
+					</>
+				)}
+			</div>
+		</>
+	);
+
+	if (displayMode === "modal") {
+		return (
+			<div className="modal-backdrop" onClick={readOnly ? handleClose : undefined}>
+				<div className="file-diff-modal" onClick={(e) => e.stopPropagation()}>
+					{headerContent}
 				</div>
 			</div>
+		);
+	}
+
+	return (
+		<div className="file-diff-viewer">
+			{headerContent}
 		</div>
 	);
 }
@@ -338,4 +460,27 @@ function extToMonacoLanguage(ext: string): string {
 		dockerfile: "dockerfile", makefile: "makefile",
 	};
 	return map[ext] ?? "plaintext";
+}
+
+/**
+ * HTML 预览组件：通过 sandboxed iframe 渲染 HTML。
+ * 使用 srcdoc 避免 CSP frame-src 限制；
+ * 放开 allow-scripts / allow-same-origin 以支持本地开发场景的外部 CSS/JS 加载。
+ * 注意：被预览的 HTML 中的脚本会执行，仅用于可信本地文件。
+ */
+function HtmlPreview({ content }: { content: string }) {
+	return (
+		<iframe
+			className="file-diff-preview"
+			srcDoc={content}
+			title="HTML preview"
+			sandbox="allow-scripts allow-same-origin allow-forms"
+			style={{
+				width: "100%",
+				height: "100%",
+				border: "none",
+				background: "white",
+			}}
+		/>
+	);
 }

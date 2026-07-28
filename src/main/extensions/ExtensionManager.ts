@@ -1,27 +1,125 @@
 import { execFile } from "node:child_process";
-import { readFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import type { AppSettings, PiCliUpdateResult, PiExtensionListResult, PiExtensionSummary, PiUpdateCheckResult } from "../../shared/types";
 import type { PiLocator } from "../pi/PiLocator";
+import { toWindowsHostPath, type WslEnvironment } from "../wsl/WslPaths";
 
 type SettingsProvider = () => AppSettings;
 
+/** PiDeck 内置扩展列表，用于在扫描不到时仍展示在扩展管理页中。 */
+export const BUILT_IN_EXTENSIONS = [
+	"pi-deck-ask-question.ts",
+	"pi-deck-nul-redirect-fix.ts",
+	"pi-deck-plan-mode.ts",
+	"pi-deck-todo.ts",
+] as const;
+
 /**
  * 通过 pi CLI 管理已安装扩展，避免桌面端直接改写 pi settings 导致和 CLI 行为不一致。
- * list/remove 都使用 --no-approve，防止配置弹窗因为项目级信任确认而阻塞。
+ * 自动检测 pi 版本，条件性添加 --no-approve（仅 pi >= 0.79.0 支持），
+ * 兼容老版本避免 unknown option 错误。
  */
 export class ExtensionManager {
+	private wslEnvironment: WslEnvironment | null = null;
+	/** 扩展列表缓存：避免每次打开配置页都重新跑 pi list + npm view。 */
+	private listCache: PiExtensionListResult | null = null;
+	/** 缓存是否包含 npm 版本信息（仅 forceRefresh 路径会写入 true）。 */
+	private listCacheHasVersionInfo = false;
+	/** 进行中的列表请求，用于启动预热与并发去重。 */
+	private listInflight: Promise<PiExtensionListResult> | null = null;
+	/** 进行中请求是否为强制刷新（含版本信息）。 */
+	private listInflightForce = false;
+	/**
+	 * 列表缓存代数：安装/卸载/开关后递增。
+	 * 用于丢弃失效前已发出的 in-flight 结果，避免旧列表写回缓存导致 UI 不刷新。
+	 */
+	private listCacheGeneration = 0;
+
 	constructor(
 		private readonly locator: PiLocator,
 		private readonly getSettings: SettingsProvider,
+		/** 获取 PiDeck 桌面设置 */
+		private readonly getPiDeckSettings: () => AppSettings,
+		/** 保存 PiDeck 桌面设置的部分更新 */
+		private readonly patchPiDeckSettings: (patch: Partial<AppSettings>) => Promise<AppSettings>,
 	) {}
 
-	async list(): Promise<PiExtensionListResult> {
-		const raw = await this.runPi(["list", "--no-approve"], 20_000);
-		const piInstalled = await Promise.all(
-			this.parseListOutput(raw).map((extension) => this.enrichExtensionVersion(extension)),
-		);
+	/** 将扩展文件边界切换到统一解析出的 WSL HOME；null 恢复 Windows home。 */
+	configureWsl(environment: WslEnvironment | null) {
+		this.wslEnvironment = environment;
+		// 切换 WSL/本地 home 后旧缓存失效。
+		this.invalidateListCache();
+	}
+
+	private get homeDir(): string {
+		return this.wslEnvironment?.windowsHome ?? homedir();
+	}
+
+	/** 缓存的 pi 版本号，用于条件性传递 --no-approve。 */
+	private piVersion: string | null = null;
+	private piVersionPromise: Promise<string | null> | null = null;
+
+	/**
+	 * 安装/卸载/开关后主动清缓存。
+	 * 同时递增 generation 并断开 inflight 复用，避免旧请求完成后把已删除/已变更的列表写回。
+	 */
+	invalidateListCache() {
+		this.listCache = null;
+		this.listCacheHasVersionInfo = false;
+		this.listCacheGeneration += 1;
+		// 允许下一次 list() 立刻发起新请求，而不是复用失效前的 inflight。
+		this.listInflight = null;
+		this.listInflightForce = false;
+	}
+
+	/**
+	 * 列出扩展。
+	 * - forceRefresh=false：优先返回内存缓存；无缓存时做一次轻量扫描（跳过 npm view）。
+	 * - forceRefresh=true：强制重新 `pi list`，并补充 npm 版本信息。
+	 */
+	async list(forceRefresh = false): Promise<PiExtensionListResult> {
+		// 有缓存且（非强制刷新，或缓存已含版本信息）时直接返回。
+		if (this.listCache && (!forceRefresh || this.listCacheHasVersionInfo)) {
+			return this.listCache;
+		}
+		// 已有同级或更强请求在飞时复用，避免并发打爆 pi/npm。
+		if (this.listInflight && (!forceRefresh || this.listInflightForce)) {
+			return this.listInflight;
+		}
+
+		// 捕获当前代数：若请求返回前发生 install/uninstall/toggle，丢弃结果并改走最新 list。
+		const generation = this.listCacheGeneration;
+		this.listInflightForce = forceRefresh;
+		const request = this.loadList(forceRefresh)
+			.then((result) => {
+				if (generation !== this.listCacheGeneration) {
+					// 失效前的调用方也必须拿到变更后的列表，否则 UI 会短暂/永久停在旧数据。
+					return this.list(forceRefresh);
+				}
+				this.listCache = result;
+				this.listCacheHasVersionInfo = forceRefresh;
+				return result;
+			})
+			.finally(() => {
+				// 仅清理自己：失效后新发起的请求可能已经接管 listInflight。
+				if (this.listInflight === request) {
+					this.listInflight = null;
+					this.listInflightForce = false;
+				}
+			});
+		this.listInflight = request;
+		return request;
+	}
+
+	private async loadList(includeVersionInfo: boolean): Promise<PiExtensionListResult> {
+		const raw = await this.runPi(["list"], 20_000);
+		const parsed = this.parseListOutput(raw);
+		// npm view 是扩展页变慢的主因；默认列表先跳过，只有手动刷新时再查更新。
+		const piInstalled = includeVersionInfo
+			? await Promise.all(parsed.map((extension) => this.enrichExtensionVersion(extension)))
+			: parsed;
 
 		// 扫描本地自动发现的扩展（~/.pi/agent/extensions/ 下的 .ts 文件和目录），
 		// pi list 只列出通过 pi install 安装的包，不包含本地文件扩展。
@@ -36,7 +134,54 @@ export class ExtensionManager {
 			}
 		}
 
-		return { extensions: merged, raw };
+		// 补充：将已禁用/文件缺失的内置扩展也纳入列表，确保用户可在 UI 中重新启用。
+		const existingSources = new Set(merged.map((ext) => ext.source));
+		for (const builtIn of BUILT_IN_EXTENSIONS) {
+			if (!existingSources.has(builtIn)) {
+				merged.push({
+					id: `local:${builtIn}`,
+					source: builtIn,
+					path: undefined,
+					scope: "user",
+					builtIn: true,
+				});
+			}
+		}
+
+		// 通过 PiDeck 桌面设置标记内置扩展移除状态
+		const removedBuiltIn = new Set(this.getPiDeckSettings().removedBuiltInExtensions ?? []);
+		for (const ext of merged) {
+			ext.enabled = !(ext.builtIn && removedBuiltIn.has(ext.source));
+		}
+
+		// 检测扩展冲突：三方扩展与内置扩展同名时，自动禁用内置扩展
+		const conflicts: { builtIn: string; thirdParty: string }[] = [];
+		for (const builtInName of BUILT_IN_EXTENSIONS) {
+			if (removedBuiltIn.has(builtInName)) continue; // 已移除的不重复检测
+			const shortName = builtInName.replace(/^pi-deck-/, "").replace(/\.ts$/, "");
+			const conflicting = merged.find(
+				(ext) =>
+					!ext.builtIn &&
+					ext.enabled !== false &&
+					this.extensionNameMatches(ext.source, shortName),
+			);
+			if (conflicting) {
+				removedBuiltIn.add(builtInName);
+				await this.saveRemovedBuiltIn([...removedBuiltIn]);
+				conflicts.push({
+					builtIn: builtInName,
+					thirdParty: conflicting.source,
+				});
+				// 同步更新 enabled 状态
+				for (const ext of merged) {
+					if (ext.builtIn && ext.source === builtInName) {
+						ext.enabled = false;
+					}
+				}
+			}
+		}
+
+		return { extensions: merged, raw, conflicts: conflicts.length > 0 ? conflicts : undefined };
 	}
 
 	/**
@@ -44,7 +189,7 @@ export class ExtensionManager {
 	 * 单文件扩展（.ts 文件）和目录扩展（含 index.ts）都会被识别。
 	 */
 	private async scanLocalExtensions(): Promise<PiExtensionSummary[]> {
-		const extensionsDir = join(homedir(), ".pi", "agent", "extensions");
+		const extensionsDir = join(this.homeDir, ".pi", "agent", "extensions");
 		const result: PiExtensionSummary[] = [];
 
 		let entries: string[];
@@ -90,25 +235,87 @@ export class ExtensionManager {
 		return result;
 	}
 
+	/**
+	 * 判断是否为本地文件扩展（~/.pi/agent/extensions 下自动发现的 .ts/目录）。
+	 * pi list 的包源都带 npm:/file:/github: 等协议前缀；裸文件名只能走文件系统删除。
+	 */
+	private isLocalFileExtension(source: string): boolean {
+		return !/^(?:npm|file|github|git|https?):/i.test(source);
+	}
+
+	/**
+	 * 删除本地扩展文件/目录。
+	 * 只允许删除 extensions 目录下的单层 basename，防止路径穿越。
+	 */
+	private async removeLocalExtension(source: string): Promise<void> {
+		const extensionsDir = join(this.homeDir, ".pi", "agent", "extensions");
+		const trimmed = source.trim();
+		const name = basename(trimmed);
+		// source 必须等于 basename（如 orca-agent-status.ts），拒绝 ../ 或绝对路径穿越。
+		if (!name || name !== trimmed || name === "." || name === "..") {
+			throw new Error("非法扩展路径");
+		}
+		const targetPath = join(extensionsDir, name);
+		await rm(targetPath, { recursive: true, force: true });
+	}
+
 	async uninstall(source: string, scope: PiExtensionSummary["scope"] = "user"): Promise<void> {
 		const normalized = source.trim();
 		if (!normalized) throw new Error("扩展来源不能为空");
-		// 阻止卸载 PiDeck 内置扩展（如 pi-deck-file-capture）
-		if (source.startsWith("pi-deck-")) {
-			throw new Error("PiDeck 内置扩展不可卸载");
+		// 内置扩展：移除 PiDeck 设置中的自动部署标记，不删除文件
+		if (normalized.startsWith("pi-deck-")) {
+			throw new Error("内置扩展请使用 removeBuiltIn 操作");
 		}
-		await this.runPi([
-			"remove",
-			normalized,
-			...(scope === "project" ? ["-l"] : []),
-			"--no-approve",
-		], 30_000);
+		// 本地 .ts/目录扩展不在 pi package 列表里，pi remove 会报 No matching package
+		if (this.isLocalFileExtension(normalized)) {
+			await this.removeLocalExtension(normalized);
+		} else {
+			await this.runPi([
+				"remove",
+				normalized,
+				...(scope === "project" ? ["-l"] : []),
+			], 30_000);
+		}
+		this.invalidateListCache();
+	}
+
+	/**
+	 * 「移除」内置扩展：仅写入 PiDeck 设置，下次启动自动跳过部署。
+	 * 不删除扩展文件，保留在 ~/.pi/agent/extensions/ 中以便恢复。
+	 */
+	async removeBuiltIn(source: string): Promise<void> {
+		const normalized = source.trim();
+		if (!normalized.startsWith("pi-deck-")) {
+			throw new Error("只能操作内置扩展");
+		}
+		const current = this.getPiDeckSettings().removedBuiltInExtensions ?? [];
+		if (current.includes(normalized)) return;
+		await this.saveRemovedBuiltIn([...current, normalized]);
+		this.invalidateListCache();
+	}
+
+	/**
+	 * 恢复已移除的内置扩展：从 PiDeck 设置中移除记录，下次启动自动部署。
+	 */
+	async restoreBuiltIn(source: string): Promise<void> {
+		const normalized = source.trim();
+		const current = this.getPiDeckSettings().removedBuiltInExtensions ?? [];
+		const next = current.filter((s) => s !== normalized);
+		if (next.length === current.length) return;
+		await this.saveRemovedBuiltIn(next);
+		this.invalidateListCache();
+	}
+
+	private async saveRemovedBuiltIn(removedList: string[]): Promise<void> {
+		await this.patchPiDeckSettings({ removedBuiltInExtensions: removedList });
 	}
 
 	async install(source: string): Promise<string> {
 		const normalized = source.trim();
 		if (!normalized) throw new Error("扩展名称不能为空");
-		return this.runPi(["install", normalized, "--no-approve"], 60_000);
+		const result = await this.runPi(["install", normalized], 60_000);
+		this.invalidateListCache();
+		return result;
 	}
 
 	async checkPiUpdate(): Promise<PiUpdateCheckResult> {
@@ -130,18 +337,20 @@ export class ExtensionManager {
 		const check = await this.checkPiUpdate();
 		if (!check.hasUpdate) {
 			return {
-				command: "pi update pi --no-approve",
+				command: "pi update pi",
 				output: check.error ?? `当前版本 ${check.currentVersion ?? "unknown"}，最新版本 ${check.latestVersion ?? "unknown"}，无需更新。`,
 				updated: false,
 			};
 		}
-		const output = await this.runPi(["update", "pi", "--no-approve"], 120_000, { offline: false });
-		return this.toUpdateResult("pi update pi --no-approve", output, true);
+		const output = await this.runPi(["update", "pi"], 120_000, { offline: false });
+		return this.toUpdateResult("pi update pi", output, true);
 	}
 
 	async updateExtensions(): Promise<PiCliUpdateResult> {
-		const output = await this.runPi(["update", "--extensions", "--no-approve"], 120_000, { offline: false });
-		return this.toUpdateResult("pi update --extensions --no-approve", output, true);
+		const output = await this.runPi(["update", "--extensions"], 120_000, { offline: false });
+		// 更新后版本信息变化，强制下次 list 重新获取。
+		this.invalidateListCache();
+		return this.toUpdateResult("pi update --extensions", output, true);
 	}
 
 	private async enrichExtensionVersion(extension: PiExtensionSummary): Promise<PiExtensionSummary> {
@@ -165,7 +374,10 @@ export class ExtensionManager {
 
 	private async readInstalledVersion(path?: string) {
 		if (!path) return undefined;
-		const raw = await readFile(join(path, "package.json"), "utf8");
+		const hostPath = this.wslEnvironment
+			? toWindowsHostPath(path, this.wslEnvironment)
+			: path;
+		const raw = await readFile(join(hostPath, "package.json"), "utf8");
 		const parsed = JSON.parse(raw) as { version?: string };
 		return parsed.version;
 	}
@@ -211,10 +423,50 @@ export class ExtensionManager {
 		return 0;
 	}
 
-	private async runPi(args: string[], timeout: number, options: { offline?: boolean } = {}) {
-		const command = this.locator.resolveCommand(this.getSettings().customPiPath);
-		const invocation = this.locator.createInvocation(command, args);
-		const env = this.locator.createProcessEnv(this.getSettings(), invocation.pathPrefix);
+	/**
+	 * --no-approve 标志在 pi 0.79.0 引入。检测本地安装的 pi 版本是否支持。
+	 */
+	private async noApproveSupported(): Promise<boolean> {
+		const version = await this.getPiVersion();
+		if (!version) return false;
+		const match = version.match(/^(\d+)\.(\d+)/);
+		if (!match) return false;
+		const major = parseInt(match[1], 10);
+		const minor = parseInt(match[2], 10);
+		// pi >= 0.79.0 或 1.x+ 都支持 --no-approve
+		return major > 0 || minor >= 79;
+	}
+
+	private async getPiVersion(): Promise<string | null> {
+		if (this.piVersion) return this.piVersion;
+		if (this.piVersionPromise) return this.piVersionPromise;
+		this.piVersionPromise = this.detectPiVersion();
+		return this.piVersionPromise;
+	}
+
+	private async detectPiVersion(): Promise<string | null> {
+		try {
+			const status = await this.locator.check(this.getSettings().customPiPath);
+			if (status.installed && status.version) {
+				this.piVersion = status.version;
+				return status.version;
+			}
+		} catch {
+			// 版本检测失败时静默处理，后续调用方会 fallback 为不支持 --no-approve
+		}
+		return null;
+	}
+
+	private async runPi(args: string[], timeout: number, options: { offline?: boolean } = {}): Promise<string> {
+		// --no-approve 在 pi 0.79+ 才支持，老版本需要跳过以避免 unknown option 错误。
+		const finalArgs = [...args];
+		if (await this.noApproveSupported()) {
+			finalArgs.push("--no-approve");
+		}
+		const settings = this.getSettings();
+		const command = this.locator.resolveCommand(settings.customPiPath, settings.wslEnabled, settings.wslDistro, settings.wslUser);
+		const invocation = this.locator.createInvocation(command, finalArgs);
+		const env = this.locator.createProcessEnv(settings, invocation.pathPrefix, invocation.wsl);
 		// list/remove/install 使用离线模式避免配置页被网络和包管理器输出拖慢；update 必须允许联网，
 		// 否则 pi 只会返回简化的 Updated packages，无法真正走 npm 更新流程。
 		if (options.offline !== false) env.PI_OFFLINE = "1";
@@ -277,5 +529,29 @@ export class ExtensionManager {
 		}
 
 		return result;
+	}
+
+	/**
+	 * 检查扩展来源是否与内置扩展的短名匹配（如 todo 匹配 pi-deck-todo.ts）。
+	 * npm:todo，本地 todo.ts 都以 todo 作为识别名。
+	 */
+	/**
+	 * 检测扩展是否与内置扩展功能冲突（同名或注册相同命令关键词）。
+	 * 例如 @juicesharp/rpiv-todo 的包名含 "todo"，与 pi-deck-todo 冲突。
+	 */
+	private extensionNameMatches(source: string, shortName: string): boolean {
+		const clean = source
+			.replace(/^(?:npm|file|github|git|https?):/i, "")
+			.replace(/\.ts$/, "")
+			.replace(/@[^/]+\//, "")
+			.toLowerCase();
+		// 精确匹配（如 todo === todo）
+		if (clean === shortName.toLowerCase()) return true;
+		// 关键词子串匹配（如 rpiv-todo 含 todo）
+		if (clean.includes(shortName.toLowerCase())) return true;
+		// 包名分段匹配（如 rpiv-ask-user-question 分段后含 ask）
+		const parts = clean.split(/[-_]/);
+		const shortParts = shortName.toLowerCase().split(/[-_]/);
+		return shortParts.some((sp) => parts.includes(sp));
 	}
 }

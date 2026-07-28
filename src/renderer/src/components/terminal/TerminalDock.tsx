@@ -8,6 +8,8 @@ import {
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
+import { showNotice } from "../../utils/notice";
+import { writeClipboard } from "../../utils/clipboard";
 import { ChevronDown, ChevronUp, MoreHorizontal, Plus, X } from "lucide-react";
 import type { PiDesktopApi } from "../../../../preload";
 import type { TerminalTab } from "../../../../shared/types";
@@ -17,10 +19,10 @@ const TERMINAL_THEMES = {
 	"pi-soft": {
 		label: "Pi Soft",
 		xterm: {
-			background: "#eef2f7",
+			background: "#ffffff",
 			foreground: "#243244",
 			cursor: "#16a34a",
-			selectionBackground: "#bbf7d0",
+			selectionBackground: "#d9f0e0",
 		},
 		xtermDark: {
 			background: "#15191d",
@@ -69,13 +71,19 @@ const TERMINAL_THEMES = {
 
 type TerminalThemeId = keyof typeof TERMINAL_THEMES;
 
+const TERMINAL_OPEN_ANIMATION_MS = 300;
+
 function stripReplayBuffer(tab: TerminalTab): TerminalTab {
 	const { buffer: _buffer, ...rest } = tab;
 	return rest;
 }
 
 export function TerminalDock(props: {
-	agentId: string;
+	/** 主进程 PTY 桶键：agentId，或无 agent 时的 `cwd:...` */
+	sessionKey?: string;
+	projectCwd?: string;
+	open: boolean;
+	closing: boolean;
 	collapsed: boolean;
 	height: number;
 	terminal: PiDesktopApi["terminal"];
@@ -88,24 +96,56 @@ export function TerminalDock(props: {
 	const fitRef = useRef<FitAddon | null>(null);
 	const activeTabIdRef = useRef("");
 	const buffersRef = useRef<Record<string, string>>({});
-	const copyNoticeTimerRef = useRef<number | null>(null);
+	// sessionKey 由 App 按 owner 解析；缺省时不应 ensure，避免误写入全局桶
+	const sessionKey = props.sessionKey;
+	/** 无 agent（cwd 桶）时显式传项目路径作为 CWD */
+	const effectiveCwd =
+		sessionKey && sessionKey.startsWith("cwd:") ? props.projectCwd : undefined;
+	/* copyNotice 已改用 toast (sonner) 实现 */
 	const [tabs, setTabs] = useState<TerminalTab[]>([]);
 	const [activeTabId, setActiveTabId] = useState("");
 	const [themeId, setThemeId] = useState<TerminalThemeId>("pi-soft");
 	const [themeMenuOpen, setThemeMenuOpen] = useState(false);
 	const [confirmCloseAllOpen, setConfirmCloseAllOpen] = useState(false);
-	const [copyNotice, setCopyNotice] = useState(false);
+	/* copyNotice 已改用 toast (sonner) 实现 */
 	const [loading, setLoading] = useState(false);
+	const [contentReady, setContentReady] = useState(false);
+	const [motionOpen, setMotionOpen] = useState(false);
 	const [appTheme, setAppTheme] = useState(
 		() => document.documentElement.dataset.theme ?? "light",
 	);
+	/** 可用 shell 列表 */
+	const [shells, setShells] = useState<
+		{ shell: string; label: string; available: boolean }[]
+	>([]);
+	const [shellMenuOpen, setShellMenuOpen] = useState(false);
 	const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? tabs[0];
 	const theme = TERMINAL_THEMES[themeId];
 	const xtermTheme =
 		themeId === "pi-soft" && appTheme === "dark" && "xtermDark" in theme
 			? theme.xtermDark
 			: theme.xterm;
-	const { collapsed } = props;
+	const { open, collapsed } = props;
+
+	useEffect(() => {
+		if (props.closing) return;
+		const frame = window.requestAnimationFrame(() => setMotionOpen(true));
+		return () => window.cancelAnimationFrame(frame);
+	}, [props.closing]);
+
+	// Grid 行高每帧变化时，xterm 的首次 fit 和缓冲区回放会抢占主线程。
+	// 先完成面板开场动画，再初始化终端，避免入口点击出现掉帧。
+	useEffect(() => {
+		if (!open) {
+			setContentReady(false);
+			return;
+		}
+		const timer = window.setTimeout(
+			() => setContentReady(true),
+			TERMINAL_OPEN_ANIMATION_MS,
+		);
+		return () => window.clearTimeout(timer);
+	}, [open]);
 
 	useEffect(() => {
 		const root = document.documentElement;
@@ -124,11 +164,14 @@ export function TerminalDock(props: {
 	}, [activeTab?.id]);
 
 	useEffect(() => {
+		if (!open || !contentReady || !sessionKey) return;
+		// pending-* 是渲染层占位，主进程还没有对应 agent runtime
+		if (sessionKey.startsWith("pending-")) return;
 		let cancelled = false;
 		async function loadTabs() {
 			setLoading(true);
 			try {
-				const nextTabs = await props.terminal.ensure(props.agentId);
+				const nextTabs = await props.terminal.ensure(sessionKey!, effectiveCwd);
 				if (cancelled) return;
 				buffersRef.current = nextTabs.reduce<Record<string, string>>(
 					(current, tab) => ({
@@ -139,6 +182,17 @@ export function TerminalDock(props: {
 				);
 				setTabs(nextTabs.map(stripReplayBuffer));
 				setActiveTabId(nextTabs[0]?.id ?? "");
+			} catch (error) {
+				// ensure 失败不能变成 unhandled rejection：Mac 上会表现为启动 agent 后终端报错/像闪退
+				if (!cancelled) {
+					setTabs([]);
+					setActiveTabId("");
+					const message = error instanceof Error ? error.message : String(error);
+					// Agent 尚未就绪时的竞态：静默跳过，等真实 agentId 再挂载
+					if (!/Agent not found/i.test(message)) {
+						showNotice(message, 4000, "error");
+					}
+				}
 			} finally {
 				if (!cancelled) setLoading(false);
 			}
@@ -147,7 +201,25 @@ export function TerminalDock(props: {
 		return () => {
 			cancelled = true;
 		};
-	}, [props.agentId, props.terminal]);
+	}, [sessionKey, effectiveCwd, props.terminal, open, contentReady]);
+
+	// 独立加载可用 shell 列表，避免与 loadTabs 耦合
+	useEffect(() => {
+		if (!open || !contentReady) return;
+		let cancelled = false;
+		void props.terminal
+			.shells()
+			.then((list) => {
+				if (!cancelled) setShells(list);
+			})
+			.catch(() => {
+				// shell 列表失败不阻断终端主体
+				if (!cancelled) setShells([]);
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [props.terminal, open, contentReady]);
 
 	useEffect(() => {
 		const offData = props.terminal.onData((payload) => {
@@ -177,10 +249,9 @@ export function TerminalDock(props: {
 	}, [props.terminal]);
 
 	useEffect(() => {
-		xtermRef.current?.dispose();
 		xtermRef.current = null;
 		fitRef.current = null;
-		if (collapsed || !activeTab || !containerRef.current) return;
+		if (collapsed || !contentReady || !activeTab || !containerRef.current) return;
 
 		const terminal = new Terminal({
 			cursorBlink: true,
@@ -230,7 +301,7 @@ export function TerminalDock(props: {
 			dataDisposable.dispose();
 			terminal.dispose();
 		};
-	}, [activeTab, collapsed, props.terminal, xtermTheme]);
+	}, [activeTab, collapsed, contentReady, props.terminal, xtermTheme]);
 
 	useEffect(() => {
 		fitRef.current?.fit();
@@ -244,26 +315,46 @@ export function TerminalDock(props: {
 	}, [props.height, activeTab, props.terminal]);
 
 	useEffect(() => {
-		if (collapsed || !activeTab || activeTab.exited) return;
+		if (collapsed || !contentReady || !activeTab || activeTab.exited) return;
 		requestAnimationFrame(() => xtermRef.current?.focus());
-	}, [activeTab?.id, activeTab?.exited, collapsed]);
+	}, [activeTab?.id, activeTab?.exited, collapsed, contentReady]);
 
-	useEffect(
-		() => () => {
-			if (copyNoticeTimerRef.current) window.clearTimeout(copyNoticeTimerRef.current);
-		},
-		[],
-	);
+	/* copyNotice cleanup 已禁用（改为 toast sonner） */
 
 	async function addTab() {
-		const next = await props.terminal.create(props.agentId);
-		setTabs((current) => [...current, stripReplayBuffer(next)]);
-		setActiveTabId(next.id);
-		props.onCollapsedChange(false);
+		if (!sessionKey || sessionKey.startsWith("pending-")) return;
+		try {
+			const next = await props.terminal.create(sessionKey, undefined, effectiveCwd);
+			setTabs((current) => [...current, stripReplayBuffer(next)]);
+			setActiveTabId(next.id);
+			props.onCollapsedChange(false);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			showNotice(message, 4000, "error");
+		}
+	}
+
+	/** 用指定 shell 创建新终端 tab */
+	async function addTabWithShell(shell: string) {
+		if (!sessionKey || sessionKey.startsWith("pending-")) return;
+		try {
+			const next = await props.terminal.create(sessionKey, shell, effectiveCwd);
+			setTabs((current) => [...current, stripReplayBuffer(next)]);
+			setActiveTabId(next.id);
+			props.onCollapsedChange(false);
+			setShellMenuOpen(false);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			showNotice(message, 4000, "error");
+		}
 	}
 
 	async function closeTab(tab: TerminalTab) {
-		await props.terminal.close(tab.id);
+		try {
+			await props.terminal.close(tab.id);
+		} catch {
+			// tab 可能已退出；继续做本地清理
+		}
 		delete buffersRef.current[tab.id];
 		const nextTabs = tabs.filter((item) => item.id !== tab.id);
 		setTabs(nextTabs);
@@ -294,13 +385,8 @@ export function TerminalDock(props: {
 		// xterm 默认右键会落到浏览器菜单；选区存在时直接复制，符合桌面终端的右键复制习惯。
 		event.preventDefault();
 		event.stopPropagation();
-		await navigator.clipboard.writeText(selection);
-		setCopyNotice(true);
-		if (copyNoticeTimerRef.current) window.clearTimeout(copyNoticeTimerRef.current);
-		copyNoticeTimerRef.current = window.setTimeout(
-			() => setCopyNotice(false),
-			1200,
-		);
+		await writeClipboard(selection);
+		showNotice(t("terminal.copied"), 1200);
 		xtermRef.current?.focus();
 	}
 
@@ -334,6 +420,8 @@ export function TerminalDock(props: {
 		<section
 			className={`terminal-dock${collapsed ? " collapsed" : ""}`}
 			data-theme={themeId}
+			data-open={open}
+			data-motion-state={props.closing || !motionOpen ? "hidden" : "visible"}
 			style={{ height: collapsed ? 34 : props.height }}
 		>
 			<div
@@ -376,10 +464,55 @@ export function TerminalDock(props: {
 						className="terminal-icon-btn"
 						onClick={() => void addTab()}
 						title={t("terminal.new")}
-						disabled={loading}
+						disabled={loading || !contentReady}
 					>
 						<Plus size={14} />
 					</button>
+					{/* Shell 选择器：点击创建指定 shell 的终端 */}
+					<div
+						style={{ position: "relative", display: "grid", placeItems: "center" }}
+					>
+						<button
+							className="terminal-icon-btn"
+							onClick={() => setShellMenuOpen((open) => !open)}
+							title={t("terminal.selectShell")}
+							disabled={loading || !contentReady}
+						>
+							<ChevronDown size={12} />
+						</button>
+						{shellMenuOpen && (
+							<div className="terminal-shell-menu">
+								<strong>{t("terminal.selectShell")}</strong>
+								{shells.length === 0 && (
+									<span className="terminal-shell-menu-empty" />
+								)}
+								{shells.map((s) => (
+									<button
+										key={s.shell}
+										className={s.available ? "" : "unavailable"}
+										onClick={() => {
+											if (!s.available) return;
+											void addTabWithShell(s.shell);
+										}}
+										title={s.available ? undefined : t("terminal.shellNotAvailable")}
+									>
+										{s.label}
+									</button>
+								))}
+							</div>
+						)}
+						{/* 点击菜单外部关闭 */}
+						{shellMenuOpen && (
+							<div
+								style={{
+									position: "fixed",
+									inset: 0,
+									zIndex: 119,
+								}}
+								onClick={() => setShellMenuOpen(false)}
+							/>
+						)}
+					</div>
 				</div>
 				<div className="terminal-actions">
 					<div
@@ -442,9 +575,9 @@ export function TerminalDock(props: {
 					onPointerDownCapture={focusTerminalSoon}
 					onContextMenu={(event) => void copySelectionOnContextMenu(event)}
 				>
-					{loading && <div className="terminal-placeholder">{t("terminal.starting")}</div>}
+					{(loading || !contentReady) && <div className="terminal-placeholder">{t("terminal.starting")}</div>}
 					<div ref={containerRef} className="terminal-xterm" />
-					{copyNotice && <div className="terminal-copy-notice">{t("terminal.copied")}</div>}
+					{/* copyNotice 已改用 toast (sonner) 实现 */}
 				</div>
 			)}
 			{confirmCloseAllOpen && (

@@ -5,29 +5,83 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          指定 tag（如 v0.6.7）则按该 tag 的代码打包。
+          留空则用当前分支最新 commit + package.json 版本号正式发布（自动 tag vX.Y.Z）。
+        required: false
+        default: ""
 
 permissions:
   contents: write
 
 jobs:
+  resolve-version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      ref: ${{ steps.resolve.outputs.ref }}
+      # 仅「手动留空 tag」时需要：把 release tag 指到本次构建的分支 HEAD
+      target_commitish: ${{ steps.resolve.outputs.target_commitish }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve version and ref
+        id: resolve
+        run: |
+          TARGET_COMMITISH=""
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            # 手动触发且指定了 tag → 用 tag 的代码（不要用分支 HEAD 覆盖 tag 指向）
+            TAG="${{ github.event.inputs.tag }}"
+            REF="refs/tags/${TAG}"
+            VERSION="${TAG#v}"
+            echo "Using provided tag: ${TAG}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            # tag push 触发 → 用推送的 tag
+            TAG="${GITHUB_REF_NAME}"
+            REF="${GITHUB_REF}"
+            VERSION="${TAG#v}"
+            echo "Using push tag: ${TAG}"
+          else
+            # 手动触发且未指定 tag → 用当前分支最新 commit 打包，
+            # 版本/tag 取 package.json，正式发布（非 draft）
+            VERSION=$(node -p "require('./package.json').version")
+            TAG="v${VERSION}"
+            # ref 留空：后续 checkout 跟随 workflow_dispatch 所选分支的 HEAD
+            REF=""
+            # softprops 创建/更新 tag 时指到本次构建的 commit
+            TARGET_COMMITISH="${GITHUB_SHA}"
+            echo "No tag provided: build latest commit as formal release ${TAG} @ ${TARGET_COMMITISH}"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "ref=${REF}" >> $GITHUB_OUTPUT
+          echo "target_commitish=${TARGET_COMMITISH}" >> $GITHUB_OUTPUT
+
   extract-changelog:
     name: Extract changelog
+    needs: resolve-version
     runs-on: ubuntu-latest
     outputs:
       release_body: ${{ steps.changelog.outputs.body }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-version.outputs.ref || '' }}
 
       - name: Extract changelog for this version
         id: changelog
         run: |
-          # 从 tag 名提取版本号（去掉 v 前缀）
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${{ needs.resolve-version.outputs.version }}"
+          TAG="${{ needs.resolve-version.outputs.tag }}"
           echo "Extracting changelog for v${VERSION}..."
           
-          # 提取该版本的 changelog 内容（从版本标题到下一个版本标题之间）
-          # 优先使用中文 CHANGELOG
+          # 提取该版本的 changelog 内容
           BODY=$(awk -v ver="v${VERSION}" '/^## v[0-9]/{if(found) exit; if($2==ver) found=1; next} found{print}' CHANGELOG.zh-CN.md)
           if [ -z "$BODY" ]; then
             BODY=$(awk -v ver="v${VERSION}" '/^## v[0-9]/{if(found) exit; if($2==ver) found=1; next} found{print}' CHANGELOG.md)
@@ -37,7 +91,6 @@ jobs:
             BODY="Release v${VERSION}"
           fi
           
-          # 使用 EOF 标记输出多行内容
           echo "body<<EOF" >> $GITHUB_OUTPUT
           echo "$BODY" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -48,7 +101,7 @@ jobs:
 
   build-release:
     name: Build ${{ matrix.name || matrix.platform }} packages
-    needs: extract-changelog
+    needs: [resolve-version, extract-changelog]
     strategy:
       fail-fast: false
       matrix:
@@ -81,6 +134,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-version.outputs.ref || '' }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -109,10 +164,13 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          # 多个 job 并发上传同一个 release；设置 prerelease 和 fail_on_unmatched_files:false
-          # 确保各架构产物都能合并到同一个 Release，不会因文件暂时未生成而失败
+          # 始终正式发布：手动留空 tag 时已解析为 v${package.json.version}
+          tag_name: ${{ needs.resolve-version.outputs.tag }}
+          # 仅「留空 tag」模式有值，把 tag 指到本次构建的分支 HEAD；其它模式留空不覆盖
+          target_commitish: ${{ needs.resolve-version.outputs.target_commitish }}
           body: ${{ needs.extract-changelog.outputs.release_body }}
           fail_on_unmatched_files: false
+          draft: false
           files: |
             release/*.exe
             release/*.msi

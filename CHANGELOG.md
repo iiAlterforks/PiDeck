@@ -4,7 +4,399 @@
 
 All notable changes to PiDeck are documented here.
 
-## [Unreleased]
+## v0.6.6 - 2026-07-25
+
+### 🚀 New Features
+
+- **Sidebar brand lockup redesign** — The official pi canvas logo now uses a cropped
+  bounding box (no empty board space), displays the PiDeck wordmark in Plantin serif,
+  and animates on agent start/close events for visual feedback. The settled color is
+  theme-adaptive (ink/white).
+- **Multi-tab file editor** — Up to 5 concurrent editor tabs, modal/drawer dual mode,
+  diff comparison mode, Monaco editor with dark/light themes, Markdown preview, and
+  auto-save (Ctrl+S) with dirty state indicator.
+- **Session reference (@-mention)** — Type `&` to pop up the session list for the
+  current project, select specific messages or reference the full context. Selection
+  persists across reopens.
+- **Feishu/Lark integration** — Bi-directional messaging, streaming cards, auto-group
+  creation, member management, and a dedicated Feishu link indicator in the composer.
+- **Git source control (major rewrite)** — VS Code-style 3-tab panel (Changes / History /
+  Compare), AI commit message generation, Git graph with colored lanes, cherry-pick /
+  revert / reset / drop via context menu, branch switching, and worktree support.
+- **Git Push / Pull** — Push and Pull buttons in the Changes pane header with full IPC
+  pipeline and error notifications.
+- **Customizable Commit Message Prompt** — New Setting `gitCommitMessagePrompt`,
+  a textarea in the Git section, template supports `{diff}` placeholder, Gitmoji mapping.
+- **Git panel relative paths** — Directory group headers now show paths relative to
+  project root instead of absolute file system paths.
+- **Chinese Prompt Store (XuePrompt)** — Replaced old yao-prompts files with SQLite
+  database (~4000 Chinese prompts). Supports 20+ category filters, FTS3 full-text
+  search, pagination, and one-click import.
+- **Skills.sh Community Skill Store** — Switched to CLI registry
+  (skill.xfyun.cn) for search, installing via `npx -g -s <skill> -y` with sort by
+  downloads and installation animations.
+- **HTML preview uses built-in browser** — Opening an HTML file defaults to source view.
+  Clicking the preview button switches to the right-side browser panel with webview
+  rendering, eliminating iframe sandbox restrictions.
+- **Composer redesign (OpenCode style)** — Replaced the top pill-button toolbar with a
+  bottom bar: mode toggle / prompt template / attachment / model name / thinking level.
+- **Client message queue** — Queue messages while the agent is busy (follow-up or steer
+  mode). Retract queued messages back to the editor. Visual queue status.
+- **Recommended extension packages** — All packages show copy-install-command buttons,
+  action buttons arranged horizontally, install status per-package.
+- **Async skill installation** — `npx skills install` runs via `execFile` without
+  blocking the main process UI.
+- **Built-in browser panel** — Browse in the right drawer with tabs, fullscreen, and
+  mobile viewport presets. Links open internally in the browser panel.
+- **ScratchPad** — Overlay-style scratch pad with content preview, selection mapping,
+  and theme-aware semantic colors.
+- **Local packaging** — `npm run compile-exe` for fast portable `.exe`. `npm run dist:win`
+  supports single-format builds (nsis / portable / zip).
+- **Auto-scroll to latest message** on historical session open.
+- **Toast notification system** — Self-built notice mechanism replaces `sonner` dependency.
+  Agent operations, file copy, model switch, and Git actions all show notifications.
+- **Expandable compaction card** — Pre-compaction message history visible in a
+  collapsible section.
+- **WSL environment support** (experimental) — Session scanning, file operations, and
+  path handling adapted for WSL.
+- **WSL environment support** — Session scanning, file operations, and path
+  handling adapted for WSL (via @Lopution PR #84).
+
+### 🔧 Terminal & UX
+
+- **Terminal shell selector** — Detect available shells (pwsh, Windows PowerShell,
+  cmd, Git Bash, WSL) on Windows. Dropdown menu next to the + button lets you pick
+  which shell to open.
+- **Project-level terminal** — Terminal is now tied to the project, not the agent.
+  It stays open when switching agents or when no agent is running.
+
+### ✨ UX Improvements
+
+- **Settings redesigned** — Global draft save/cancel replaces per-tab save buttons.
+  New tab categories: Common, Appearance, Proxy, Dev, Pet, Storage.
+- **Font size/face per-zone** — Independent font size configuration for chat, code,
+  sidebar, and composer. Preset themes (Sans/Serif/Mono) and window zoom.
+- **File sidebar** — New create file/folder functionality, tree view for Git panel,
+  relative paths, persistent drawer state per project.
+- **Behavior selector moved left of stop button** — Clearer visual layout.
+- **Composer bottom bar style unified** — All buttons use `composer-bar-btn` style
+  (28px small radius).
+- **Skills/Prompts auto-refresh on local tab switch** — Newly installed items
+  immediately visible.
+- **Document preview** — Markdown files default to rendered preview (with source
+  toggle). HTML files preview in the built-in browser panel.
+- **File diff side-by-side toggle** — Now works reliably in modal mode (key remount +
+  keepCurrentModel). Button hidden in drawer mode (container too narrow for split view).
+- **Built-in browser webview stability** — Fixed initial load cancellation (ERR_ABORTED),
+  dom-ready infinite refresh, and webview-not-ready white screen issues.
+- **Browser close/maximize buttons moved to tab bar** — Saves vertical space.
+- **Copy install command button** — Added next to install buttons for manual terminal use.
+- **Session outline & quick action bar** — Floating outline panel with jump-to-message.
+  Quick actions: terminal, file drawer, Git, browser, scratch pad, external editor.
+- **NoSession anonymous agent** — Chat entry at top of project list, writes to app
+  user-data directory for general conversations.
+- **Content width restriction** — Draggable content width slider for comfortable
+  reading of long code lines.
+- **Pin mode** — Pin frequently used agents to the top of the sidebar.
+
+### 🐛 Bug Fixes
+
+- **Monaco CSP error** — `loader.config({ monaco })` moved to module scope, preventing
+  CDN fallback blocked by CSP.
+- **TurnRow "Rendered fewer hooks" crash** — Moved `useMemo` before early returns,
+  fixing white screen on sending messages.
+- **"TextModel got disposed before DiffEditorWidget model got reset"** — Added
+  `keepCurrentOriginalModel` + `keepCurrentModifiedModel` to prevent model disposal
+  race when switching diff editors.
+- **Stop button invisible during agent response** — Now always shown when agent is busy.
+- **NoSession anonymous agent duplicate in sidebar** — Added `noSession` matching path.
+- **Agent startup status stuck on "starting"** — Fixed `setAgents` to overwrite
+  existing entries when API returns.
+- **Same-session resend truncation** — Fixed to delete only the last message's
+  descendant entries, not everything before it.
+- **Skills.sh search crash** — Added `Array.isArray` guard in `loadPersisted()`.
+- **Prompt category returns no data** — DB category matching fixed between slug
+  and original name.
+- **Title bar color mismatch** — Unified `background` across `.window-controls`.
+- **sql.js ESM loading failure in packaged app** — Fixed WASM path resolution.
+- **GitService.getStagedDiff maxBuffer too small** — Increased from 5KB to 10MB.
+- **Dev terminal Chinese garbled** — Auto-run `chcp 65001` on Windows.
+- **HTML preview white screen** — Fixed webview dom-ready infinite refresh and
+  ERR_ABORTED on initial load.
+- **Docs site build failure** — VitePress YAML `&` wrapped in quotes.
+- **TypeScript CI failure** — Removed duplicate `setAttachedImages` function.
+- **Bundled extension disabled/re-enable** — Fixed loss of built-in extensions after
+  disable.
+- **Old pi compatibility** — Graceful fallback for `--no-approve` parameter.
+- **Session loading indicator flicker** — Enforce a 200 ms minimum display duration
+  to avoid a brief flash on fast API responses.
+- **Send message auto-scroll** — Scroll to end instead of beginning.
+- **Thinking animation removed** — Unified "responding" animation as default.
+- **Agent idle after agent_end** — Added fallback idle check to avoid stuck animation.
+- **Multi-select image share padding** — Added padding to avoid text clipping.
+- **Ask dialog interaction** — Confirm button sizing, custom input always visible,
+  hide background card when dialog open, filter out Pi's default ✎ option.
+- **Message CPA_DONE marker cleanup** — Strips `CPA_DONE` from message end.
+- **User message edit** — Edited text backfilled to composer for re-sending.
+- **Feishu link "Cannot find package @larksuiteoapi/node-sdk" after packaging** —
+  The `afterPack` cleanup script was deleting the CJS build (`lib/`) assuming
+  `await import()` would use the ESM entry, but the package has no `exports` field
+  so Node.js resolves via `main` → `./lib/index.js`. Removed the deletion to fix
+  runtime resolution.
+
+### 🐛 Terminal Fixes
+
+- **Terminal always opened pwsh.exe** — `spawnShell` computed the priority-sorted
+  candidate list but was iterating over the original unsorted array, so the
+  preferred shell was always ignored.
+- **Shell dropdown clipped by overflow:hidden** — `.terminal-tabs` had
+  `overflow: hidden` which clipped the absolutely-positioned shell menu above it.
+- **Object destroyed crash on terminal data after window close** — The emit
+  callback lacked a guard against destroyed `webContents`.
+- **Stop button not cancelling on first click** — Added `recentlyAborted` set to
+  discard delayed pi events after abort.
+- **429 error not shown in chat** — Auto-retry failure now sets agent status to
+  error and appends a visible error message.
+
+### 🙏 Acknowledgements
+
+Thanks to all contributors for their PRs, issues, and feedback:
+
+- **@1900EasonJin** — Feishu integration, MemSpacedCard, think throttling, sidebar
+  card design, ScratchPad, terminal encoding fix (#80, #74, #60, #44, #42, #35, #34)
+- **@frostime** — Session info sync, custom font/zoom, model picker auto-scroll,
+  max thinking level, RPC extension lifecycle (#58, #56, #53, #52, #50)
+- **@me9rez** — Dependency cleanup, SkillManager symlink scanning (#86, #69)
+- **@bfzha** — VS Code-style Git panel with complex workflows (#68)
+- **@Lopution** — WSL path handling across desktop boundaries (#84)
+- **@buaassp** — Hide internal pi-subagent sessions (#57)
+- **@magic2066** — Codex subagent import fix, Linux dev/pet fixes (#40, #41)
+- **@pangolinknight** — Stream throttling, tool result truncation, white screen fix (#33)
+
+Special thanks to **微时佬友** for providing the Grok model service used in our
+community testing environment 🎉
+
+> 💬 **Join our QQ group for feedback & discussion: 1026218644**
+
+Thanks to all users who submitted suggestions and bug reports for PiDeck! 🙏
+
+---
+
+
+## v0.6.5 - 2026-07-13
+
+### 🚀 New Features
+
+- **Prompt Templates System (Major)**
+  - `PromptManager` with full CRUD and IPC bridge for `~/.pi/agent/prompts/`
+  - `PromptsTab` settings page with Monaco Editor (create/edit/preview/delete)
+  - `/` picker in composer to insert templates with `$N` variable hints
+  - Project-level prompts (create/edit/delete in ProjectResourcesModal)
+  - Built-in templates: review, test, fix, refactor, doc, explain, commit, pi-system, skill-discipline
+  - Frontmatter stripping on send, `description` metadata attached to prompt RPC
+  - Unicode naming support (Chinese, Japanese, etc.) for prompts and skills
+- **Prompt/Skill Store Integration**
+  - `prompts.chat` store: search, preview, and import prompts with variable-hint conversion
+  - Yao Open Prompts: 121 bundled Chinese prompts across 9 categories with category filter, search, and preview
+  - New Skill Store tab for searching prompts.chat skills
+- **Git Worktree Workspace Management**
+  - `WorktreeService`: detect git worktrees, create/delete via IPC
+  - Branch list + create dialog + remove button under worktree-enabled projects
+  - Sessions grouped by worktree, main workspace header clickable to load parent sessions
+  - Auto-refresh worktrees on startup
+- **Multi-Select Messages & Sharing**
+  - Checkbox multi-select mode with floating action bar (text/markdown/image copy)
+  - Image copy via `toBlob()` fix for CSP compliance
+  - Success pulse animation + toast feedback
+- **Built-in Browser Preview**
+  - New right-drawer browser panel with tabs, URL bar, refresh/home/back/forward controls
+  - Fullscreen mode and PC/mobile/tablet viewport presets for quickly checking web pages without leaving PiDeck
+  - External-link fallback opens unsupported protocols in the system browser
+- **Session Manager Modal**
+  - Open from project context menu: lists all project sessions with multi-select delete
+  - Per-session rename, export, delete, source filter (Pi/Codex/Claude/OpenCode)
+  - Unified 1300×850 modal size with backdrop click-to-close
+- **External Editor Integration**
+  - Project context menu: right-click → "Open with" → pick editor (VS Code / Cursor / Zed / JetBrains)
+  - Editor popover position fixed (left/top) with viewport clamping, works from sidebar project context
+- **Prompt Configuration Enhancement**
+  - Prompt templates picker shows description + variable hints in dropdown
+  - Compose: template expansion separates command from user input with `\n\n`
+  - Session file summary moved from chat timeline to composer area (collapsible)
+  - Prompt rename supported across global and project levels
+- **Model Configuration**
+  - New `xhigh` reasoning level support
+
+### ✨ UI Polish
+
+- **Extracted common MonacoEditor component**: CSP-compatible local workers, dark theme, unified across ConfigModal, ProjectResourcesModal, PromptsTab
+- **Thinking card visual refresh**: "思考" label, border removed, duration shown, chevron right after label, lighter hover
+- **Tool cards**: borders and background tints removed to match thinking card style, tertiary text for details
+- **Answer text**: font-size increased to 15px, line-height 1.68
+- **Turn row gap**: increased from 8px to 12px between blocks
+- **Extension widgets**: redesigned as collapsible cards with dismiss (X) button
+- **Unified modal sizing**: all full-screen modals use 1300×850 + `min(vw,vh) - 48px` + backdrop click-to-close
+- **Uniform icon buttons**: SkillsTab, ExtensionsTab, ProjectResourcesModal — text buttons → lucide icon buttons with hover titles
+  - Enable/disable toggle icons: ToggleRight (green)/ToggleLeft (default)
+- **Model selection UI**: simplified and refined (288 → 124 lines)
+- **Enter key**: native browser newline handling, no manual `<br>` insertion
+- **Chinese prompt names**: chip regex now supports `\p{L}` Unicode (removed `[a-zA-Z]` restriction)
+
+### 🔧 Performance
+
+- **Session open optimization**: Parallel `get_state` + `get_messages` on agent start
+- **loadMessages**: parallel `get_messages` + `get_entries` via Promise.all
+- **Initial session load**: skip `get_entries` (defer to edit/delete)
+- **IPC payload reduction**: strip `originalContent` from tool ChatMessage meta
+- **History message counting**: by conversation turns (20 turns) instead of raw message count
+- **Removed `repairAssistantUsage`**: importers already add usage fields, no need to check on every session open
+- **loadMessages retry**: only on failure, not unconditionally
+- **Cleaned up all `[perf]` debug logs and unused timing code**
+
+### 🐛 Bug Fixes
+
+- **Windows crash fix**: globally disable Chromium sandbox (`--no-sandbox`), resolves `0x80000003` breakpoint crash on startup
+- **Pi auto-compaction process restart**:
+  - New tracking sets: `compactingAgents`, `userInitiatedStop`, `autoRestartAttempted`
+  - Process exit handler: three-tier check (user-stop / compacting / clean restart)
+  - `reattachProcess()`: preserves agentId + messages, replaces PiProcess + RPC client on restart
+  - Manual compaction RPC failure → auto `reattachProcess()` (compaction already written to file)
+  - Stop/stopAll marks user-initiated stop, skips auto-reconnect
+- **onCompact event pollution**: MouseEvent passed to IPC → structured clone failure; wrapped with `() => compactAgent()`
+- **Extension RPC lifecycle**:
+  - Extension commands now cleared after session output (not before)
+  - Non-dialog UI requests rendered as cards, no popup
+  - Extension UI request lifecycle: pending cleared on agent_end
+- **Message rendering**:
+  - TurnRow renders by `run.items` original chronological order, restoring interleaved thinking/tool/answer display
+  - `showThinking` dynamically read from pi agent config, takes effect on agent switch
+  - Fragmented `content[].text` blocks from Anthropic-compatible providers are concatenated without synthetic newlines, fixing vertical-looking assistant replies
+  - `<button>` nesting fixed: ExtensionWidgetCard close uses `<span role=button>`
+- **Worktree**: refined project handling, session loading under worktree projects fixed
+- **Share & widget UI**: visual polish and layout correction
+- **Prompt frontmatter**: `description` no longer duplicated into message body
+- **Translated built-in prompt descriptions**: auto-switch between zh-CN/en-US based on app language
+
+### 🛠 Refactor
+
+- Split non-component exports from `AppParts.tsx` into `AppUtils.ts` (fixes Vite Fast Refresh warning)
+- RPC extension command idle check clarified
+
+## v0.6.4 - 2026-07-05
+
+### 🚀 New Features
+
+- **Plan Mode**: New mode picker in the composer toolbar, supporting seamless
+  switching between Plan Mode and Normal Mode. In Plan Mode the agent first
+  generates a plan, executes step by step with confirmation, and returns to
+  the menu on cancel.
+- **ask_question Extension Enhancement**:
+  - Batch question support: send multiple questions at once with structured results
+  - Option selection with highlight and confirmation feedback
+  - Collapsed tool card subtitle shows the question text
+  - Results persisted to `meta._askCard`, correctly rendered after session restore
+  - Enhanced promptGuidelines for rule-oriented instructions
+- **Message Edit/Delete**:
+  - Copy, edit, and delete AI responses
+  - Edit/delete user messages with backfill to composer
+  - Fix delete failures, flashback, and sync issues
+  - New plan mode cancel functionality
+- **ScratchPad Overlay**: Brand new scratch pad overlay with content preview,
+  selection mapping, entry migration, right-aligned animation, and theme-aware
+  semantic color tokens.
+- **pi-deck-todo Built-in Extension**: New todo list extension for task
+  management; widget rendering by widget key (no flatMap merging), with
+  truncation and scrolling for long text.
+- **Content Width Restriction**: New draggable content width slider (default
+  unlimited, drag left to narrow, minimum 800 px).
+- **Thinking Block Rework & Status Indicator**:
+  - Thinking rendered as ThinkingBlock cards, AssistantText reverted to plain text
+  - Thinking blocks rendered in-place by `<thinking>` tags, preserving original
+    alternating order in content array (no merging or repositioning)
+  - ThinkingBlock default expanded after streaming; manually collapsible
+  - ThinkingBlock trigger with content preview subtitle, font matching tool-card
+  - Toolbar "running" dot replaced by three-dot animated indicator at message
+    list bottom: supports "Thinking", "Executing {tool}", and waiting states;
+    auto-hides when model starts responding
+  - Optimized waiting indicator spacing (16 px above)
+  - Flat timeline rendering + unified message spacing + inline thinking segments
+- **Extension Management Enhancement**:
+  - Disable/enable built-in extensions with animated button
+  - Project-level skill/extension management, distinguishing global vs project config
+  - Fix extension_ui_request field read path (pi RPC at top-level, not params)
+  - getToolKind distinguishes MCP-direct from underscore-prefixed extension tools
+- **Trust Confirmation System**: Trust confirmation intercepted by desktop UI;
+  untrusted projects can still be opened; projects with running agents cannot
+  be deleted.
+- **DiagnosticMessageCard**: New error/system message card with tone-coded styling.
+- **Settings Page Enhancements**:
+  - defaultProvider/defaultModel dropdowns with cascading and auto-discovery
+  - enabledModels multi-select UI with model favorites pinned to top
+  - Use lucide Star icon instead of Unicode ★
+  - Agent restart no longer auto-switches selection; removed misleading retry option
+- **Session UX Enhancements**:
+  - Session compaction event display + clickable session file path
+  - One-click New Agent button on project rows
+  - External editor entry + session outline visible by default
+  - Empty session outline grayed with persistent hover state
+- **Feishu Bridge Enhancements**:
+  - Optimized model switch card, fixed rich table rendering
+  - Fixed file send false triggers and duplicate sends
+  - Streamlined Feishu bridge code
+
+### ✨ UI Polish
+
+- **Thinking Card Breathing Animation**: Streaming thinking card now has pulsing
+  border glow and subtle background pulse, so you can tell the system is still
+  active even when text stalls.
+- **Thinking Card Background**: Matches the tool-running card style with a subtle
+  accent-tinted background.
+- **Web Search Card Subtitle**: Collapsed `web_search` / `fetch_content` tool cards
+  now show the search query or URL as a subtitle.
+- **Content Width Slider**: Minimum value raised from 50 to 800 px to prevent
+  overly narrow composition area.
+- **Waiting Indicator Spacing**: Three-dot indicator now has 16 px margin above.
+- **Composer Optimization**: Default height reduced by 25 px, forced reset after
+  sending; composer moved down 10 px for more bottom breathing room.
+- **Terminal Toggle Animation**: Changed to smooth slide-in from below the input
+  area instead of a jarring pop.
+- **Right Drawer Animation**: Grid layout transition animation improved, reverted
+  to 0.18s ease version for fluidity.
+- **ScratchPad UX**: Preview selection, entry migration, animation, right-aligned
+  layout; file list collapsed by default.
+- **Chat Area Background**: Unified to `#fcfcfc` in light mode, `#fbfaf7` in warm mode.
+- **Tool Card Fixes**: JSON string parameter parsing, removed elapsed-time threshold,
+  summary moved after timestamp; restored tool-call elapsed time display.
+- **Slash Command Labels** now in Chinese, matching the dropdown display.
+- **Branch-dropdown** centered positioning + unified New Agent background color.
+- **ConfigModal**: User-Agent field layout fix, compat options description added.
+- **Compatibility Settings**: Explicitly writes `false` when unchecked, simplified desc.
+
+### 🐛 Bug Fixes
+
+- **Dark Mode White Backgrounds**: Fixed hardcoded `#fcfcfc` in `.chat-pane`,
+  `.composer`, `.composer-box`, and loading overlay — now properly adapts to
+  dark mode via `--color-bg-panel`.
+- **RichInput Newline Fix**: Fixed multi-line paste newline loss in contentEditable.
+- **Message Rendering Fixes**:
+  - Increased global message spacing specificity to override component margins
+  - Removed `.thinking-card.streaming` margin-top:0, restored global 16px spacing
+  - extension-widget-stack and composer-footer now respect content width limit
+  - AssistantText supports message.thinking fallback rendering
+  - Thinking/tool rendered in chronological order; fixed auto-scroll and cache hit rate
+- **Plan Mode Fixes**: Cross-session deadlock, inability to exit within session,
+  slash command breakage; cancel returns to menu; dialog options improved.
+- **ask_question Fixes**: Three bug fixes, extension integration restored
+  (was overwritten by scratchpad changes).
+- **Message Edit/Delete Fixes**: Role detection error, reload state out of sync,
+  delete failure/flashback.
+- **Linux Wayland Fixes**: Desktop pet drag fix and dev startup improvements.
+- **Feishu Fixes**: Rich table rendering, file send false triggers and duplicates,
+  session file sending.
+- **Codex Subagent Session Import**: Display fix, grouped under parent session.
+- **Pending Agent**: No longer loads terminal; closed terminals silently ignore resize.
+- **Regenerated package-lock.json** to fix npm ci failures.
+- **Restored ask_question extension integration** (overwritten by scratchpad changes).
 
 ## v0.6.3 - 2026-06-28
 

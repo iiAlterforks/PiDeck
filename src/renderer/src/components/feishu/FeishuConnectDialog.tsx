@@ -47,13 +47,15 @@ export function FeishuConnectDialog({ onClose, onConnect, onTest, connecting, on
 		}
 	}, [appId, appSecret, onTest]);
 
-	const openExternal = useCallback(async (url: string) => {
-		if (onOpenExternal) {
-			await onOpenExternal(url);
+	/** 飞书登录/指南页强制使用系统默认浏览器，不适合在内置浏览器打开 */
+	const openSystemExternal = useCallback(async (url: string) => {
+		const appApi = (window as unknown as { piDesktop?: { app?: { openExternal: (u: string, forceSystem?: boolean) => Promise<void> } } }).piDesktop?.app;
+		if (appApi?.openExternal) {
+			await appApi.openExternal(url, true);
 		} else {
 			window.open(url, "_blank", "noopener,noreferrer");
 		}
-	}, [onOpenExternal]);
+	}, []);
 
 	const handleConnect = useCallback(async () => {
 		if (!appId.trim() || !appSecret.trim()) {
@@ -201,7 +203,7 @@ export function FeishuConnectDialog({ onClose, onConnect, onTest, connecting, on
 					{showHelp && (
 						<div className="feishu-help-content">
 							<p>1. 打开{" "}
-								<button className="feishu-help-link" onClick={() => void openExternal("https://open.feishu.cn/app")}>
+								<button className="feishu-help-link" onClick={() => void openSystemExternal("https://open.feishu.cn/app")}>
 									飞书开放平台
 								</button>
 							</p>
@@ -212,7 +214,8 @@ export function FeishuConnectDialog({ onClose, onConnect, onTest, connecting, on
 								<li>im:message — 获取消息</li>
 								<li>im:message:send_as_bot — 发送消息</li>
 								<li>im:chat — 获取群聊信息</li>
-								<li>im:resource — 下载文件/图片</li>
+								<li>im:resource — 下载/上传文件与图片</li>
+								<li>docx:document — 创建与管理文档</li>
 							</ul>
 							<p>5. 在「事件订阅」中开启 im.message.receive_v1（WebSocket 长连接模式）</p>
 							<p>6. 发布应用并审核通过</p>

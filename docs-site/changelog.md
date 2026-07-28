@@ -5,6 +5,69 @@
 - [中文 CHANGELOG](https://github.com/ayuayue/PiDeck/blob/main/CHANGELOG.zh-CN.md)
 - [English CHANGELOG](https://github.com/ayuayue/PiDeck/blob/main/CHANGELOG.md)
 
+## v0.6.6
+
+发布时间：2026-07-25
+
+- 🚀 **侧栏品牌区重新设计**：Pi 官方 canvas logo 裁掉空边 + Plantin 字标，agent 启停动画
+- 🚀 **多 Tab 文件编辑器**：最多 5 个并发 Tab，弹框/侧栏双模式，Diff 差异对比
+- 🚀 **& 会话引用快捷输入**：键入 & 弹出会话列表，选择特定消息或引用全部上下文
+- 🚀 **飞书/Lark 集成**：双向对话、流式卡片、自动拉群、成员管理
+- 🚀 **Git 大重构**：VS Code 风格 3 Tab 面板 + AI 提交摘要 + Git 图形历史 + Cherry-pick/Revert/Reset/Drop
+- 🚀 **Git Push / Pull**：变更面板直接推拉
+- 🚀 **Prompt 中文提示词精选**：SQLite 存储 4000+ 提示词，分类/搜索/一键导入
+- 🚀 **Skills.sh 社区技能商店**：CLI 注册中心驱动搜索和安装，支持安装量排序
+- 🚀 **Composer 重新设计**：OpenCode 风格底部操作栏，模式/Prompt/附件/模型/Think 均可点击
+- 🚀 **客户端消息队列**：Agent 忙碌时可排队，可撤回编辑
+- 🚀 **HTML 预览改为内置浏览器**：webview 渲染，不受 iframe sandbox 限制
+- 🚀 **WSL 环境支持**：会话扫描、文件操作、路径处理适配 WSL
+- ✨ 设置页重构（全局保存/取消）、字号分区配置、文件侧栏增强、Diff 分栏修复
+- ✨ 自建 Toast 通知系统、可展开的压缩卡片、Session 摘要缓存持久化
+- 🐛 大量 Bug 修复（Monaco CSP、TextModel disposed 白屏、WSL 路径、中文乱码等）
+- 🐛 飞书链接打包后 "Cannot find package @larksuiteoapi/node-sdk" 修复
+
+特别感谢所有贡献者，以及 **微时佬友** 提供的 Grok 模型服务 🎉
+
+感谢所有给 PiDeck 提建议和反馈 Bug 的用户 🙏
+
+## v0.6.5
+
+发布时间：2026-07-13
+
+- 🚀 **Prompt 模板系统**：全新模板管理 + 内置模板 + `/` picker 快速插入
+- 🚀 **Prompt/Skill 商店**：集成 prompts.chat 和 Yao Open Prompts（121 个中文 Prompt）
+- 🚀 **Git Worktree 工作区**：git worktree 创建/删除，会话按分支分组
+- 🚀 **消息多选 & 分享**：多选转发，文字/图片复制
+- 🚀 **内置浏览器预览**：右侧抽屉浏览网页，多标签、全屏和移动端视口
+- 🚀 **会话管理器弹框**：多选删除、重命名、导出、来源筛选
+- 🚀 **外部编辑器集成**：项目右键「打开方式」直接选择编辑器
+- ✨ 公共 MonacoEditor 组件、统一图标按钮、统一弹框 1300×850
+- 🐛 Windows 启动崩溃修复（--no-sandbox 禁用沙箱，0x80000003）
+- 🐛 pi 压缩后进程重启断连修复 + Extension RPC 生命周期修复
+- 🐛 兼容分片 `content[].text` 输出，修复部分模型回答被额外换行成"竖排"
+- 🔧 会话打开性能优化、IPC 传输裁剪、清理调试日志
+
+## v0.6.4
+
+发布时间：2026-07-05
+
+- 🚀 思考/响应状态指示器：工具栏"运行中"圆点 → 消息列表底部三点脉动动画
+- 🚀 思考块默认展开：推理过程在思考结束后默认展开
+- ✨ 思考卡片呼吸脉冲动画 + 微色背景，文本卡住也能感知活跃
+- 🐛 暗色模式白色背景修复
+- 🐛 Web 搜索卡片二级标题、内容宽度滑块最小值 50→800
+
+## v0.6.3
+
+发布时间：2026-06-28
+
+- 🚀 桌面宠物系统：透明悬浮窗、Canvas 动画、巡游/逗弄/Review 交互
+- 🚀 Chip 输入系统：`@`路径和 `/` 命令作为可视化交互式 chip
+- 🚀 居中模态对话框：设置/配置/反馈改为覆盖模态框
+- 🚀 支持 OpenCode 会话导入和批量模型选择
+- ✨ 会话统计、模型折叠、加载动画等 UI 优化
+- 🐛 修复 macOS 终端权限、宠物 IPC 时序、换行丢失等 20+ 项
+
 ## v0.6.2
 
 发布时间：2026-06-22

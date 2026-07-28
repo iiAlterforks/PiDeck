@@ -1,7 +1,33 @@
 import { app, BrowserWindow, Menu } from "electron";
+import { readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createDefaultExternalEditorSettings, type AppSettings } from "../../shared/types";
+
+/** pi agent 的 settings.json 路径（~/.pi/agent/settings.json） */
+function piAgentSettingsPath() {
+	return join(app.getPath("home"), ".pi", "agent", "settings.json");
+}
+
+/**
+ * 读取 pi agent 的 settings.json 并从中提取 showThinking（取 hideThinkingBlock 的反值）。
+ * pi CLI 的 hideThinkingBlock 语义：true=隐藏思考，false=显示思考。
+ * 桌面端 showThinking 语义：true=显示，false=隐藏。
+ * 映射：showThinking = !hideThinkingBlock
+ * 若 pi agent 文件不存在或 hideThinkingBlock 未设置，返回 undefined。
+ */
+function readPiAgentShowThinking(): boolean | undefined {
+	try {
+		const agentRaw = readFileSync(piAgentSettingsPath(), "utf8");
+		const agentSettings = JSON.parse(agentRaw) as Record<string, unknown>;
+		if (typeof agentSettings.hideThinkingBlock === "boolean") {
+			return !agentSettings.hideThinkingBlock;
+		}
+	} catch {
+		// 文件不存在或解析失败，静默忽略
+	}
+	return undefined;
+}
 
 const defaultSettings: AppSettings = {
   useNativeTitleBar: false,
@@ -11,9 +37,29 @@ const defaultSettings: AppSettings = {
   lightBackground: "white",
   language: "system",
   piEnvironmentChecked: false,
+  enableGitManagement: true,
+  gitCommitMessagePrompt: `请根据以下 git diff 生成一条中文 git commit message。
+
+变更描述：
+{diff}
+
+Gitmoji 对应关系：
+✨ feat - 新功能
+🐛 fix - Bug 修复
+📚 docs - 文档更新
+💎 style - 代码格式
+♻️ refactor - 重构
+🧪 test - 测试
+🔧 chore - 构建/工具
+
+要求：
+1. 使用对应的 Gitmoji 开头
+2. 第一行简要说明修改的模块和做了什么
+3. 后续用 - 列出具体变更点
+4. 直接输出 commit 消息，不要解释`,
   closeToTray: true,
   enableNotifications: true,
-  showThinking: true,
+  showThinking: readPiAgentShowThinking() ?? true,
   showDevTools: false,
   piProxyEnabled: false,
   piProxyUrl: "http://127.0.0.1:7890",
@@ -22,12 +68,16 @@ const defaultSettings: AppSettings = {
   desktopProxyUrl: "http://127.0.0.1:7890",
   desktopProxyBypass: "localhost,127.0.0.1,::1",
   customPiPath: "",
+  wslEnabled: false,
+  wslDistro: "Ubuntu",
+  wslUser: "root",
   telemetryEnabled: true,
   webServiceEnabled: false,
   webServiceHost: "0.0.0.0",
   webServicePort: 8765,
   rpcTimeout: 600_000,
   linkOpenMode: "external",
+  contentMaxWidth: 1400,
   maxEditorFileSizeMB: 5,
   externalEditors: createDefaultExternalEditorSettings(),
 
@@ -40,6 +90,25 @@ const defaultSettings: AppSettings = {
   petPatrolEnabled: true,
   // 巡游碰边后 idle 停顿默认 5 分钟
   petPatrolPauseMin: 5,
+  favoriteModels: [],
+
+  // ── 扩展管理 ──
+  /** 用户手动移除的内置扩展，启动时跳过自动部署 */
+  removedBuiltInExtensions: [],
+
+  // ── 更新检测：默认正常检测，用户可手动关闭忽略更新 ──
+  disableUpdateCheck: false,
+
+  // 字体配置：默认值保证与历史版本行为一致，零回归
+  fontSize: "default",
+  uiFontSize: null,
+  chatFontSize: null,
+  inputFontSize: null,
+  zoomFactor: 1,
+  fontFamilyBase: "system",
+  fontFamilyBaseCustom: "",
+  fontFamilyMono: "commit-mono",
+  fontFamilyMonoCustom: "",
 };
 
 export class SettingsStore {
@@ -61,6 +130,12 @@ export class SettingsStore {
     } catch {
       this.settings = { ...defaultSettings };
     }
+    // showThinking 不再作为可持久化的独立配置项，完全跟随 pi agent 的 hideThinkingBlock。
+    // 启动时重新读取以确保每次启动都使用最新值，而非缓存的 defaultSettings。
+    const computedShowThinking = readPiAgentShowThinking();
+    if (computedShowThinking !== undefined) {
+      this.settings.showThinking = computedShowThinking;
+    }
     // 每次启动都校准安装类型：Windows 便携版由 electron-builder 注入运行时环境变量,
     // 该信号比旧 settings 更可信,可修正用户从安装版/旧版本迁移后残留的 installed 记录。
     await this.detectAndSaveInstallationType();
@@ -69,11 +144,18 @@ export class SettingsStore {
   }
 
   get() {
+    // showThinking 由 pi agent 的 hideThinkingBlock 动态决定，每次 get() 都重新读取
+    const computed = readPiAgentShowThinking();
+    if (computed !== undefined) {
+      return { ...this.settings, showThinking: computed };
+    }
     return { ...this.settings };
   }
 
   async update(patch: Partial<AppSettings>) {
-    this.settings = { ...this.settings, ...patch };
+    // showThinking 完全由 pi agent 的 hideThinkingBlock 控制，不允许通过桌面设置修改
+    const { showThinking: _, ...safePatch } = patch;
+    this.settings = { ...this.settings, ...safePatch };
     await this.save();
     this.applyMenu();
     return this.get();
@@ -98,7 +180,8 @@ export class SettingsStore {
         : isMac
           ? "hiddenInset" as const
           : "hidden" as const,
-      trafficLightPosition: { x: 14, y: 14 },
+      // 系统标题栏模式下红绿灯由 macOS 控制，不设置避免与侧栏 logo 重叠。
+      ...(!useNative && isMac ? { trafficLightPosition: { x: 14, y: 14 } as const } : {}),
     };
   }
 
@@ -120,7 +203,9 @@ export class SettingsStore {
 
   private async save() {
     await mkdir(app.getPath("userData"), { recursive: true });
-    await writeFile(this.filePath, JSON.stringify(this.settings, null, 2), "utf8");
+    // showThinking 由 pi agent 的 hideThinkingBlock 决定，不持久化到桌面 settings.json
+    const { showThinking: _unused, ...persistable } = this.settings;
+    await writeFile(this.filePath, JSON.stringify(persistable, null, 2), "utf8");
   }
 
   /**
