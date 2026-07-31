@@ -89,3 +89,62 @@ test("wraps plan composer submissions with the hidden PiDeck plan marker", () =>
 	assert.match(submission.agentMessage, /Inspect first/);
 	assert.match(submission.agentMessage, /Plan:/);
 });
+
+// 复现：普通输入不重渲染 App，live ref 已是全文，但闭包里的 renderedPrompt 仍是旧值。
+// ArrowUp 必须快照 live 草稿，否刕 ArrowDown 会丢掉继续输入的部分。
+test("history navigation snapshots the live draft instead of the last rendered prompt", () => {
+	const { resolveComposerHistoryDraft } = loadComposerBehaviorModule();
+
+	const draft = resolveComposerHistoryDraft({
+		activeAgentId: "agent-1",
+		livePromptByAgent: {
+			"agent-1": "第一段输入 继续输入的后半段",
+		},
+		// 上次重渲染时的旧 prompt（例如仅在 IME 确认/有无内容翻转时更新）
+		renderedPrompt: "第一段输入",
+	});
+
+	assert.equal(draft, "第一段输入 继续输入的后半段");
+});
+
+test("history navigation falls back to rendered prompt when live draft is missing", () => {
+	const { resolveComposerHistoryDraft } = loadComposerBehaviorModule();
+
+	const draft = resolveComposerHistoryDraft({
+		activeAgentId: "agent-1",
+		livePromptByAgent: {},
+		renderedPrompt: "fallback draft",
+	});
+
+	assert.equal(draft, "fallback draft");
+});
+
+test("history line bounds use the live draft cursor position", () => {
+	const { getComposerHistoryLineBounds } = loadComposerBehaviorModule();
+
+	const multi = getComposerHistoryLineBounds("line1\nline2", 2);
+	assert.equal(multi.isFirstLine, true);
+	assert.equal(multi.isLastLine, false);
+
+	const last = getComposerHistoryLineBounds("line1\nline2", 8);
+	assert.equal(last.isFirstLine, false);
+	assert.equal(last.isLastLine, true);
+});
+
+// confirm 扩展层走 select([是,否])：桌面端必须识别为纯是否题，不展示自定义输入。
+test("detects yes/no confirm options and rejects multi-choice selects", () => {
+	const { isYesNoConfirmOptions } = loadComposerBehaviorModule();
+
+	assert.equal(isYesNoConfirmOptions(["是", "否"]), true);
+	assert.equal(isYesNoConfirmOptions(["Yes", "No"]), true);
+	assert.equal(
+		isYesNoConfirmOptions([
+			{ label: "是", value: "yes" },
+			{ label: "否", value: "no" },
+		]),
+		true,
+	);
+	assert.equal(isYesNoConfirmOptions(["继续", "查看目录", "写代码"]), false);
+	assert.equal(isYesNoConfirmOptions(["是"]), false);
+	assert.equal(isYesNoConfirmOptions(["是", "否", "其它"]), false);
+});

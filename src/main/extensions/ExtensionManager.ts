@@ -8,6 +8,17 @@ import { toWindowsHostPath, type WslEnvironment } from "../wsl/WslPaths";
 
 type SettingsProvider = () => AppSettings;
 
+/**
+ * pi-node 将 Pi 安装在用户目录下的独立 npm runtime 中，Pi CLI 本身禁止对该
+ * runtime 执行 `pi update pi`。只识别它的顶层 shim，避免把普通的自定义 CLI
+ * 或 WSL 命令误判为可由本机 npm 接管的安装。
+ */
+export function getPiNodeRuntimeDir(piCommand: string): string | null {
+	const normalized = piCommand.replace(/\\/g, "/").replace(/\/+$/, "");
+	const match = normalized.match(/^(.*\/appdata\/local\/pi-node\/current)\/pi(?:\.cmd|\.exe)?$/i);
+	return match ? match[1].replace(/\//g, "\\") : null;
+}
+
 /** PiDeck 内置扩展列表，用于在扫描不到时仍展示在扩展管理页中。 */
 export const BUILT_IN_EXTENSIONS = [
 	"pi-deck-ask-question.ts",
@@ -154,20 +165,26 @@ export class ExtensionManager {
 			ext.enabled = !(ext.builtIn && removedBuiltIn.has(ext.source));
 		}
 
-		// 检测扩展冲突：三方扩展与内置扩展同名时，自动禁用内置扩展
+		// 仅检测 todo / plan / ask 固定冲突：三方包名含对应关键词时自动禁用内置版。
+		// nul-redirect-fix 等其它内置扩展暂不参与冲突检测，避免 mode 等通用词误伤。
+		// 注意：此处不走 disableBuiltIn（会 invalidateListCache），避免 list 请求中途 generation
+		// 变化导致结果被丢弃后反复重入。
 		const conflicts: { builtIn: string; thirdParty: string }[] = [];
-		for (const builtInName of BUILT_IN_EXTENSIONS) {
+		let removedChanged = false;
+		for (const [builtInName, keyword] of BUILT_IN_CONFLICT_KEYWORDS) {
 			if (removedBuiltIn.has(builtInName)) continue; // 已移除的不重复检测
-			const shortName = builtInName.replace(/^pi-deck-/, "").replace(/\.ts$/, "");
 			const conflicting = merged.find(
 				(ext) =>
 					!ext.builtIn &&
 					ext.enabled !== false &&
-					this.extensionNameMatches(ext.source, shortName),
+					extensionNameMatches(ext.source, keyword),
 			);
 			if (conflicting) {
 				removedBuiltIn.add(builtInName);
-				await this.saveRemovedBuiltIn([...removedBuiltIn]);
+				removedChanged = true;
+				// 必须删掉磁盘文件：pi 会加载 ~/.pi/agent/extensions 下全部 .ts，
+				// 仅写 removedBuiltInExtensions 无法阻止 Tool 同名冲突导致 RPC 启动失败。
+				await this.removeBuiltInFile(builtInName).catch(() => undefined);
 				conflicts.push({
 					builtIn: builtInName,
 					thirdParty: conflicting.source,
@@ -179,6 +196,15 @@ export class ExtensionManager {
 					}
 				}
 			}
+		}
+		if (removedChanged) {
+			await this.saveRemovedBuiltIn([...removedBuiltIn]);
+		}
+
+		// 已标记移除但磁盘仍有残留时主动清掉，修复「UI 已禁用但仍冲突」的历史状态。
+		for (const builtInName of removedBuiltIn) {
+			if (!builtInName.startsWith("pi-deck-")) continue;
+			await this.removeBuiltInFile(builtInName).catch(() => undefined);
 		}
 
 		return { extensions: merged, raw, conflicts: conflicts.length > 0 ? conflicts : undefined };
@@ -262,7 +288,7 @@ export class ExtensionManager {
 	async uninstall(source: string, scope: PiExtensionSummary["scope"] = "user"): Promise<void> {
 		const normalized = source.trim();
 		if (!normalized) throw new Error("扩展来源不能为空");
-		// 内置扩展：移除 PiDeck 设置中的自动部署标记，不删除文件
+		// 内置扩展走 removeBuiltIn（设置 + 删文件），不要走 pi remove
 		if (normalized.startsWith("pi-deck-")) {
 			throw new Error("内置扩展请使用 removeBuiltIn 操作");
 		}
@@ -280,22 +306,22 @@ export class ExtensionManager {
 	}
 
 	/**
-	 * 「移除」内置扩展：仅写入 PiDeck 设置，下次启动自动跳过部署。
-	 * 不删除扩展文件，保留在 ~/.pi/agent/extensions/ 中以便恢复。
+	 * 「移除」内置扩展：写入 PiDeck 设置跳过自动部署，并删除用户目录中的扩展文件。
+	 * 必须删文件：pi 会自动加载 ~/.pi/agent/extensions 下的 .ts，仅改设置无法阻止加载，
+	 * 与同名三方工具（如 npm:@juicesharp/rpiv-todo 的 todo）会直接冲突导致 RPC 启动失败。
+	 * 恢复时由 ensurePiDeckExtension 从 resources 重新部署。
 	 */
 	async removeBuiltIn(source: string): Promise<void> {
 		const normalized = source.trim();
 		if (!normalized.startsWith("pi-deck-")) {
 			throw new Error("只能操作内置扩展");
 		}
-		const current = this.getPiDeckSettings().removedBuiltInExtensions ?? [];
-		if (current.includes(normalized)) return;
-		await this.saveRemovedBuiltIn([...current, normalized]);
-		this.invalidateListCache();
+		await this.disableBuiltIn(normalized);
 	}
 
 	/**
 	 * 恢复已移除的内置扩展：从 PiDeck 设置中移除记录，下次启动自动部署。
+	 * 实际文件由调用方 ensurePiDeckExtension 写回。
 	 */
 	async restoreBuiltIn(source: string): Promise<void> {
 		const normalized = source.trim();
@@ -304,6 +330,38 @@ export class ExtensionManager {
 		if (next.length === current.length) return;
 		await this.saveRemovedBuiltIn(next);
 		this.invalidateListCache();
+	}
+
+	/**
+	 * 禁用内置扩展的统一路径：记入 removedBuiltInExtensions + 删除磁盘文件。
+	 * 供手动移除与三方冲突自动让位共用，保证 pi 进程侧立即不再加载。
+	 */
+	async disableBuiltIn(source: string): Promise<void> {
+		const normalized = source.trim();
+		if (!normalized.startsWith("pi-deck-")) {
+			throw new Error("只能操作内置扩展");
+		}
+		const current = this.getPiDeckSettings().removedBuiltInExtensions ?? [];
+		if (!current.includes(normalized)) {
+			await this.saveRemovedBuiltIn([...current, normalized]);
+		}
+		await this.removeBuiltInFile(normalized);
+		this.invalidateListCache();
+	}
+
+	/**
+	 * 删除用户扩展目录中的内置扩展文件。
+	 * 只允许 pi-deck-* 单层 basename，防止路径穿越。
+	 * force: 文件本就不存在时静默成功（幂等，适合启动残留清理）。
+	 */
+	async removeBuiltInFile(source: string): Promise<void> {
+		const extensionsDir = join(this.homeDir, ".pi", "agent", "extensions");
+		const trimmed = source.trim();
+		const name = basename(trimmed);
+		if (!name || name !== trimmed || !name.startsWith("pi-deck-") || name === "." || name === "..") {
+			throw new Error("非法内置扩展路径");
+		}
+		await rm(join(extensionsDir, name), { force: true });
 	}
 
 	private async saveRemovedBuiltIn(removedList: string[]): Promise<void> {
@@ -341,6 +399,27 @@ export class ExtensionManager {
 				output: check.error ?? `当前版本 ${check.currentVersion ?? "unknown"}，最新版本 ${check.latestVersion ?? "unknown"}，无需更新。`,
 				updated: false,
 			};
+		}
+		const settings = this.getSettings();
+		const piCommand = this.locator.resolveCommand(
+			settings.customPiPath,
+			settings.wslEnabled,
+			settings.wslDistro,
+			settings.wslUser,
+		);
+		const piNodeRuntime = getPiNodeRuntimeDir(piCommand);
+		if (piNodeRuntime) {
+			const npmCommand = join(piNodeRuntime, process.platform === "win32" ? "npm.cmd" : "npm");
+			const output = await this.runCommand(
+				npmCommand,
+				["install", "@earendil-works/pi-coding-agent@latest", "--save"],
+				120_000,
+				{ offline: false },
+			);
+			// npm 已替换 runtime 中的 CLI，旧版本缓存会让后续 update check 误报。
+			this.piVersion = null;
+			this.piVersionPromise = null;
+			return this.toUpdateResult(`${npmCommand} install @earendil-works/pi-coding-agent@latest --save`, output, true);
 		}
 		const output = await this.runPi(["update", "pi"], 120_000, { offline: false });
 		return this.toUpdateResult("pi update pi", output, true);
@@ -465,7 +544,12 @@ export class ExtensionManager {
 		}
 		const settings = this.getSettings();
 		const command = this.locator.resolveCommand(settings.customPiPath, settings.wslEnabled, settings.wslDistro, settings.wslUser);
-		const invocation = this.locator.createInvocation(command, finalArgs);
+		return this.runCommand(command, finalArgs, timeout, options);
+	}
+
+	private runCommand(command: string, args: string[], timeout: number, options: { offline?: boolean } = {}): Promise<string> {
+		const settings = this.getSettings();
+		const invocation = this.locator.createInvocation(command, args);
 		const env = this.locator.createProcessEnv(settings, invocation.pathPrefix, invocation.wsl);
 		// list/remove/install 使用离线模式避免配置页被网络和包管理器输出拖慢；update 必须允许联网，
 		// 否则 pi 只会返回简化的 Updated packages，无法真正走 npm 更新流程。
@@ -530,28 +614,27 @@ export class ExtensionManager {
 
 		return result;
 	}
+}
 
-	/**
-	 * 检查扩展来源是否与内置扩展的短名匹配（如 todo 匹配 pi-deck-todo.ts）。
-	 * npm:todo，本地 todo.ts 都以 todo 作为识别名。
-	 */
-	/**
-	 * 检测扩展是否与内置扩展功能冲突（同名或注册相同命令关键词）。
-	 * 例如 @juicesharp/rpiv-todo 的包名含 "todo"，与 pi-deck-todo 冲突。
-	 */
-	private extensionNameMatches(source: string, shortName: string): boolean {
-		const clean = source
-			.replace(/^(?:npm|file|github|git|https?):/i, "")
-			.replace(/\.ts$/, "")
-			.replace(/@[^/]+\//, "")
-			.toLowerCase();
-		// 精确匹配（如 todo === todo）
-		if (clean === shortName.toLowerCase()) return true;
-		// 关键词子串匹配（如 rpiv-todo 含 todo）
-		if (clean.includes(shortName.toLowerCase())) return true;
-		// 包名分段匹配（如 rpiv-ask-user-question 分段后含 ask）
-		const parts = clean.split(/[-_]/);
-		const shortParts = shortName.toLowerCase().split(/[-_]/);
-		return shortParts.some((sp) => parts.includes(sp));
-	}
+/**
+ * 当前参与冲突检测的内置扩展与关键词。
+ * todo / plan / ask：三方包名含关键词即视为功能冲突；其它内置扩展暂不自动互斥。
+ */
+export const BUILT_IN_CONFLICT_KEYWORDS = [
+	["pi-deck-todo.ts", "todo"],
+	["pi-deck-plan-mode.ts", "plan"],
+	["pi-deck-ask-question.ts", "ask"],
+] as const;
+
+/**
+ * 固定关键词冲突匹配：清理协议/作用域后，包名是否包含指定关键词。
+ * 例：rpiv-todo、my-plan-helper 命中；context-mode 不含 plan/todo 不命中。
+ */
+export function extensionNameMatches(source: string, keyword: string): boolean {
+	const clean = source
+		.replace(/^(?:npm|file|github|git|https?):/i, "")
+		.replace(/\.ts$/, "")
+		.replace(/@[^/]+\//, "")
+		.toLowerCase();
+	return clean.includes(keyword.toLowerCase());
 }

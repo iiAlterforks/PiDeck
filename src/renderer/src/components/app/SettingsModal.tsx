@@ -448,6 +448,13 @@ function SettingsModalContent(props: SettingsModalProps) {
 		{ value: "blue", label: t("settings.lightBackgroundBlue") },
 		{ value: "green", label: t("settings.lightBackgroundGreen") },
 	];
+	const startupWindowModeOptions = [
+		{ value: "maximized", label: t("settings.startupWindow.maximized") },
+		{ value: "normal-large", label: t("settings.startupWindow.large") },
+		{ value: "normal-medium", label: t("settings.startupWindow.medium") },
+		{ value: "normal-compact", label: t("settings.startupWindow.compact") },
+		{ value: "fullscreen", label: t("settings.startupWindow.fullscreen") },
+	];
 	const languageOptions = [
 		{ value: "system", label: t("settings.languageSystem") },
 		{ value: "zh-CN", label: t("settings.languageZh") },
@@ -635,8 +642,8 @@ function SettingsModalContent(props: SettingsModalProps) {
 											</div>
 										</>
 									)}
-									<hr className="setting-divider" />
-									<div className="setting-field">
+									{/* 不接 setting-divider：上方 SettingSwitch 已有 border-bottom，再画线会双线 */}
+									<div className="setting-field setting-field--after-switch">
 										<span>
 											{t("settings.fontFamilyBase")}
 											<DirtyMarker dirty={isDirty("fontFamilyBase")} label={t("settings.fontFamilyBase")} />
@@ -721,6 +728,14 @@ function SettingsModalContent(props: SettingsModalProps) {
 										}
 									/>
 									<SettingSwitch
+										title={t("settings.singleInstance")}
+										description={t("settings.singleInstanceDesc")}
+										checked={draftSettings.singleInstance}
+										onChange={(checked) =>
+											updateDraft({ singleInstance: checked })
+										}
+									/>
+									<SettingSwitch
 										title={t("settings.enableNotifications")}
 										checked={draftSettings.enableNotifications}
 										onChange={(checked) =>
@@ -788,6 +803,27 @@ function SettingsModalContent(props: SettingsModalProps) {
 						{activeTab === "appearance" && (
 							<>
 								<SettingsSection title={t("settings.interface")}>
+									<div className="setting-field">
+										<span>
+											{t("settings.startupWindowMode")}
+											<DirtyMarker
+												dirty={isDirty("startupWindowMode")}
+												label={t("settings.startupWindowMode")}
+											/>
+										</span>
+										<SelectField
+											value={draftSettings.startupWindowMode}
+											options={startupWindowModeOptions}
+											onChange={(value) =>
+												updateDraft({
+													startupWindowMode: value as AppSettings["startupWindowMode"],
+												})
+											}
+										/>
+										<small style={{ color: "var(--color-text-tertiary)", fontSize: "var(--font-size-caption)" }}>
+											{t("settings.startupWindowModeDesc")}
+										</small>
+									</div>
 									<div className="setting-field">
 										<span>
 											{t("settings.lightBackground")}
@@ -1204,6 +1240,43 @@ function SettingsModalContent(props: SettingsModalProps) {
 											updateDraft({ disableUpdateCheck: checked })
 										}
 									/>
+
+									{/* Electron Chromium 沙箱：与 pi Agent 无关，改完需整应用重启。 */}
+									<SettingSwitch
+										title={t("settings.electronSandbox")}
+										description={t("settings.electronSandboxDesc")}
+										checked={draftSettings.electronChromiumSandbox}
+										onChange={(checked) =>
+											updateDraft({ electronChromiumSandbox: checked })
+										}
+									/>
+
+									{/* Agent RPC 启动诊断：改完后需重启 Agent。
+									    不要再插 setting-divider：SettingSwitch 已有 border-bottom，叠 divider 会双线。 */}
+									<div className="setting-row setting-row--section-label">
+										<div>
+											<strong>{t("settings.piRpcStartup")}</strong>
+											<small>{t("settings.piRpcStartupDesc")}</small>
+										</div>
+									</div>
+									<SettingSwitch
+										title={t("settings.piRpcOffline")}
+										description={t("settings.piRpcOfflineDesc")}
+										checked={draftSettings.piRpcOffline}
+										onChange={(checked) => updateDraft({ piRpcOffline: checked })}
+									/>
+									<SettingSwitch
+										title={t("settings.piRpcNoExtensions")}
+										description={t("settings.piRpcNoExtensionsDesc")}
+										checked={draftSettings.piRpcNoExtensions}
+										onChange={(checked) => updateDraft({ piRpcNoExtensions: checked })}
+									/>
+									<SettingSwitch
+										title={t("settings.piRpcNoSkills")}
+										description={t("settings.piRpcNoSkillsDesc")}
+										checked={draftSettings.piRpcNoSkills}
+										onChange={(checked) => updateDraft({ piRpcNoSkills: checked })}
+									/>
 								</SettingsSection>
 								<SettingsSection title={t("settings.debug")}>
 									<div className="setting-row">
@@ -1284,16 +1357,6 @@ function SettingsModalContent(props: SettingsModalProps) {
 											</Button>
 										</div>
 									</div>
-								</SettingsSection>
-								<SettingsSection title={t("settings.privacy")}>
-									<SettingSwitch
-										title={t("settings.telemetry")}
-										description={t("settings.telemetryDesc")}
-										checked={draftSettings.telemetryEnabled}
-										onChange={(checked) =>
-											updateDraft({ telemetryEnabled: checked })
-										}
-									/>
 								</SettingsSection>
 							</>
 						)}

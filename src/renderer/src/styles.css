@@ -463,19 +463,40 @@ select:focus-visible {
     radial-gradient(1000px 520px at 50% 30%, color-mix(in srgb, var(--color-logo-green) 12%, transparent), transparent 62%),
     var(--color-bg-app);
 }
+/* 与 .empty-logo 对齐：同一 accent 渐变与小圆角，仅尺寸略小适配启动/加载屏 */
 .boot-logo {
   width: 88px;
   height: 88px;
   display: grid;
   place-items: center;
-  border-radius: 22px;
-  background: var(--logo-boot-gradient);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(
+    145deg,
+    var(--color-accent-strong) 0%,
+    var(--color-accent) 100%
+  );
   color: var(--color-text-inverse);
   box-shadow:
-    0 1px 0 color-mix(in srgb, #fff 18%, transparent) inset,
-    0 14px 32px color-mix(in srgb, var(--color-logo-green) 24%, transparent);
+    0 18px 40px color-mix(in srgb, var(--color-accent) 28%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.18);
 }
 .boot-logo svg {
+  width: 48px;
+  height: 48px;
+}
+/* preload 失败等 React 内 boot 屏：避免再套一层 logo-mark 的亮绿圆角块 */
+.boot-logo .logo-mark {
+  width: 48px;
+  height: 48px;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
+}
+.boot-logo .logo-mark::before {
+  display: none;
+}
+.boot-logo .logo-mark svg {
   width: 48px;
   height: 48px;
 }
@@ -982,8 +1003,8 @@ body.is-resizing .wechat-shell {
   position: fixed;
   top: 0;
   left: 0;
-  /* 右侧留给：右栏切换 + 置顶/最小化/最大化/关闭（5 个控件） */
-  right: calc(var(--window-control-width, 36px) * 5);
+  /* 右侧留给：置顶/最小化/最大化/关闭（4 个控件） */
+  right: calc(var(--window-control-width, 36px) * 4);
   height: var(--window-drag-height);
   z-index: 900;
   background: var(--color-bg-sidebar);
@@ -999,7 +1020,7 @@ body.is-resizing .wechat-shell {
   z-index: 920;
   display: grid;
   /* 右栏切换 + pin + min + max + close */
-  grid-template-columns: repeat(5, var(--window-control-width, 36px));
+  grid-template-columns: repeat(4, var(--window-control-width, 36px));
   height: var(--window-drag-height);
   background: var(--color-bg-sidebar);
   -webkit-app-region: no-drag;
@@ -1286,8 +1307,109 @@ body.is-resizing .wechat-shell {
   background: var(--color-bg-hover);
   color: var(--color-accent);
 }
+/*
+ * shadcn 风 IconButton：左右分栏、会话头部开关统一走这套尺寸与边框，
+ * 避免 list-toggle / header-drawer-toggle 各自一套导致大小/圆角不一致。
+ */
+.ui-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  padding: 0;
+  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition:
+    background-color 0.15s,
+    border-color 0.15s,
+    color 0.15s,
+    box-shadow 0.15s;
+}
+.ui-icon-button-sm {
+  width: 26px;
+  height: 26px;
+}
+.ui-icon-button-md {
+  width: 30px;
+  height: 30px;
+}
+.ui-icon-button-ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--color-text-secondary);
+}
+.ui-icon-button-outline {
+  border-color: var(--color-border-subtle);
+  background: var(--color-bg-panel);
+  color: var(--color-text-primary);
+}
+.ui-icon-button-soft {
+  border-color: transparent;
+  background: var(--color-bg-muted);
+  color: var(--color-text-secondary);
+}
+.ui-icon-button:hover:not(:disabled) {
+  background: var(--color-bg-hover);
+  border-color: var(--color-border-strong);
+  color: var(--color-text-primary);
+}
+.ui-icon-button:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+.ui-icon-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.ui-icon-button.active {
+  color: var(--color-accent);
+  border-color: color-mix(in srgb, var(--color-accent) 40%, var(--color-border-subtle));
+  background: color-mix(in srgb, var(--color-accent) 8%, var(--color-bg-panel));
+}
 .ui-icon-button svg {
   display: block;
+  flex: none;
+}
+/* 轻量 Badge：会话头部 ctx/cache/cost 等状态信息 */
+.ui-badge {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-radius: var(--radius-md);
+  font-family: var(--font-family-business);
+  font-variant-numeric: tabular-nums;
+  line-height: var(--line-height-caption);
+  font-size: var(--font-size-caption);
+}
+.ui-badge-sm {
+  height: 26px;
+  padding: 0 8px;
+}
+.ui-badge-md {
+  height: 28px;
+  padding: 0 10px;
+}
+.ui-badge-secondary {
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-bg-muted);
+  color: var(--color-text-secondary);
+}
+.ui-badge-outline {
+  border: 1px solid var(--color-border-subtle);
+  background: var(--color-bg-panel);
+  color: var(--color-text-secondary);
+}
+.ui-badge-muted {
+  border: 1px solid transparent;
+  background: color-mix(in srgb, var(--color-bg-muted) 80%, transparent);
+  color: var(--color-text-tertiary);
 }
 .ui-button {
   min-height: var(--control-height-md);
@@ -3076,6 +3198,24 @@ body.is-terminal-resizing {
   background: transparent;
 }
 
+/*
+ * 左右分栏开关：视觉与交互由 .ui-icon-button-* 提供。
+ * 这里只保留定位/间距，避免再写一套 26×30 与 26×26 混用导致左右大小不一。
+ */
+.list-toggle-native {
+  flex: 0 0 auto;
+}
+/* 折叠后的浮动恢复入口：避开左侧 14px 折叠条 */
+.list-toggle-native.floating {
+  position: fixed;
+  top: 12px;
+  left: 22px;
+  z-index: 920;
+}
+.header-drawer-toggle {
+  flex: 0 0 auto;
+}
+
 /* ---- Session combo (合并新会话 + 下拉,类似 branch-select) ---- */
 .session-combo,
 .file-action-combo {
@@ -3091,11 +3231,11 @@ body.is-terminal-resizing {
   border: 1px solid var(--color-border-subtle);
   background: var(--color-bg-panel);
   color: var(--color-text-primary);
-  /* 与 empty-state / logo 统一用方圆角，不用胶囊 pill */
+  /* 与 IconButton outline / Badge outline 同一套素雅边框，不用胶囊 pill */
   border-radius: var(--radius-md);
   padding: 0 10px;
   font-size: var(--font-size-control);
-  font-weight: 600;
+  font-weight: 500;
   cursor: pointer;
   transition:
     background 0.15s,
@@ -3103,6 +3243,7 @@ body.is-terminal-resizing {
     box-shadow 0.15s,
     color 0.15s;
   white-space: nowrap;
+  box-shadow: none;
 }
 .session-combo-trigger:hover:not(:disabled) {
   background: var(--color-bg-hover);
@@ -3435,7 +3576,13 @@ body.is-terminal-resizing {
   background: color-mix(in srgb, var(--color-success) 16%, transparent);
   color: var(--color-success);
 }
-.chat-header-actions button,
+/*
+ * 头部文字按钮默认尺寸。
+ * 注意：不要用 `.chat-header-actions button` 一刀切，否则会把右侧
+ * IconButton（分栏开关）也拉成 min-width:60 / height:32，看起来比左侧大一圈。
+ */
+.chat-header-actions > button:not(.ui-icon-button),
+.chat-header-actions .header-action-group > button:not(.ui-icon-button),
 .panel-action-row button {
   flex: 0 0 auto;
   min-width: 60px;
@@ -3452,23 +3599,29 @@ body.is-terminal-resizing {
     border-color 0.15s,
     color 0.15s;
 }
-.chat-header-actions .session-combo-trigger {
-  min-width: 102px;
+/* 分栏 IconButton 在头部里保持 26×26，与左侧 list-toggle / 新会话高度一致 */
+.chat-header-actions .ui-icon-button {
+  min-width: 0;
+  width: 26px;
   height: 26px;
-  padding: 0 12px;
+  padding: 0;
+}
+.chat-header-actions .session-combo-trigger {
+  min-width: 90px;
+  height: 26px;
+  padding: 0 10px;
   border: 1px solid var(--color-border-subtle);
   border-radius: var(--radius-md);
   background: var(--color-bg-panel);
   color: var(--color-text-primary);
-  box-shadow: 0 1px 2px
-    color-mix(in srgb, var(--color-text-primary) 5%, transparent);
+  font-weight: 500;
+  box-shadow: none;
 }
 .chat-header-actions .session-combo-trigger:hover:not(:disabled) {
   border-color: var(--color-border-strong);
   background: var(--color-bg-hover);
   color: var(--color-text-primary);
-  box-shadow: 0 2px 5px
-    color-mix(in srgb, var(--color-text-primary) 8%, transparent);
+  box-shadow: none;
 }
 .chat-header-actions .primary-action {
   min-width: 60px;
@@ -3675,11 +3828,13 @@ body.is-terminal-resizing {
 }
 
 /* ---- Header action buttons ---- */
-.chat-header-actions button:hover {
+.chat-header-actions > button:not(.ui-icon-button):hover,
+.chat-header-actions .header-action-group > button:not(.ui-icon-button):hover {
   background: var(--color-bg-hover);
   border-color: var(--color-border-strong);
 }
-.chat-header-actions button.active {
+.chat-header-actions > button:not(.ui-icon-button).active,
+.chat-header-actions .header-action-group > button:not(.ui-icon-button).active {
   background: transparent;
   border-color: var(--color-accent);
   color: var(--color-accent);
@@ -3800,61 +3955,17 @@ body.is-terminal-resizing {
   transform: translate3d(0, 100%, 0);
   pointer-events: none;
 }
-.terminal-dock[data-theme="solarized-light"] {
-  --terminal-bg: #fdf6e3;
-  --terminal-fg: #657b83;
-  --terminal-panel: #eee8d5;
-  --terminal-header: #fdf6e3;
-  --terminal-border: #d9d0ad;
-  --terminal-muted: #6c7780;
-  --terminal-active-bg: #e6f2d7;
-  --terminal-active-fg: #586e00;
-  --terminal-hover: #e8dfc3;
-}
 :root[data-theme="dark"] .terminal-dock[data-theme="pi-soft"] {
-  --terminal-bg: #15191d;
-  --terminal-fg: #d9e2dc;
-  --terminal-panel: #1b2025;
-  --terminal-header: #22282e;
-  --terminal-border: #2a333a;
-  --terminal-muted: #95a39c;
+  --terminal-bg: var(--color-bg-app);
+  --terminal-fg: var(--color-text-primary);
+  --terminal-panel: var(--color-bg-panel);
+  --terminal-header: var(--color-bg-sidebar);
+  --terminal-border: var(--color-border-subtle);
+  --terminal-muted: var(--color-text-tertiary);
   --terminal-active-bg: transparent;
-  --terminal-active-fg: #6ee78c;
-  --terminal-hover: #263039;
+  --terminal-active-fg: var(--color-text-primary);
+  --terminal-hover: var(--color-bg-hover);
   box-shadow: none;
-}
-.terminal-dock[data-theme="solarized-dark"] {
-  --terminal-bg: #002b36;
-  --terminal-fg: #839496;
-  --terminal-panel: #073642;
-  --terminal-header: #073642;
-  --terminal-border: #164b59;
-  --terminal-muted: #93a1a1;
-  --terminal-active-bg: #114b58;
-  --terminal-active-fg: #2aa198;
-  --terminal-hover: #0f4652;
-}
-.terminal-dock[data-theme="one-dark"] {
-  --terminal-bg: #282c34;
-  --terminal-fg: #abb2bf;
-  --terminal-panel: #21252b;
-  --terminal-header: #282c34;
-  --terminal-border: #3a3f4b;
-  --terminal-muted: #9aa3b4;
-  --terminal-active-bg: #343b46;
-  --terminal-active-fg: #98c379;
-  --terminal-hover: #303640;
-}
-.terminal-dock[data-theme="monokai"] {
-  --terminal-bg: #272822;
-  --terminal-fg: #f8f8f2;
-  --terminal-panel: #20211c;
-  --terminal-header: #272822;
-  --terminal-border: #3e3d32;
-  --terminal-muted: #cfcfc2;
-  --terminal-active-bg: #3a3b31;
-  --terminal-active-fg: #a6e22e;
-  --terminal-hover: #33342c;
 }
 .terminal-dock.collapsed {
   min-height: 30px;
@@ -3961,56 +4072,6 @@ body.is-terminal-resizing .terminal-resize-handle::before {
   align-items: center;
   gap: 4px;
   flex: 0 0 auto;
-}
-.terminal-more-menu {
-  position: relative;
-  display: grid;
-  place-items: center;
-}
-.terminal-theme-menu {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + 6px);
-  z-index: 120;
-  width: 190px;
-  display: grid;
-  gap: 4px;
-  padding: 8px;
-  border: 1px solid var(--terminal-border);
-  border-radius: var(--radius-lg);
-  background: var(--terminal-panel);
-  color: var(--terminal-fg);
-  box-shadow: var(--shadow-popover);
-}
-.terminal-theme-menu strong,
-.terminal-theme-menu span {
-  padding: 0 4px;
-  line-height: var(--line-height-caption);
-}
-.terminal-theme-menu strong {
-  font-size: var(--font-size-caption);
-}
-.terminal-theme-menu span {
-  color: var(--terminal-muted);
-  font-size: var(--font-size-micro);
-}
-.terminal-theme-menu button {
-  width: 100%;
-  min-height: 28px;
-  height: auto;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--terminal-fg);
-  padding: 0 8px;
-  text-align: left;
-  font-size: var(--font-size-caption);
-}
-.terminal-theme-menu button:hover,
-.terminal-theme-menu button.active {
-  border-color: var(--terminal-border);
-  background: var(--terminal-active-bg);
-  color: var(--terminal-active-fg);
 }
 
 /* Shell 选择器 */
@@ -6229,10 +6290,11 @@ body.is-terminal-resizing .terminal-resize-handle::before {
 .tool-card--ask {
   background: transparent;
 }
-/* ask dialog 打开时隐藏内联卡片的全部内容，避免对话中重复显示提问 */
+/* ask dialog 打开时隐藏时间线内重复的提问卡，只保留 composer 上方内联栏 */
 body.ask-bar-active .tool-card--ask,
 body.ask-bar-active .ask-card-preview,
-body.ask-bar-active .ask-question-card.pending {
+body.ask-bar-active .ask-question-card.pending,
+body.ask-bar-active .ask-inline-bar--timeline {
   display: none;
 }
 .tool-card--ask .tool-card-icon {
@@ -6260,56 +6322,66 @@ body.ask-bar-active .ask-question-card.pending {
   color: var(--color-info);
   flex-shrink: 0;
 }
-.ask-question-card-tool-inner .ask-question-card-options-list {
+/* 单问 select 备选项：紧凑列表，与批量 Q→A 行同属一套素雅语言 */
+.ask-question-card-options-list {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 12px;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+.ask-question-card-options-list--compact {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px dashed color-mix(in srgb, var(--color-border-subtle) 80%, transparent);
 }
 .ask-question-card-tool-inner .ask-question-card-option-item {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 28px;
-  padding: 0 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-height: 26px;
+  padding: 5px 8px;
   border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--color-chat-control-bg);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--color-bg-panel) 70%, transparent);
   color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
   font-weight: 500;
   line-height: var(--line-height-caption);
-  transition: none;
+  transition:
+    border-color 0.12s ease,
+    background-color 0.12s ease,
+    color 0.12s ease;
 }
 .ask-question-card-tool-inner .ask-question-card-option-item.selected {
-  border-color: var(--color-accent);
-  background: var(--color-chat-control-bg);
+  border-color: color-mix(in srgb, var(--color-accent) 42%, var(--color-border-subtle));
+  background: color-mix(in srgb, var(--color-accent) 8%, var(--color-bg-panel));
   color: var(--color-text-primary);
 }
 .ask-question-card-tool-inner .ask-question-card-option-selector {
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 999px;
+  background: var(--color-bg-panel);
   flex-shrink: 0;
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--color-success);
-  transition: none;
+  color: transparent;
 }
 .ask-question-card-tool-inner
   .ask-question-card-option-item.selected
   .ask-question-card-option-selector {
+  border-color: color-mix(in srgb, var(--color-success) 45%, var(--color-border-subtle));
+  background: color-mix(in srgb, var(--color-success) 12%, var(--color-bg-panel));
   color: var(--color-success);
 }
 .ask-question-card-tool-inner .ask-question-card-option-text {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
   min-width: 0;
 }
 .ask-question-card-tool-inner .ask-question-card-option-label {
@@ -6318,54 +6390,14 @@ body.ask-bar-active .ask-question-card.pending {
   color: inherit;
   font-family: var(--font-family-base);
   font-weight: 500;
+  word-break: break-word;
 }
 .ask-question-card-tool-inner .ask-question-card-option-desc {
-  font-size: var(--font-size-caption);
-  line-height: var(--line-height-caption);
+  font-size: var(--font-size-micro);
+  line-height: 1.35;
   color: var(--color-text-tertiary);
   font-weight: 400;
-}
-.ask-question-card-tool-inner .ask-question-card-answered {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 28px;
-  padding: 0 12px;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--color-chat-card-bg);
-  font-size: var(--font-size-caption);
-  line-height: var(--line-height-caption);
-  color: var(--color-chat-link);
-  font-weight: 700;
-}
-.ask-question-card-tool-inner .ask-question-card-answered svg {
-  flex-shrink: 0;
-  stroke-width: 2.5;
-  color: var(--color-success);
-}
-/* 长答案允许换行，避免 fixed height 下文字覆盖错位 */
-.ask-question-card-tool-inner .ask-question-card-answered--wrap {
-  height: auto;
-  min-height: 24px;
-  max-width: 100%;
-  align-items: flex-start;
-  padding: 4px 10px;
-  white-space: normal;
   word-break: break-word;
-}
-.ask-question-card-tool-inner .ask-question-card-answered--muted {
-  color: var(--color-text-tertiary);
-  font-weight: 500;
-  height: auto;
-  min-height: 24px;
-  padding: 4px 10px;
-}
-.ask-question-card-tool-inner .ask-question-card-answer-text {
-  min-width: 0;
-  white-space: pre-wrap;
-  word-break: break-word;
-  line-height: var(--line-height-caption);
 }
 
 /* 批量问卷结果：问题与答案尽量同一行；任一侧过长时自动换行，不互相覆盖 */
@@ -6448,8 +6480,10 @@ body.ask-bar-active .ask-question-card.pending {
   font-weight: 500;
 }
 
-/* ask_question 内联栏 - 在当前会话的输入框上方显示，不遮挡其他页面 */
+/* ask_question 内联栏 - 输入框上方；普通 ask 与 Plan 下一步共用紧凑高度 */
 .ask-inline-bar {
+  /* 与 Plan 下一步共用总高上限，避免某一类弹层特别高 */
+  --ask-inline-max-height: min(220px, 32vh);
   border: 1px solid var(--color-border-strong);
   border-bottom: none;
   border-radius: var(--radius-md) var(--radius-md) 0 0;
@@ -6458,8 +6492,23 @@ body.ask-bar-active .ask-question-card.pending {
     var(--color-accent) 6%,
     var(--color-bg-panel)
   );
-  padding: var(--space-3) var(--space-3) var(--space-3);
+  padding: 8px 10px 8px;
   margin: 0;
+  max-height: var(--ask-inline-max-height);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+/* 时间线内 pending 单问：完整圆角卡片，不贴 composer 底边 */
+.ask-inline-bar--timeline {
+  --ask-inline-max-height: none;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--color-bg-panel) 92%, var(--color-accent) 8%);
+  margin: 8px 0;
+  max-height: none;
+  overflow: visible;
 }
 .ask-inline-bar-header {
   display: flex;
@@ -6468,7 +6517,8 @@ body.ask-bar-active .ask-question-card.pending {
   color: var(--color-accent);
   font-weight: 600;
   font-size: var(--font-size-caption);
-  margin-bottom: var(--space-2);
+  margin-bottom: 4px;
+  flex-shrink: 0;
 }
 .ask-inline-bar-cancel-hint {
   color: var(--color-text-tertiary);
@@ -6480,8 +6530,8 @@ body.ask-bar-active .ask-question-card.pending {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
   margin-left: auto;
   border: none;
   border-radius: var(--radius-sm);
@@ -6496,23 +6546,27 @@ body.ask-bar-active .ask-question-card.pending {
   color: var(--color-text-primary);
 }
 .ask-inline-bar-question {
-  font-size: var(--font-size-body);
-  line-height: var(--line-height-body);
+  font-size: var(--font-size-control);
+  line-height: var(--line-height-control);
   word-break: break-word;
   color: var(--color-text-primary);
-  font-weight: 500;
-  margin-bottom: var(--space-3);
+  font-weight: 600;
+  margin-bottom: 4px;
+  flex-shrink: 0;
 }
 .ask-inline-bar-body {
-  /* 容器，子元素决定实际布局 */
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .ask-inline-bar-options {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-2);
-  max-height: 180px;
-  overflow-y: auto;
-  padding-right: var(--space-1);
+  gap: 6px;
+  max-height: none;
+  overflow: visible;
+  padding-right: 0;
 }
 .ask-inline-bar-options-confirm {
   display: flex;
@@ -6528,23 +6582,28 @@ body.ask-bar-active .ask-question-card.pending {
   display: inline-flex;
   align-items: flex-start;
   justify-content: flex-start;
-  min-height: 30px;
-  padding: 6px 14px;
+  min-height: 28px;
+  padding: 6px 12px;
   border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-sm);
-  background: var(--color-chat-control-bg);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-panel);
   color: var(--color-text-secondary);
-  font-size: var(--font-size-control);
+  font-size: var(--font-size-caption);
   font-weight: 500;
-  line-height: var(--line-height-body);
+  line-height: var(--line-height-caption);
   cursor: pointer;
-  transition: all 0.12s ease;
+  transition:
+    background-color 0.12s ease,
+    border-color 0.12s ease,
+    color 0.12s ease,
+    box-shadow 0.12s ease;
   font-family: var(--font-family-base);
   white-space: normal;
   text-align: left;
   word-break: break-word;
   flex: 1 1 auto;
   max-width: 100%;
+  box-shadow: none;
 }
 .ask-inline-bar-option:hover {
   color: var(--color-text-primary);
@@ -6558,27 +6617,156 @@ body.ask-bar-active .ask-question-card.pending {
   outline: var(--focus-ring);
   outline-offset: 2px;
 }
+/* 批量/单问共用 selected：与 badge/outline 控件同一强调色 */
+.ask-inline-bar-option.selected {
+  border-color: color-mix(in srgb, var(--color-accent) 45%, var(--color-border-subtle));
+  background: color-mix(in srgb, var(--color-accent) 10%, var(--color-bg-panel));
+  color: var(--color-text-primary);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-accent) 18%, transparent);
+}
 .ask-inline-bar-option-yes {
-  border-color: var(--color-accent);
-  color: var(--color-accent);
+  border-color: color-mix(in srgb, var(--color-success) 35%, var(--color-border-subtle));
+  color: var(--color-success);
   justify-content: center;
   align-items: center;
   white-space: nowrap;
-  flex: none;
+  flex: 1 1 0;
+  min-width: 88px;
+}
+.ask-inline-bar-option-yes:hover,
+.ask-inline-bar-option-yes.selected {
+  border-color: color-mix(in srgb, var(--color-success) 55%, var(--color-border-subtle));
+  background: color-mix(in srgb, var(--color-success) 10%, var(--color-bg-panel));
+  color: var(--color-success);
 }
 .ask-inline-bar-option-no {
-  border-color: var(--color-danger);
+  border-color: color-mix(in srgb, var(--color-danger) 35%, var(--color-border-subtle));
   color: var(--color-danger);
   justify-content: center;
   align-items: center;
   white-space: nowrap;
-  flex: none;
+  flex: 1 1 0;
+  min-width: 88px;
+}
+.ask-inline-bar-option-no:hover,
+.ask-inline-bar-option-no.selected {
+  border-color: color-mix(in srgb, var(--color-danger) 55%, var(--color-border-subtle));
+  background: color-mix(in srgb, var(--color-danger) 10%, var(--color-bg-panel));
+  color: var(--color-danger);
 }
 .ask-inline-bar-option-marker {
   font-size: var(--font-size-control);
-  color: var(--color-text-primary);
+  color: inherit;
   font-weight: 500;
   line-height: var(--line-height-body);
+}
+
+/* Plan 结束「下一步」：紧凑卡片选项；总高与普通 ask 共用 --ask-inline-max-height */
+.ask-inline-bar--plan-next {
+  border-color: color-mix(in srgb, var(--color-brand-blue) 35%, var(--color-border-strong));
+  background: color-mix(
+    in srgb,
+    var(--color-brand-blue) 7%,
+    var(--color-bg-panel)
+  );
+}
+.ask-inline-bar-guide {
+  margin: 0 0 6px;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-micro);
+  line-height: 1.35;
+  flex-shrink: 0;
+}
+.ask-plan-next-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  align-items: stretch;
+}
+/* 三列紧凑卡：标题单行 + 说明两行；用 grid 保宽，避免 flex min-width:0 把中文挤成竖排 */
+.ask-plan-next-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
+  min-width: 0;
+  min-height: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-chat-control-bg);
+  color: var(--color-text-primary);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color 0.12s ease,
+    border-color 0.12s ease;
+}
+.ask-plan-next-option:hover {
+  background: var(--color-bg-hover);
+  border-color: var(--color-border-strong);
+}
+.ask-plan-next-option:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+.ask-plan-next-option.tone-primary {
+  border-color: color-mix(in srgb, var(--color-accent) 45%, var(--color-border-subtle));
+  background: color-mix(in srgb, var(--color-accent) 10%, var(--color-chat-control-bg));
+}
+.ask-plan-next-option.tone-primary:hover {
+  border-color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 16%, var(--color-bg-hover));
+}
+.ask-plan-next-option.tone-secondary {
+  border-color: color-mix(in srgb, var(--color-brand-blue) 35%, var(--color-border-subtle));
+}
+.ask-plan-next-option-title {
+  max-width: 100%;
+  font-size: var(--font-size-caption);
+  font-weight: 650;
+  line-height: 1.25;
+  color: var(--color-text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ask-plan-next-option-desc {
+  max-width: 100%;
+  font-size: var(--font-size-micro);
+  line-height: 1.3;
+  color: var(--color-text-secondary);
+  font-weight: 400;
+  /* 中文按词/短语换行，禁止单字竖排；最多两行 */
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.ask-plan-next-dismiss {
+  grid-column: 1 / -1;
+  margin-top: 2px;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-micro);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-align: left;
+}
+.ask-plan-next-dismiss:hover {
+  color: var(--color-text-secondary);
+}
+.ask-plan-next-dismiss:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--radius-xs);
 }
 .ask-inline-bar-custom-input {
   display: flex;
@@ -6606,6 +6794,49 @@ body.ask-bar-active .ask-question-card.pending {
   display: flex;
   gap: var(--space-2);
   align-items: center;
+}
+/* 修改计划：多行输入 + 返回/提交并排，避免只能提交或关掉 */
+.ask-inline-bar-input-area--plan-revise {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+.ask-inline-bar-textarea {
+  width: 100%;
+  min-height: 64px;
+  max-height: 120px;
+  height: auto;
+  padding: 8px 10px;
+  resize: vertical;
+  line-height: var(--line-height-body);
+  font-family: var(--font-family-base);
+}
+.ask-inline-bar-input-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+}
+.ask-inline-bar-back-btn {
+  height: var(--control-height-lg);
+  padding: 0 12px;
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-control);
+  font-family: var(--font-family-base);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ask-inline-bar-back-btn:hover {
+  color: var(--color-text-primary);
+  border-color: var(--color-border-strong);
+  background: var(--color-bg-hover);
+}
+.ask-inline-bar-back-btn:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
 }
 .ask-inline-bar-input {
   flex: 1;
@@ -7232,6 +7463,31 @@ body.ask-bar-active .ask-question-card.pending {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
 }
+
+/* ```latex / ```tex / ```math 围栏：与代码块同壳，内容区用 KaTeX 块级排版 */
+.latex-block-content {
+  max-width: 100%;
+  min-width: 0;
+  padding: 36px var(--space-3) var(--space-3);
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.latex-block-content .katex-display {
+  margin: 0;
+}
+
+.latex-block-error {
+  display: block;
+  margin: 36px var(--space-3) var(--space-2);
+  color: var(--color-danger);
+  font-size: var(--font-size-caption);
+  font-family: var(--font-family-business);
+}
+
+.latex-block--fallback pre {
+  padding-top: var(--space-2);
+}
 .markdown-body table {
   display: block;
   box-sizing: border-box;
@@ -7438,13 +7694,13 @@ body.ask-bar-active .ask-question-card.pending {
   color: var(--color-text-tertiary);
 }
 .empty-logo {
-  width: 118px;
-  height: 118px;
+  width: 76px;
+  height: 76px;
   border-radius: var(--radius-lg);
   display: block;
   background: transparent;
   box-shadow: 0 18px 40px color-mix(in srgb, var(--color-text-primary) 14%, transparent);
-  margin-bottom: var(--space-8);
+  margin-bottom: var(--space-5);
 }
 .empty-logo img {
   width: 100%;
@@ -7842,8 +8098,8 @@ body.is-composer-resizing .composer-resize-handle::after {
   flex-direction: column;
   gap: 1px;
   width: 100%;
-  /* 约 5 行 Todo 高度，再高就卡片内滚动 */
-  max-height: min(108px, 16vh);
+  /* 父容器限高：给 TODO/Plan 卡片足够可视高度，超出再内部滚动 */
+  max-height: min(240px, 34vh);
   overflow-y: auto;
   overscroll-behavior: contain;
   /* composer 默认 gap=8px，这里用负 margin 抵消，最终与输入框只留约 2px 缝 */
@@ -7992,18 +8248,18 @@ body.is-composer-resizing .composer-resize-handle::after {
   outline-offset: 1px;
 }
 .extension-widget-card-content {
-  /* 扩展内容按"可见行数"限高：默认只露约 5 行，多出来的在卡片内滚动，给输入框腾空间。 */
-  --extension-widget-visible-lines: 5;
-  --extension-widget-line-height: 15px;
-  padding: 0 6px 2px 6px;
+  /* 扩展内容按"可见行数"限高：约 9 行，便于 TODO/Plan 查看更多待办项。 */
+  --extension-widget-visible-lines: 9;
+  --extension-widget-line-height: 16px;
+  padding: 0 6px 4px 6px;
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: 2px;
   min-height: 0;
   max-height: calc(
     var(--extension-widget-visible-lines) *
       var(--extension-widget-line-height) +
-      (var(--extension-widget-visible-lines) - 1) * 1px
+      (var(--extension-widget-visible-lines) - 1) * 2px
   );
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -8161,6 +8417,56 @@ body.is-composer-resizing .composer-resize-handle::after {
 }
 .composer-bar-btn.thinking:hover {
   color: var(--color-accent);
+}
+/* 上下文压缩：默认像次级 chip，不高对比；warn/critical 仅靠文字色提示紧迫度 */
+.composer-bar-btn.compact {
+  height: 26px;
+  padding: 0 7px;
+  gap: 3px;
+  border: 1px solid transparent;
+  color: var(--color-text-secondary);
+  font-style: normal;
+  font-weight: 500;
+  font-family: var(--font-family-business);
+  font-variant-numeric: tabular-nums;
+}
+.composer-bar-btn.compact svg {
+  flex: none;
+  opacity: 0.78;
+}
+.composer-bar-btn.compact:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+  border-color: var(--color-border-subtle);
+}
+.composer-bar-btn.compact:hover svg {
+  opacity: 1;
+}
+/* 70%+：提示该考虑压缩，但不要做成高饱和按钮 */
+.composer-bar-btn.compact.warn {
+  color: color-mix(in srgb, var(--color-warning) 82%, var(--color-text-secondary));
+}
+.composer-bar-btn.compact.warn:hover {
+  color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 10%, transparent);
+  border-color: color-mix(in srgb, var(--color-warning) 22%, var(--color-border-subtle));
+}
+/* 90%+：更接近危险阈值，仍保持轻量描边而不是实心块 */
+.composer-bar-btn.compact.critical {
+  color: color-mix(in srgb, var(--color-danger) 78%, var(--color-text-secondary));
+}
+.composer-bar-btn.compact.critical:hover {
+  color: var(--color-danger);
+  background: color-mix(in srgb, var(--color-danger) 10%, transparent);
+  border-color: color-mix(in srgb, var(--color-danger) 22%, var(--color-border-subtle));
+}
+.composer-bar-btn.compact.compacting {
+  color: var(--color-accent);
+  background: color-mix(in srgb, var(--color-accent) 8%, transparent);
+  border-color: color-mix(in srgb, var(--color-accent) 18%, transparent);
+}
+.composer-bar-btn.compact.compacting svg {
+  opacity: 1;
 }
 /* 分支只读展示：secondary 色而非 tertiary，避免灰色看不见 */
 .composer-bar-branch {
@@ -8431,6 +8737,19 @@ body.is-composer-resizing .composer-resize-handle::after {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 目录建议项：文件夹图标 + 路径 label，与文件项对齐 */
+.command-palette-dir-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.command-palette-dir-label svg {
+  flex-shrink: 0;
+  color: var(--color-accent);
+}
+.command-palette-item.is-directory .command-palette-label {
+  color: var(--color-text-primary);
 }
 .command-palette-desc {
   flex: 1;
@@ -10517,41 +10836,17 @@ body.is-composer-resizing .composer-resize-handle::after {
   font-size: var(--font-size-caption);
   overflow: visible;
   flex-shrink: 0;
-}
-.session-status span {
-  display: inline-flex;
   align-items: center;
-  min-width: 0;
-  max-width: 180px;
-  height: 26px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  padding: 0 10px;
-  border: 1px solid var(--color-border-subtle);
-  border-radius: var(--radius-md);
-  font-family: var(--font-family-business);
-  line-height: var(--line-height-caption);
-  font-size: var(--font-size-caption);
-  font-variant-numeric: tabular-nums;
 }
-.session-status .ctx-chip {
-  max-width: none;
-  flex: 0 0 auto;
-  border-color: var(--color-border-subtle);
-}
-.session-status .cache-chip {
-  max-width: none;
-  flex: 0 0 auto;
-  border-color: var(--color-border-subtle);
-}
+/* chip 外观由 .ui-badge 提供；这里只做布局约束 */
+.session-status .ctx-chip,
+.session-status .cache-chip,
 .session-status .cost-chip {
   max-width: none;
   flex: 0 0 auto;
-  border-color: var(--color-border-subtle);
+}
+.session-status .cost-chip {
   font-weight: 600;
-  font-family: var(--font-family-business);
-  font-variant-numeric: tabular-nums;
 }
 
 /* Agent 状态徽章 */
@@ -11304,6 +11599,16 @@ body.is-composer-resizing .composer-resize-handle::after {
   border: 0;
   border-top: 1px solid var(--color-border-subtle);
 }
+/* SettingSwitch 已自带 border-bottom；其后的表单项只加间距，避免双线 */
+.setting-field--after-switch {
+  margin-top: var(--space-2);
+}
+/* SettingSwitch 后若仍需要分组，用无边框 spacer 代替 divider */
+.setting-spacer {
+  height: var(--space-2);
+  margin: 0;
+  border: 0;
+}
 .setting-field > span,
 .setting-field .ui-field-label {
   color: var(--color-text-secondary);
@@ -11658,6 +11963,11 @@ body.is-composer-resizing .composer-resize-handle::after {
   min-height: 44px;
   margin: 6px 0;
   padding: 0;
+}
+/* 分组小标题（插在 SettingSwitch 之间）：不再额外画线，依赖上一行 switch 的 border-bottom */
+.setting-row--section-label {
+  min-height: 0;
+  margin: 10px 0 2px;
 }
 .setting-row div {
   display: grid;
@@ -19588,6 +19898,12 @@ html[data-theme="dark"] .scratch-pad-md mark {
   border-bottom-right-radius: 0;
 }
 
+/* 折叠态：v3-braun 的选择器优先级高于通用 .list-collapsed 规则，
+   需显式隐藏 sidebar-body 避免文字残留可见。 */
+.list-collapsed .chat-list-pane.v3-braun .sidebar-body {
+  display: none !important;
+}
+
 .wechat-shell:not(.list-collapsed) .chat-list-pane.v3-braun {
   background: var(--color-bg-panel);
 }
@@ -19621,11 +19937,15 @@ html[data-theme="dark"] .scratch-pad-md mark {
 }
 
 .chat-list-pane.v3-braun .sidebar-body .brand-lockup {
-  gap: 14px;
+  gap: 10px;
   align-items: center;
-  /* 保留基础右移，侧栏场景不再清零 */
-  margin: 0 0 0 8px;
+  margin: 0;
   padding: 0;
+}
+
+.chat-list-pane.v3-braun .sidebar-body .brand-lockup .pi-logo-canvas-stage {
+  width: 28px;
+  height: 28px;
 }
 
 .chat-list-pane.v3-braun .sidebar-body .search-row {
@@ -19701,8 +20021,8 @@ html[data-theme="dark"] .scratch-pad-md mark {
   background: transparent;
   border: none;
   border-radius: 0;
-  border-bottom: 1px solid var(--color-border-subtle);
-  padding: var(--space-2) 0;
+  border-bottom: 0;
+  padding: var(--space-1) 0;
   margin-bottom: 0;
   box-shadow: none;
   transition: none;
@@ -19731,6 +20051,12 @@ html[data-theme="dark"] .scratch-pad-md mark {
 
 .chat-list-pane.v3-braun .sidebar-body .project-group.chat-project-group {
   padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--color-border-subtle);
+}
+
+/* 普通项目仅保留紧凑行距；聊天区仍单独保留分区留白。 */
+.chat-list-pane.v3-braun .sidebar-body .project-group:not(.chat-project-group) {
+  padding: 0;
 }
 
 .chat-list-pane.v3-braun
@@ -21205,4 +21531,34 @@ body.is-git-pane-resizing, body.is-git-pane-resizing * { cursor: row-resize !imp
   gap: var(--space-2);
   justify-content: flex-end;
   margin-top: var(--space-1);
+}
+
+/* ── Sonner Toast ──
+ * 去 richColors，中性背景 + 左侧色条区分类型，保持 shadcn 式的素雅。
+ * 图标更小、留白克制，不过度装饰。
+ */
+[data-sonner-toaster] {
+  font-family: var(--font-family-base);
+}
+
+[data-sonner-toaster] [data-close-button] {
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+[data-sonner-toaster] [data-sonner-toast]:hover [data-close-button] {
+  opacity: 0.5;
+}
+
+/* Toast 类型色图标：中性底色下用图标颜色区分类型 */
+[data-sonner-toaster] [data-sonner-toast][data-type="error"] [data-icon] {
+  color: var(--color-danger);
+}
+[data-sonner-toaster] [data-sonner-toast][data-type="warning"] [data-icon] {
+  color: var(--color-warning);
+}
+[data-sonner-toaster] [data-sonner-toast][data-type="success"] [data-icon] {
+  color: var(--color-accent);
+}
+[data-sonner-toaster] [data-sonner-toast][data-type="info"] [data-icon] {
+  color: var(--color-info);
 }

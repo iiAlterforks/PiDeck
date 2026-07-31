@@ -15,6 +15,7 @@ import {
 } from "react";
 import { toBlob } from "html-to-image";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import katex from "katex";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -93,8 +94,9 @@ import {
 	Trash,
 	Share,
 	SquarePen,
-	Send,
 	UserPen,
+	// 会话 fork：从该用户消息切出新会话（对应 pi /fork），忙碌时不展示。
+	GitFork,
 } from "lucide-react";
 import { getFileIconSeti, getFileIconColor, getFileTypeLabel } from "../../fileIcons";
 import { normalizeSessionPathForCompare } from "../../agentListDisplay";
@@ -102,6 +104,7 @@ import { t, type TranslationKey } from "../../i18n";
 import { showNotice } from "../../utils/notice";
 import { writeClipboard } from "../../utils/clipboard";
 import { filePathFromHref, stripFileLocation, toInternalFileHref } from "../../utils/fileLinks";
+import { Badge } from "../ui/Badge";
 import { Button } from "../ui/Button";
 import { CloseIconButton, IconButton } from "../ui/IconButton";
 import { Modal } from "../ui/Modal";
@@ -133,7 +136,7 @@ import type {
 	Project,
 	SessionSummary,
 } from "../../../../shared/types";
-import { parseRichInputChips, type RichInputChip } from "./RichInput";
+import { parseRichInputChips, unwrapFileChipPath, type RichInputChip } from "./RichInput";
 import removeMarkdown from "remove-markdown";
 /** 复用 petdex 标准网格规格，在主设置面板里为宠物选择器渲染单格动画预览 */
 import { GRID_COLS, CELL_W, CELL_H, MODE_ROW, MODE_FRAMES } from "../../pet/PetSpriteSheet";
@@ -508,10 +511,12 @@ export function SessionStatus(props: {
 }) {
 	const state = props.state;
 	if (!state) return null;
+	// 会话头部状态用轻量 Badge，与左右分栏/新会话按钮同一套素雅边框语言，
+	// 避免各 chip 自定义高度/圆角造成头部控件参差。
 	return (
 		<div className="session-status">
 			{state.contextPercent != null && (
-				<span className="ctx-chip">
+				<Badge variant="outline" badgeSize="sm" className="ctx-chip">
 					{t("app.ctx")}:{" "}
 					{state.contextPercent?.toFixed?.(1) ??
 						state.contextPercent}
@@ -522,10 +527,10 @@ export function SessionStatus(props: {
 					{state.outputTokens != null && (
 						<>{" "}↓ {formatCompact(state.outputTokens)}</>
 					)}
-				</span>
+				</Badge>
 			)}
 			{(state.cacheHitPercent != null || state.cacheTotal != null) && (
-				<span className="cache-chip">
+				<Badge variant="outline" badgeSize="sm" className="cache-chip">
 					{state.cacheHitPercent != null && (
 						<>{t("app.cacheHit")}: {state.cacheHitPercent?.toFixed?.(0) ?? state.cacheHitPercent}%</>
 					)}
@@ -533,12 +538,17 @@ export function SessionStatus(props: {
 					{state.cacheTotal != null && (
 						<>{t("app.cache")}: {formatCompact(state.cacheTotal)}</>
 					)}
-				</span>
+				</Badge>
 			)}
 			{state.cost != null && (
-				<span className="cost-chip" title={t("app.totalCost")}>
+				<Badge
+					variant="outline"
+					badgeSize="sm"
+					className="cost-chip"
+					title={t("app.totalCost")}
+				>
 					${state.cost.toFixed(3)}
-				</span>
+				</Badge>
 			)}
 		</div>
 	);
@@ -2128,73 +2138,119 @@ const statusLabel =
 				<div className="tool-card-content">
 					{isAskCard && askCard ? (
 						<div className="ask-question-card-tool-inner">
-							{/* 批量：问题与答案尽量同一行；任一侧过长时自动换行，不互相覆盖 */}
-							{Array.isArray(askCard.items) && askCard.items.length > 0 ? (
-								<div className="ask-question-card-batch-list">
-									{askCard.items.map((item, idx) => {
-										const answerText = formatAskAnswerText(item.answer, item.answerLabel);
-										return (
-											<div key={item.id ?? idx} className="ask-question-card-batch-item">
-												<span className="ask-question-card-batch-num" aria-hidden="true">
-													{idx + 1}
-												</span>
-												<div className="ask-question-card-batch-row">
-													<span className="ask-question-card-batch-q" title={item.question || item.id}>
-														{item.question || item.id}
+							{/*
+							 * 单问 / 批量统一成 Q→A 行卡。
+							 * 业务规则：批量 items 优先；单问（select/confirm/input/editor）
+							 * 也走同一布局，避免会话里两套视觉语言。
+							 */}
+							{(() => {
+								const rows =
+									Array.isArray(askCard.items) && askCard.items.length > 0
+										? askCard.items.map((item, idx) => ({
+												key: item.id ?? String(idx),
+												num: idx + 1,
+												question: item.question || item.id,
+												answered: Boolean(item.answered),
+												answerText: formatAskAnswerText(item.answer, item.answerLabel),
+										  }))
+										: [
+												{
+													key: "single",
+													num: 1,
+													question: askCard.question ?? "",
+													answered: Boolean(askCard.answered),
+													answerText: formatAskAnswerText(
+														askCard.answer,
+														askCard.answerLabel,
+													),
+												},
+										  ];
+								const isSingleSelect =
+									!(Array.isArray(askCard.items) && askCard.items.length > 0) &&
+									Array.isArray(askCard.options) &&
+									askCard.options.length > 0;
+
+								return (
+									<>
+										<div className="ask-question-card-batch-list">
+											{rows.map((row) => (
+												<div key={row.key} className="ask-question-card-batch-item">
+													<span className="ask-question-card-batch-num" aria-hidden="true">
+														{row.num}
 													</span>
-													<span className="ask-question-card-batch-sep" aria-hidden="true">
-														→
-													</span>
-													{item.answered ? (
-														<span className="ask-question-card-batch-a" title={answerText}>
-															{answerText}
+													<div className="ask-question-card-batch-row">
+														<span
+															className="ask-question-card-batch-q"
+															title={row.question}
+														>
+															{row.question}
 														</span>
-													) : (
-														<span className="ask-question-card-batch-a ask-question-card-batch-a--muted">
-															{askCard.cancelled ? t("ask.cancelled") : t("ask.unanswered")}
+														<span className="ask-question-card-batch-sep" aria-hidden="true">
+															→
 														</span>
-													)}
-												</div>
-											</div>
-										);
-									})}
-								</div>
-							) : (
-								<>
-									<div className="ask-question-card-title"><MessageCircle size={13} />{askCard.question}</div>
-									{askCard.options && askCard.options.length > 0 && (
-										<div className="ask-question-card-options-list">
-											{askCard.options.map((opt, i) => {
-												const optLabel = typeof opt === "string" ? opt : (opt as any).label ?? String((opt as any).value ?? "");
-												const optValue = typeof opt === "string" ? opt : String((opt as any).value ?? optLabel);
-												const desc = typeof opt === "object" && opt ? (opt as any).description : undefined;
-												const isSelected = Boolean(askCard.answered) && (optLabel === askCard.answerLabel || optValue === askCard.answer);
-												return (
-													<div key={i} className={`ask-question-card-option-item${isSelected ? " selected" : ""}`}>
-														<span className="ask-question-card-option-selector">{isSelected ? "✓" : ""}</span>
-														<div className="ask-question-card-option-text">
-															<span className="ask-question-card-option-label">{optLabel}</span>
-															{desc && <span className="ask-question-card-option-desc">{desc}</span>}
-														</div>
+														{row.answered ? (
+															<span
+																className="ask-question-card-batch-a"
+																title={row.answerText}
+															>
+																{row.answerText}
+															</span>
+														) : (
+															<span className="ask-question-card-batch-a ask-question-card-batch-a--muted">
+																{askCard.cancelled
+																	? t("ask.cancelled")
+																	: t("ask.unanswered")}
+															</span>
+														)}
 													</div>
-												);
-											})}
+												</div>
+											))}
 										</div>
-									)}
-									{askCard.answered ? (
-										<div className="ask-question-card-answered ask-question-card-answered--wrap">
-											<Check size={14} className="ask-question-card-answered-ok" />
-											<span className="ask-question-card-answer-text">
-												{formatAskAnswerText(askCard.answer, askCard.answerLabel)}
-											</span>
-										</div>
-									) : (
-										<div className="ask-question-card-answered" style={{ color: "var(--color-text-tertiary)" }}>
-											{t("ask.unanswered")}
-										</div>
-									)}
-								</>
-							)}
+										{/* 单问 select：折叠展示备选项，选中项轻量高亮，便于回看完整上下文 */}
+										{isSingleSelect && (
+											<div className="ask-question-card-options-list ask-question-card-options-list--compact">
+												{askCard.options!.map((opt, i) => {
+													const optLabel =
+														typeof opt === "string"
+															? opt
+															: ((opt as { label?: string }).label ??
+																String((opt as { value?: unknown }).value ?? ""));
+													const optValue =
+														typeof opt === "string"
+															? opt
+															: String(
+																	(opt as { value?: unknown }).value ?? optLabel,
+															  );
+													const desc =
+														typeof opt === "object" && opt
+															? (opt as { description?: string }).description
+															: undefined;
+													const isSelected =
+														Boolean(askCard.answered) &&
+														(optLabel === askCard.answerLabel ||
+															optValue === askCard.answer);
+													return (
+														<div
+															key={i}
+															className={`ask-question-card-option-item${isSelected ? " selected" : ""}`}
+														>
+															<span className="ask-question-card-option-selector" aria-hidden="true">
+																{isSelected ? <Check size={12} strokeWidth={2.4} /> : null}
+															</span>
+															<div className="ask-question-card-option-text">
+																<span className="ask-question-card-option-label">{optLabel}</span>
+																{desc ? (
+																	<span className="ask-question-card-option-desc">{desc}</span>
+																) : null}
+															</div>
+														</div>
+													);
+												})}
+											</div>
+										)}
+									</>
+								);
+							})()}
 						</div>
 					) : (
 						<pre className="tool-card-detail">{detailText}</pre>
@@ -2397,6 +2453,17 @@ export const AskQuestionCard = memo(function AskQuestionCard(props: {
 	};
 
 	const handleCancel = () => {
+		// 消息流内卡片取消也给 toast，与 composer 内联栏行为一致。
+		const method = String(uiRequest?.method ?? "input");
+		const cancelHint =
+			method === "confirm"
+				? t("ask.cancelConfirmHint")
+				: method === "input"
+					? t("ask.cancelInputHint")
+					: method === "editor"
+						? t("ask.cancelEditorHint")
+						: t("ask.cancelHint");
+		showNotice(cancelHint);
 		setCancelling(true);
 		props.onRespond?.({ cancelled: true });
 	};
@@ -2413,40 +2480,54 @@ export const AskQuestionCard = memo(function AskQuestionCard(props: {
 	const placeholder = String(uiRequest?.placeholder ?? "");
 	const options = uiRequest?.options as string[] | undefined;
 
+	// 时间线内 pending 单问：复用 ask-inline-bar 控件语言，与输入区单问/批量题卡一致。
 	return (
-		<article className="ask-question-card pending" data-message-id={props.message.id}>
-			<div className="ask-question-card-header">
+		<article className="ask-inline-bar ask-inline-bar--timeline" data-message-id={props.message.id}>
+			<div className="ask-inline-bar-header">
 				<MessageCircle size={14} />
-				<span className="ask-question-card-title">{title || t("ask.defaultTitle")}</span>
-				<span className="ask-question-card-status">{cancelling ? t("ask.cancelling") : t("ask.waiting")}</span>
+				<span>{title || t("ask.defaultTitle")}</span>
+				<span className="ask-inline-bar-cancel-hint">
+					{cancelling ? t("ask.cancelling") : t("ask.waiting")}
+				</span>
+				<button
+					className="ask-inline-bar-close"
+					onClick={handleCancel}
+					disabled={cancelling}
+					title={t("common.cancel")}
+					aria-label={t("common.cancel")}
+				>
+					<X size={14} />
+				</button>
 			</div>
-			<div className="ask-question-card-body">
+			<div className="ask-inline-bar-body">
 				{method === "select" && options && options.length > 0 && (
-					<div className="ask-question-card-options">
-						{/* 过滤掉 Pi 自带的 "✎ 自行输入..." 选项，用下方内联输入框替代 */}
-						{options.filter((opt) => !opt.startsWith("✎")).map((opt, i) => (
-							<button
-								key={i}
-								className="ask-question-card-option"
-								onClick={() => handleSelect(opt)}
-								disabled={cancelling}
-							>
-								{opt}
-							</button>
-						))}
+					<div className="ask-inline-bar-options">
+						{/* 过滤掉 Pi 自带的 "✎ 自行输入..." 选项，自定义输入由其它路径承接 */}
+						{options
+							.filter((opt) => !opt.startsWith("✎"))
+							.map((opt, i) => (
+								<button
+									key={i}
+									className="ask-inline-bar-option"
+									onClick={() => handleSelect(opt)}
+									disabled={cancelling}
+								>
+									<span className="ask-inline-bar-option-marker">{opt}</span>
+								</button>
+							))}
 					</div>
 				)}
 				{method === "confirm" && (
-					<div className="ask-question-card-options ask-question-card-options-confirm">
+					<div className="ask-inline-bar-options ask-inline-bar-options-confirm">
 						<button
-							className="ask-question-card-option ask-question-card-option-yes"
+							className="ask-inline-bar-option ask-inline-bar-option-yes"
 							onClick={() => handleConfirm(true)}
 							disabled={cancelling}
 						>
 							{t("common.true")}
 						</button>
 						<button
-							className="ask-question-card-option ask-question-card-option-no"
+							className="ask-inline-bar-option ask-inline-bar-option-no"
 							onClick={() => handleConfirm(false)}
 							disabled={cancelling}
 						>
@@ -2454,68 +2535,46 @@ export const AskQuestionCard = memo(function AskQuestionCard(props: {
 						</button>
 					</div>
 				)}
-				{method === "input" && (
-					<div className="ask-question-card-input-row">
-						<textarea
-							ref={inputRef}
-							className="ask-question-card-input"
-							placeholder={placeholder || t("ask.inputPlaceholder")}
-							value={inputValue}
-							onChange={(e) => setInputValue(e.target.value)}
-							onKeyDown={(e) => {
+				{(method === "input" || method === "editor") && (
+					<div
+						className={`ask-inline-bar-input-area${method === "editor" ? " ask-inline-bar-input-area--plan-revise" : ""}`}
+					>
+						{method === "editor" ? (
+							<textarea
+								ref={editorRef}
+								className="ask-inline-bar-input ask-inline-bar-textarea"
+								placeholder={placeholder || t("ask.editorPlaceholder")}
+								value={inputValue}
+								onChange={(e) => setInputValue(e.target.value)}
+								disabled={cancelling}
+								rows={3}
+							/>
+						) : (
+							<textarea
+								ref={inputRef}
+								className="ask-inline-bar-input ask-inline-bar-textarea"
+								placeholder={placeholder || t("ask.inputPlaceholder")}
+								value={inputValue}
+								onChange={(e) => setInputValue(e.target.value)}
+								onKeyDown={(e) => {
 								// 与主输入框一致：IME 确认候选词的回车不触发提交
-							if (getComposerEnterIntent(e, "enter-send") === "send") {
+								if (getComposerEnterIntent(e, "enter-send") === "send") {
 									e.preventDefault();
 									handleInputSubmit();
 								}
-							}}
-							disabled={cancelling}
-						/>
-						<button
-							className="ask-question-card-submit"
-							onClick={handleInputSubmit}
-							disabled={!inputValue.trim() || cancelling}
-							title={t("ask.submit")}
-						>
-							<Check size={14} />
-						</button>
-						<button
-							className="ask-question-card-cancel"
-							onClick={handleCancel}
-							disabled={cancelling}
-							title={t("common.cancel")}
-							aria-label={t("common.cancel")}
-						>
-							<X size={14} />
-						</button>
-					</div>
-				)}
-				{method === "editor" && (
-					<div className="ask-question-card-editor-area">
-						<textarea
-							ref={editorRef}
-							className="ask-question-card-editor"
-							placeholder={placeholder || t("ask.editorPlaceholder")}
-							value={inputValue}
-							onChange={(e) => setInputValue(e.target.value)}
-							disabled={cancelling}
-						/>
-						<div className="ask-question-card-editor-actions">
+								}}
+								disabled={cancelling}
+								rows={2}
+							/>
+						)}
+						<div className="ask-inline-bar-input-actions">
 							<button
-								className="ask-question-card-submit"
+								className="ask-inline-bar-submit-btn"
 								onClick={handleInputSubmit}
 								disabled={!inputValue.trim() || cancelling}
+								title={t("ask.submit")}
 							>
 								{t("ask.submit")}
-							</button>
-							<button
-								className="ask-question-card-cancel"
-								onClick={handleCancel}
-								disabled={cancelling}
-								title={t("common.cancel")}
-								aria-label={t("common.cancel")}
-							>
-								<X size={14} />
 							</button>
 						</div>
 					</div>
@@ -2618,16 +2677,18 @@ export const BatchAskInlineBar = memo(function BatchAskInlineBar(props: {
 
 	return (
 		<div className="ask-inline-bar ask-inline-bar--batch">
-			{/* 标题行：进度 + 关闭 */}
+			{/* 标题行：进度 + 取消提示 + 关闭 */}
 			<div className="ask-inline-bar-header">
 				<MessageCircle size={14} />
 				<span>{uiRequest.title || t("ask.batchTitle", { count: String(totalQ) })}</span>
 				<span className="ask-inline-bar-batch-progress">
 					{t("ask.batchProgress", { done: String(answeredCount), total: String(totalQ) })}
 				</span>
+				<span className="ask-inline-bar-cancel-hint">{t("ask.cancelBatchHint")}</span>
 				<button
 					className="ask-inline-bar-close"
 					onClick={props.onCancel}
+					title={t("ask.cancelBatchHint")}
 					aria-label={t("common.cancel")}
 				>
 					<X size={14} />
@@ -3149,7 +3210,6 @@ export const TurnRow = memo(function TurnRow(props: {
 	onOpenExternal: (url: string) => void;
 	onOpenFile?: (path: string) => void;
 	onDiffFile?: DiffFileHandler;
-	onResendUserMessage?: (message: ChatMessage) => void;
 	onDeleteMessage?: (messageId: string) => void;
 	onEditMessage?: (messageId: string, newText: string) => void;
 	/** Agent 正在处理请求或流式输出中时禁用编辑/删除等操作按钮 */
@@ -3573,19 +3633,23 @@ export const UserBubble = memo(function UserBubble(props: {
 	message: ChatMessage;
 	onPreviewImage: (image: ImageContent) => void;
 	onOpenFile?: (path: string) => void;
-	onResendUserMessage?: (message: ChatMessage) => void;
 	onEditMessage?: (messageId: string, newText: string) => void;
 	onDeleteMessage?: (messageId: string) => void;
-	/** 附件（中止/失败）可重发时显示重发按钮 */
-	showResendButton?: boolean;
+	/** 从该用户消息 fork 新会话；需 message.meta.entryId，忙碌时不展示入口 */
+	onForkMessage?: (message: ChatMessage) => void;
 	validCommandNames?: Set<string>;
 	validFilePaths?: Set<string>;
 	/** Agent 正在处理请求或流式输出中时禁用编辑/删除等操作按钮 */
 	agentRunning?: boolean;
+	/** fork 进行中：仅当前消息禁用按钮，避免连点重复 fork */
+	forking?: boolean;
 	/** 打开多选分享弹框 */
 	onEnterMultiSelect?: () => void;
 }) {
 	const { message } = props;
+	// 空闲时始终展示 fork 入口；entryId 解析放到点击时做（meta 缺失时会走 getForkMessages 回退）。
+	// 忙碌中与编辑/删除一致隐藏，避免半完成回合上 fork。
+	const canFork = Boolean(props.onForkMessage) && !props.agentRunning;
 	const rowRef = useRef<HTMLElement | null>(null);
 	const [editing, setEditing] = useState(false);
 	const [editText, setEditText] = useState("");
@@ -3710,6 +3774,18 @@ export const UserBubble = memo(function UserBubble(props: {
 						</button>
 				{!editing && !props.agentRunning && (
 					<>
+						{canFork && (
+							<button
+								type="button"
+								className="user-turn-action-btn"
+								disabled={props.forking}
+								onClick={() => props.onForkMessage?.(message)}
+								title={t("app.forkFromMessageTitle")}
+								aria-label={t("app.forkFromMessage")}
+							>
+								<GitFork size={14} strokeWidth={1.8} aria-hidden="true" />
+							</button>
+						)}
 						<button className="user-turn-action-btn" onClick={() => {
 							setEditText(cleanText);
 							setEditing(true);
@@ -3718,7 +3794,7 @@ export const UserBubble = memo(function UserBubble(props: {
 						</button>
 						<button
 							className="user-turn-action-btn"
-							onClick={handleEditAndResend}
+					onClick={handleEditAndResend}
 							title={t("app.editAndResendTitle")}
 						>
 							<UserPen size={14} />
@@ -3730,15 +3806,7 @@ export const UserBubble = memo(function UserBubble(props: {
 						>
 							<Trash size={14} />
 						</button>
-						{props.showResendButton && (
-							<button
-								className="user-turn-action-btn"
-								onClick={() => props.onResendUserMessage?.(message)}
-								title={t("app.resendTitle")}
-							>
-								<Send size={14} />
-							</button>
-						)}
+
 					</>
 				)}
 			</div>
@@ -3746,8 +3814,8 @@ export const UserBubble = memo(function UserBubble(props: {
 	);
 }, (previous, next) =>
 	sameChatMessageForRender(previous.message, next.message) &&
-	previous.showResendButton === next.showResendButton &&
 	previous.agentRunning === next.agentRunning &&
+	previous.forking === next.forking &&
 	previous.validCommandNames === next.validCommandNames &&
 	previous.validFilePaths === next.validFilePaths,
 );
@@ -3925,7 +3993,7 @@ function renderChipText(text: string, onOpenFile?: (path: string) => void, valid
 				data-type={chip.kind}
 				data-raw={chip.raw}
 				title={chip.raw}
-				onClick={clickable ? () => onOpenFile(chip.raw.slice(1)) : undefined}
+				onClick={clickable ? () => onOpenFile(unwrapFileChipPath(chip.raw)) : undefined}
 			>
 				<span className="input-chip__icon">
 					{chip.kind === "file" ? "@" : "/"}
@@ -3978,8 +4046,13 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
 	const languageClass = codeProps?.className ?? "";
 	const text = extractText(codeProps?.children ?? props.children);
 	const [copied, setCopied] = useState(false);
+	// mermaid / latex 围栏都走专用渲染，避免把图表或公式当普通代码块展示。
 	if (/\blanguage-mermaid\b/i.test(languageClass)) {
 		return <MermaidDiagram chart={text} />;
+	}
+	// 模型常输出 ```latex / ```tex / ```math 而不是 $...$，这里补齐 KaTeX 渲染路径。
+	if (/\blanguage-(?:latex|tex|math)\b/i.test(languageClass)) {
+		return <LatexBlock source={text} />;
 	}
 	const handleCopy = () => {
 		writeClipboard(text);
@@ -3997,6 +4070,70 @@ function CodeBlock(props: React.HTMLAttributes<HTMLPreElement>) {
 				{copied ? <Check size={14} /> : <Copy size={14} />}
 			</button>
 			<pre {...props}>{props.children}</pre>
+		</div>
+	);
+}
+
+/**
+ * 将 ```latex / ```tex / ```math 代码围栏渲染为 KaTeX 公式。
+ * 与 remark-math 的 $...$ / $$...$$ 路径互补：模型更常输出 language fence。
+ * 渲染失败时回退到源码展示，避免整条消息白屏。
+ */
+function LatexBlock(props: { source: string }) {
+	const [copied, setCopied] = useState(false);
+	const source = props.source.trim();
+	const rendered = useMemo(() => {
+		if (!source) return { html: "", error: null as string | null };
+		try {
+			// displayMode + throwOnError:false：多行方程块也能尽量渲染；错误以 katex-error span 呈现。
+			const html = katex.renderToString(source, {
+				displayMode: true,
+				throwOnError: false,
+				strict: "ignore",
+				trust: false,
+			});
+			return { html, error: null as string | null };
+		} catch (err) {
+			return {
+				html: "",
+				error: err instanceof Error ? err.message : String(err),
+			};
+		}
+	}, [source]);
+
+	const handleCopy = () => {
+		// 复制为可再次粘贴的 $$...$$ 块，兼容 remark-math 与编辑器粘贴。
+		const texContent = source.includes("\n") ? `$$\n${source}\n$$` : `$$${source}$$`;
+		void writeClipboard(texContent);
+		setCopied(true);
+		showNotice(t("app.latexCopied"), 1200);
+		setTimeout(() => setCopied(false), 1800);
+	};
+
+	if (rendered.error || !rendered.html) {
+		return (
+			<div className="code-block-wrap latex-block latex-block--fallback">
+				<button className="code-copy" type="button" onClick={handleCopy} title={t("common.copy")}>
+					{copied ? <Check size={14} /> : <Copy size={14} />}
+				</button>
+				{rendered.error && (
+					<small className="latex-block-error">{rendered.error}</small>
+				)}
+				<pre><code className="language-latex">{source}</code></pre>
+			</div>
+		);
+	}
+
+	return (
+		<div className="code-block-wrap latex-block">
+			<button className="code-copy" type="button" onClick={handleCopy} title={t("common.copy")}>
+				{copied ? <Check size={14} /> : <Copy size={14} />}
+			</button>
+			{/* KaTeX 输出已消毒（trust:false），dangerouslySetInnerHTML 仅用于插入渲染结果 */}
+			<div
+				className="latex-block-content"
+				dangerouslySetInnerHTML={{ __html: rendered.html }}
+			/>
 		</div>
 	);
 }
@@ -4113,10 +4250,22 @@ function MarkdownLink(
 		if (!props.href) return;
 
 		if (filePath !== null) {
+			// 本地文件链接不受 linkOpenMode 影响，始终走 onOpenFile。
 			if (onOpenFile) void onOpenFile(stripFileLocation(filePath));
-		} else {
-			void onOpenExternal(props.href);
+			return;
 		}
+
+		// 仅 http(s) 外链：Ctrl/Cmd+点击强制系统浏览器；普通点击仍跟 linkOpenMode。
+		// 不扩散到非链接控件，避免误伤按钮/chip 等交互。
+		const forceSystem = e.ctrlKey || e.metaKey;
+		if (forceSystem && (props.href.startsWith("http:") || props.href.startsWith("https:"))) {
+			const open = window.piDesktop?.app?.openExternal;
+			if (open) {
+				void open(props.href, true);
+				return;
+			}
+		}
+		void onOpenExternal(props.href);
 	};
 	const handleContextMenu = (e: React.MouseEvent<HTMLAnchorElement>) => {
 		if (filePath === null) return;
@@ -5945,8 +6094,8 @@ export function PromptSuggestions(props: {
 			<div className="command-palette-list" ref={listRef}>
 				{props.items.map((item, index) => {
 				const indent = item.treeDepth != null ? `${item.treeDepth * 20}px` : "0px";
-				if (item.disabled) {
-					// 目录树节点：缩进 + 文件夹图标，选中时加高亮背景
+			if (item.disabled) {
+					// 不可选分组头（保留兼容）；目录本身已改为可选建议项
 					return (
 						<div
 							key={item.key}
@@ -5962,12 +6111,19 @@ export function PromptSuggestions(props: {
 				return (
 					<button
 						key={item.key}
-						className={`command-palette-item${index === props.selectedIndex ? " selected" : ""}`}
+						className={`command-palette-item${item.isDirectory ? " is-directory" : ""}${index === props.selectedIndex ? " selected" : ""}`}
 						style={{ paddingLeft: `calc(12px + ${indent})` }}
 						onMouseEnter={() => props.onSelectedIndexChange(index)}
 						onClick={() => props.onPick(item.value)}
 					>
-						<span className="command-palette-label">{item.label}</span>
+						{item.isDirectory ? (
+							<span className="command-palette-label command-palette-dir-label">
+								<Folder size={13} strokeWidth={1.8} aria-hidden="true" />
+								{item.label}
+							</span>
+						) : (
+							<span className="command-palette-label">{item.label}</span>
+						)}
 						<span className="command-palette-desc">{item.description}</span>
 					</button>
 				);
@@ -6657,6 +6813,31 @@ export function SettingsModal(props: {
 										}
 									/>
 									<SettingSwitch
+										title={t("settings.singleInstance")}
+										description={t("settings.singleInstanceDesc")}
+										checked={props.settings.singleInstance}
+										onChange={(checked) =>
+											props.onChange({ singleInstance: checked })
+										}
+									/>
+									<SelectField
+										className="setting-field"
+										label={t("settings.startupWindowMode")}
+										value={props.settings.startupWindowMode}
+										options={[
+											{ value: "maximized", label: t("settings.startupWindow.maximized") },
+											{ value: "normal-large", label: t("settings.startupWindow.large") },
+											{ value: "normal-medium", label: t("settings.startupWindow.medium") },
+											{ value: "normal-compact", label: t("settings.startupWindow.compact") },
+											{ value: "fullscreen", label: t("settings.startupWindow.fullscreen") },
+										]}
+										onChange={(value) =>
+											props.onChange({
+												startupWindowMode: value as AppSettings["startupWindowMode"],
+											})
+										}
+									/>
+									<SettingSwitch
 										title={t("settings.enableNotifications")}
 										checked={props.settings.enableNotifications}
 										onChange={(checked) =>
@@ -6709,16 +6890,6 @@ export function SettingsModal(props: {
 											const mb = Math.max(1, parseInt(value) || 5);
 											props.onChange({ maxEditorFileSizeMB: mb });
 										}}
-									/>
-								</SettingsSection>
-								<SettingsSection title={t("settings.privacy")}>
-									<SettingSwitch
-										title={t("settings.telemetry")}
-										description={t("settings.telemetryDesc")}
-										checked={props.settings.telemetryEnabled}
-										onChange={(checked) =>
-											props.onChange({ telemetryEnabled: checked })
-										}
 									/>
 								</SettingsSection>
 							</>
@@ -6968,6 +7139,40 @@ export function SettingsModal(props: {
 									onChange={(checked) =>
 										props.onChange({ disableUpdateCheck: checked })
 									}
+								/>
+								{/* Electron Chromium 沙箱：与 pi Agent 无关，改完需整应用重启。 */}
+								<SettingSwitch
+									title={t("settings.electronSandbox")}
+									description={t("settings.electronSandboxDesc")}
+									checked={props.settings.electronChromiumSandbox}
+									onChange={(checked) =>
+										props.onChange({ electronChromiumSandbox: checked })
+									}
+								/>
+								{/* 不要再插 setting-divider：SettingSwitch 已有 border-bottom，叠 divider 会双线。 */}
+								<div className="setting-row setting-row--section-label">
+									<div>
+										<strong>{t("settings.piRpcStartup")}</strong>
+										<small>{t("settings.piRpcStartupDesc")}</small>
+									</div>
+								</div>
+								<SettingSwitch
+									title={t("settings.piRpcOffline")}
+									description={t("settings.piRpcOfflineDesc")}
+									checked={props.settings.piRpcOffline}
+									onChange={(checked) => props.onChange({ piRpcOffline: checked })}
+								/>
+								<SettingSwitch
+									title={t("settings.piRpcNoExtensions")}
+									description={t("settings.piRpcNoExtensionsDesc")}
+									checked={props.settings.piRpcNoExtensions}
+									onChange={(checked) => props.onChange({ piRpcNoExtensions: checked })}
+								/>
+								<SettingSwitch
+									title={t("settings.piRpcNoSkills")}
+									description={t("settings.piRpcNoSkillsDesc")}
+									checked={props.settings.piRpcNoSkills}
+									onChange={(checked) => props.onChange({ piRpcNoSkills: checked })}
 								/>
 								<div className="setting-row">
 										<div>

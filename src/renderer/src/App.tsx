@@ -23,7 +23,6 @@ import {
   ChevronDown,
   Code,
   MessageCircle,
-  PanelLeftClose,
   Search,
   Play,
   Plus,
@@ -50,6 +49,8 @@ import {
   X,
   PanelLeft,
   PanelRight,
+  // 上下文压缩：用 FoldVertical 表达“折叠上下文”，比 Shrink 更克制、不抢模型名视线。
+  FoldVertical,
 } from "lucide-react";
 import { showNotice } from "./utils/notice";
 import { createPreviewApi } from "./previewApi";
@@ -60,7 +61,7 @@ import { TrustConfirmModal } from "./components/app/TrustConfirmModal";
 import { TerminalDock } from "./components/terminal/TerminalDock";
 import { FeishuLinkIndicator } from "./components/feishu/FeishuLinkIndicator";
 import { useFeishuBridge } from "./hooks/useFeishuBridge";
-import { CloseIconButton } from "./components/ui/IconButton";
+import { CloseIconButton, IconButton } from "./components/ui/IconButton";
 import { writeClipboard } from "./utils/clipboard";
 import { Toaster } from "./components/ui/sonner";
 import { THINKING_LEVELS } from "./components/app/AppParts";
@@ -68,7 +69,10 @@ import {
   buildComposerPromptSubmission,
   expandPromptTemplates,
   getComposerEnterIntent,
+  getComposerHistoryLineBounds,
+  isYesNoConfirmOptions,
   parseArgumentHint,
+  resolveComposerHistoryDraft,
   translateBuiltinPromptDescription,
 } from "./composerBehavior";
 import {
@@ -77,7 +81,7 @@ import {
   isSameSessionPath,
   isSidebarSessionRowActive,
 } from "./agentListDisplay";
-import { resolveLocale, setI18nLocale, t } from "./i18n";
+import { resolveLocale, setI18nLocale, t, type TranslationKey } from "./i18n";
 import { mergeAgentRuntimeState } from "./utils/agentRuntimeState";
 import { sameSessionSummaryList } from "./utils/sessionSummaryList";
 import {
@@ -126,7 +130,6 @@ import {
   ImagePreviewModal,
   BrandLockup,
   AgentStatusIndicator,
-  LogoMark,
   ModelPicker,
   PromptTemplatePicker,
   ProjectAvatar,
@@ -174,10 +177,12 @@ import {
   type MessageItem,
 } from "./components/app/AppUtils";
 import {
+	formatFilePathRef,
 	getCaretOffset as getCaretOffsetOf,
 	getRichInputCaretCoords,
 	parseRichInputChips,
 	RichInput,
+	unwrapFileChipPath,
 	type RichInputChip,
 } from "./components/app/RichInput";
 // 懒加载：Monaco Editor（~17.6MB Web Worker）仅在用户打开 diff 时才加载
@@ -546,8 +551,16 @@ export function App() {
   if (missingElectronPreload) {
     return (
       <div className="boot-screen root-loading">
-        <div className="boot-logo root-loading-logo">
-          <LogoMark />
+        {/* 与 EmptyState / index.html 启动标同一 path，避免 LogoMark 再套一层不同底色 */}
+        <div className="boot-logo root-loading-logo" aria-hidden="true">
+          <svg viewBox="140 140 520 520" width="48" height="48">
+            <path
+              fill="#fff"
+              fillRule="evenodd"
+              d="M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65Z"
+            />
+            <path fill="#fff" d="M517.36 400H634.72V634.72H517.36Z" />
+          </svg>
         </div>
         <strong>PiDeck</strong>
         <span>{t("app.preloadMissing")}</span>
@@ -651,6 +664,8 @@ export function App() {
   const [composerBangMode, setComposerBangMode] = useState<"none" | "bang" | "bang-bang">("none");
   /** 当前正在重启的 Agent，用于仅给对应会话显示 loading，避免切到其他 Agent 后仍被全局禁用。 */
   const [restartingAgentId, setRestartingAgentId] = useState<string | null>(null);
+  /** 正在 fork 的用户消息 id；用于按钮 loading，避免连点重复 fork。 */
+  const [forkingMessageId, setForkingMessageId] = useState<string | null>(null);
   /** 用户点击 ask_question 取消/abort 后的过渡标记，立即隐藏运行指示器。 */
   const [cancellingUi, setCancellingUi] = useState(false);
   const [attachedImagesByAgent, setAttachedImagesByAgent] = useState<
@@ -1278,14 +1293,18 @@ export function App() {
     theme: "system",
     lightBackground: "white",
     language: "system",
+    startupWindowMode: "maximized",
     piEnvironmentChecked: false,
     enableGitManagement: true,
     gitCommitMessagePrompt: "",
     closeToTray: true,
+    singleInstance: true,
     enableNotifications: true,
     // showThinking 由 pi agent 的 hideThinkingBlock 控制，启动后从主进程加载的真实值会覆盖此处
     showThinking: true,
     showDevTools: false,
+    // Electron Chromium 沙箱默认关，与主进程历史兼容策略一致
+    electronChromiumSandbox: false,
     piProxyEnabled: false,
     piProxyUrl: "http://127.0.0.1:7890",
     piProxyBypass: "localhost,127.0.0.1,::1",
@@ -1296,8 +1315,7 @@ export function App() {
     wslEnabled: false,
     wslDistro: "Ubuntu",
     wslUser: "root",
-    telemetryEnabled: true,
-    webServiceEnabled: false,
+		webServiceEnabled: false,
     webServiceHost: "0.0.0.0",
     webServicePort: 8765,
     rpcTimeout: 600_000,
@@ -1327,6 +1345,9 @@ export function App() {
     fontFamilyMonoCustom: "",
     removedBuiltInExtensions: [],
     disableUpdateCheck: false,
+    piRpcOffline: true,
+    piRpcNoExtensions: false,
+    piRpcNoSkills: false,
   });
   /* settingsNotice 已改用 showToast (app-notice) 实现 */
   const [piProxyNotice, setPiProxyNotice] = useState("");
@@ -1812,36 +1833,6 @@ export function App() {
   }, [activeMessages, renderedRuns]);
 
 
-  /**
-   * 判断用户消息是否可重发：仅当该消息为最后一条用户消息，且其后的 assistant 响应
-   * 被中止（系统提示）或执行失败（error 消息）时才显示重发按钮。
-   * 正常完成的 assistant 响应不应触发重发。
-   */
-  const resendableMessageIds = useMemo(() => {
-    const ids = new Set<string>();
-    for (let i = activeMessages.length - 1; i >= 0; i--) {
-      const msg = activeMessages[i];
-      if (msg.role !== "user") continue;
-      // 从最后一条用户消息开始，检查其后最近的消息状态
-      let hasAbortOrError = false;
-      for (let j = i + 1; j < activeMessages.length; j++) {
-        const next = activeMessages[j];
-        if (next.role === "user") break; // 下一条用户消息，不属本轮
-        if (next.role === "error") { hasAbortOrError = true; break; }
-        if (next.role === "system") {
-          const meta = next.meta as Record<string, unknown> | undefined;
-          if (meta?.i18nKey === "app.abortRequested") { hasAbortOrError = true; break; }
-        }
-        if (next.role === "assistant" && next.text?.trim()) {
-          // 存在正常的 assistant 回复 → 不显示重发
-          break;
-        }
-      }
-      if (hasAbortOrError) ids.add(msg.id);
-      break; // 只检查最后一条用户消息
-    }
-    return ids;
-  }, [activeMessages]);
 
   // 从 activeUiRequest 提取正在进行的交互式请求（select/confirm/input/editor/batch_ask）
   // 这是 ask_question 在 pi RPC 模式下的表现方式：pi 通过 extension_ui_request 将
@@ -2438,6 +2429,14 @@ export function App() {
         [payload.agentId]: payload.thinking,
       })),
     );
+    // 主进程瞬时状态反馈（如 abort 已请求停止）走 toast，不进会话时间线
+    const offNotice = api.agents.onNotice((payload) => {
+      const text =
+        payload.i18nKey
+          ? t(payload.i18nKey as TranslationKey)
+          : payload.message;
+      showNotice(text, payload.duration ?? 2500, payload.kind ?? "info");
+    });
     // 监听 Extension UI 请求：对话类渲染为提问卡片；setWidget 类作为 composer 上方的轻量状态块展示。
     const offUiRequest = api.agents.onUiRequest((request) => {
       if (request.method === "notify") {
@@ -2495,22 +2494,36 @@ export function App() {
       }
 
       setActiveUiRequest((current) => {
-        // 如果 requestId 已存在且带了 completed 标记，清除该请求
-        if (current?.[request.requestId] && request.completed) {
+        // completed 事件：只删对应 requestId；其它 pending 请求保留。
+        if (request.completed) {
+          if (!current?.[request.requestId]) return current;
           const next = { ...current };
           delete next[request.requestId];
           if (Object.keys(next).length === 0) return null;
           return next;
         }
-        /* 用户通过 select 弹框自定义输入框提交自定义值后，Pi 会收到 "✎ 自行输入..."
-           选项值并发送 input 弹框让用户输入。此处检测到 pending 值后自动提交 input
-           弹框，对用户表现为一次提交即完成，无需二次输入。 */
+
+        /*
+         * select 自定义输入两步协议：
+         * 1) 用户在桌面端自定义框提交文本 → 先回 "✎ 自行输入..." 给扩展
+         * 2) 扩展再发 input UI 请求收集正文
+         * 这里检测到 pending 自定义文本时，立刻把真实值回给第二步 input，
+         * 不弹二次输入框。若 agentId 丢失则丢弃 pending，避免挂死。
+         */
         if (request.method === "input" && pendingCustomInputRef.current) {
           const value = pendingCustomInputRef.current;
           pendingCustomInputRef.current = "";
-          api.agents.sendUiResponse(activeAgentIdRef.current ?? "", request.requestId, { value });
-          return current; // 不显示 input 弹框
+          const targetAgentId = request.agentId || activeAgentIdRef.current;
+          if (targetAgentId) {
+            // 异步回填，避免在 setState updater 里直接做副作用
+            queueMicrotask(() => {
+              api.agents.sendUiResponse(targetAgentId, request.requestId, { value });
+            });
+          }
+          // 不把这个 input 请求放进 activeUiRequest，用户侧保持「一次提交」
+          return current;
         }
+
         // 新增或更新 UI 请求
         return { ...(current ?? {}), [request.requestId]: request as UiRequest };
       });
@@ -2574,6 +2587,7 @@ export function App() {
       offOpenInBrowser?.();
       offRuntimeState();
       offThinking();
+      offNotice();
       offUiRequest();
       offTrustRequest();
       offRpcLog();
@@ -3607,7 +3621,27 @@ export function App() {
 
   function openFilePath(path: string) {
     // 绝对路径直接打开;相对路径按当前 agent cwd / 项目目录解析。
-    const resolvedPath = resolveFileLinkPath(path, activeAgent?.cwd ?? activeProject?.path);
+    // unwrapFileChipPath 已剥尾斜杠；这里再兜底一次，兼容消息里手写的 src/
+    const cleanedPath = path.replace(/[/\\]+$/, "");
+    const resolvedPath = resolveFileLinkPath(cleanedPath, activeAgent?.cwd ?? activeProject?.path);
+    // 目录引用：在资源管理器中定位，避免被 isTextFile 误当成无扩展名文本文件打开。
+    const normalizedInput = cleanedPath.replace(/\\/g, "/");
+    const normalizedResolved = resolvedPath.replace(/\\/g, "/");
+    const isDirectoryRef = flatFiles.some(
+      (node) =>
+        node.type === "directory" &&
+        (node.path === resolvedPath ||
+          node.relativePath === normalizedInput ||
+          node.relativePath === normalizedResolved),
+    );
+    if (isDirectoryRef) {
+      void api.files.showInFolder(resolvedPath).catch((error) => {
+        showToast(t("app.openFileFailed", {
+          error: error instanceof Error ? error.message : String(error),
+        }));
+      });
+      return;
+    }
     // 文本文件→内置编辑器；二进制→系统默认应用。
     if (isTextFile(resolvedPath)) {
       viewFilePath(resolvedPath);
@@ -4647,13 +4681,31 @@ export function App() {
 
   async function compactAgent(compactPrompt?: string, agentId = activeAgentId) {
     if (!agentId || isPendingAgentId(agentId)) return;
+    // 按 agent 维度锁 compacting：避免全局 boolean 在切换会话时错绑状态，
+    // 也保证 /compact 与底栏按钮走同一条路径、同一套 busy/toast 语义。
     setCompacting(true);
     try {
       const state = await api.agents.compact(agentId, compactPrompt);
       applyAgentRuntimeState(agentId, state);
       showToast(t("app.compactDone"));
     } catch (e) {
-      showToast(t("app.compactFailed"));
+      // 主进程会把 pi 的可读错误（Already compacted / session too small / 鉴权失败）原样抛出。
+      // 对“会话太小”类错误做友好文案，避免把 IPC 包装层一起甩给用户。
+      const raw = e instanceof Error ? e.message.trim() : String(e ?? "").trim();
+      const detail = raw
+        .replace(/^Error invoking remote method ['"][^'"]+['"]:\s*/i, "")
+        .replace(/^Error:\s*/i, "")
+        .trim();
+      const lower = detail.toLowerCase();
+      const friendly =
+        /nothing to compact|already compacted/i.test(lower)
+          ? t("app.compactNothingToDo")
+          : /session too small|too small/i.test(lower)
+            ? t("app.compactSessionTooSmall")
+            : detail
+              ? t("app.compactFailedWithReason", { error: detail })
+              : t("app.compactFailed");
+      showToast(friendly, 6500);
     } finally {
       setCompacting(false);
     }
@@ -4668,11 +4720,18 @@ export function App() {
 
   async function abortAgent(agentId = activeAgentId) {
     if (!agentId || isPendingAgentId(agentId)) return;
-    // 立即清除流式状态，让思考气泡和 loading 立刻消失，不等后端 RPC 返回
+    // 立即清除流式状态与本地 thinking 缓存，让思考气泡和 loading 立刻消失，不等后端 RPC 返回。
+    // 若不先清 streamingThinking，后端残留 delta 被拦截前 UI 仍会继续显示旧思考。
     const previous = runtimeStateByAgentRef.current[agentId];
     if (previous) {
       applyAgentRuntimeState(agentId, { ...previous, isStreaming: false });
     }
+    setStreamingThinking((current) => {
+      if (!(agentId in current)) return current;
+      const next = { ...current };
+      delete next[agentId];
+      return next;
+    });
     await api.agents.abort(agentId);
     // 不调用 refreshRuntimeState：AgentManager.abort() 会通过 emitState 推送正确状态，
     // 避免后端 get_state 返回过时的 isStreaming: true 覆盖前端立刻设的 false。
@@ -4986,13 +5045,21 @@ export function App() {
       }
     }
 
-    // 历史命令导航:只在光标位于第一行时生效
+    // 历史命令导航：只在光标位于第一行/最后一行时生效。
+    // 普通输入只更新 livePromptByAgentRef、不触发 App 重渲染，因此这里必须读 live 草稿，
+    // 不能用闭包里的 prompt——否则 ArrowUp 会把“上次重渲染时的半截文本”当草稿保存，
+    // ArrowDown 恢复后就会丢掉中间继续输入的内容。
     const editor = event.currentTarget;
     const cursorPos = getCaretOffsetOf(editor);
-    const textBeforeCursor = prompt.substring(0, cursorPos);
-    const isFirstLine = !textBeforeCursor.includes('\n');
-    const textAfterCursor = prompt.substring(cursorPos);
-    const isLastLine = !textAfterCursor.includes('\n');
+    const liveComposerDraft = resolveComposerHistoryDraft({
+      activeAgentId: activeAgentIdRef.current,
+      livePromptByAgent: livePromptByAgentRef.current,
+      renderedPrompt: prompt,
+    });
+    const { isFirstLine, isLastLine } = getComposerHistoryLineBounds(
+      liveComposerDraft,
+      cursorPos,
+    );
 
     // 当前 Agent 的历史记录
     const agentHistory = promptHistoryRef.current[activeAgentIdRef.current ?? ''] ?? [];
@@ -5000,9 +5067,9 @@ export function App() {
     if (event.key === "ArrowUp" && isFirstLine && agentHistory.length > 0) {
       event.preventDefault();
 
-      // 首次导航时保存当前输入
+      // 首次导航时保存当前 live 草稿（不是可能过期的 rendered prompt）
       if (!historyNavigating) {
-        setSavedPrompt(prompt);
+        setSavedPrompt(liveComposerDraft);
         setHistoryNavigating(true);
         const newIndex = 0;
         setHistoryIndex(newIndex);
@@ -5046,9 +5113,11 @@ export function App() {
     if (event.key === "Escape") {
       const el = event.currentTarget;
       const cursor = getCaretOffsetOf(el);
-      const liveComposerPrompt = activeAgentIdRef.current
-        ? (livePromptByAgentRef.current[activeAgentIdRef.current] ?? prompt)
-        : prompt;
+      const liveComposerPrompt = resolveComposerHistoryDraft({
+        activeAgentId: activeAgentIdRef.current,
+        livePromptByAgent: livePromptByAgentRef.current,
+        renderedPrompt: prompt,
+      });
       const result = clearSuggestionTrigger(liveComposerPrompt, cursor);
       setPrompt(result.text);
       setComposerCursor(result.cursor);
@@ -5073,9 +5142,13 @@ export function App() {
 
   const isAgentStarting = activeAgent?.status === "starting";
   const composerDisabled = !activeAgent || isAgentStarting;
+  // isCompacting / 本地 compacting 也算 busy：压缩期间禁止再发消息，并显示停止区语义。
   const isAgentBusy = Boolean(
     activeAgent &&
-    (activeAgent.status === "running" || activeRuntimeState?.isStreaming),
+    (activeAgent.status === "running" ||
+      activeRuntimeState?.isStreaming ||
+      activeRuntimeState?.isCompacting ||
+      compacting),
   );
   // hasComposerContent 合并文本状态（hasComposerText，仅在空↔非空翻转时触发重渲染）
   // 与图片附件；images 本身已是 state 变化即触发重渲染。
@@ -5214,12 +5287,16 @@ export function App() {
     // 已删除内置 /goal 拦截，命令直接发给 agent。
 
     // ── /compact 命令处理 ──
-    if (/^\/compact(?:\s|$)/.test(trimmedMessage)) {
-      const compactPrompt = trimmedMessage.replace(/^\/compact\s*/, "").trim();
-      // /compact 是桌面端内置控制命令，必须走 RPC compact 通道；否则会被当作普通消息发送给 agent。
+    // 与底栏“压缩”按钮同一实现：走 agents.compact RPC，而不是把 /compact 当普通 prompt 发给模型。
+    if (/^\/compact(?:\s|$)/i.test(trimmedMessage)) {
+      const compactPrompt = trimmedMessage.replace(/^\/compact\s*/i, "").trim();
       setPromptForAgent(targetAgentId, "");
       setAttachedImagesForAgent(targetAgentId, []);
       setSuggestionsOpen(false);
+      // 清空 contentEditable 显示（仅清 ref 时 DOM 可能残留 /compact 文本）
+      if (composerTextareaRef.current) {
+        composerTextareaRef.current.textContent = "";
+      }
       await compactAgent(compactPrompt || undefined, targetAgentId);
       return;
     }
@@ -5503,51 +5580,6 @@ export function App() {
     }
   }
 
-  /** 重发防重复：通过 messageId 锁避免同一消息多次重发。
-   *  锁会在 agent 状态切回 idle 时自动清除（下方 useEffect），超时 30s 兜底释放。 */
-  const resendingIdsRef = useRef<Set<string>>(new Set());
-
-  async function resendUserMessage(message: ChatMessage) {
-    if (!activeAgentId || message.agentId !== activeAgentId) return;
-    if (resendingIdsRef.current.has(message.id)) return;
-    // 同文件截断重发需要 idle：只删当前用户消息及其本轮后代，保留更早历史，再重新 prompt。
-    if (isAgentBusy || isAgentStarting) {
-      showToast(t("message.busyGeneric"), 3000);
-      return;
-    }
-    resendingIdsRef.current.add(message.id);
-    // 30 秒兜底释放，防止锁泄漏
-    setTimeout(() => resendingIdsRef.current.delete(message.id), 30_000);
-
-    try {
-      // 不走 fork（会新建会话文件），在同文件内截断后重发。
-      const prepared = await api.agents.prepareResend(activeAgentId, message.id);
-      const text =
-        typeof prepared?.text === "string" && prepared.text.trim()
-          ? prepared.text
-          : message.text;
-      const images =
-        prepared?.images && prepared.images.length > 0
-          ? prepared.images
-          : message.images;
-      await submitPromptSnapshot(activeAgentId, text, images);
-    } catch (error) {
-      showToast(
-        t("app.resendFailed", {
-          error: error instanceof Error ? error.message : String(error),
-        }),
-        4000,
-      );
-    }
-  }
-
-  /** agent 切回 idle 时释放所有重发锁，允许下次正常重发。 */
-  useEffect(() => {
-    if (activeAgent?.status !== "running" && activeAgent?.status !== "starting") {
-      resendingIdsRef.current.clear();
-    }
-  }, [activeAgent?.status]);
-
   /** 将主进程抛出的错误消息中的 BUSY_ 前缀码转为前端多语言文案 */
   function translateAgentErrorMessage(msg: string): string {
     if (msg.startsWith("BUSY_STREAMING:")) return t("message.busyStreaming");
@@ -5589,6 +5621,85 @@ export function App() {
         }
       },
     });
+  }
+
+  /**
+   * 解析用户消息对应的 pi session entryId。
+   * 优先 meta.entryId；其次 id 里的 history 片段；再回退 get_fork_messages 按正文匹配。
+   */
+  async function resolveForkEntryId(
+    agentId: string,
+    message: ChatMessage,
+  ): Promise<string | undefined> {
+    if (typeof message.meta?.entryId === "string" && message.meta.entryId) {
+      return message.meta.entryId;
+    }
+    // convertAgentMessages 生成的 id：`${agentId}-history-${entryId}`
+    const historyPrefix = `${agentId}-history-`;
+    if (message.id.startsWith(historyPrefix)) {
+      const fromId = message.id.slice(historyPrefix.length).trim();
+      if (fromId && fromId !== String(message.meta?._piDeckMsgSeq ?? "")) {
+        // 纯数字序号是无 entryId 时的 index 回退，不能当 fork entryId。
+        if (!/^\d+$/.test(fromId)) return fromId;
+      }
+    }
+    try {
+      const forkMessages = await api.agents.getForkMessages(agentId);
+      const target = message.text.trim();
+      if (!target) return undefined;
+      // 相同文案多条时取最后一次，贴近用户点的“当前这句”。
+      for (let i = forkMessages.length - 1; i >= 0; i -= 1) {
+        const item = forkMessages[i];
+        if (item?.entryId && item.text?.trim() === target) return item.entryId;
+      }
+    } catch {
+      // getForkMessages 失败时交给上层 toast
+    }
+    return undefined;
+  }
+
+  /**
+   * 从用户消息 fork 新会话（pi /fork）。
+   * 忙碌中不展示入口；点击时再解析 entryId（meta 缺失时走 getForkMessages 回退）。
+   * 成功后主进程会替换 sessionPath 并重载消息，这里把原 prompt 预填回输入框供修改再发。
+   */
+  async function forkFromUserMessage(message: ChatMessage) {
+    if (!activeAgentId || isPendingAgentId(activeAgentId) || isAgentBusy) return;
+    if (forkingMessageId) return;
+    setForkingMessageId(message.id);
+    try {
+      const entryId = await resolveForkEntryId(activeAgentId, message);
+      if (!entryId) {
+        showToast(t("app.forkMissingEntryId"), 4000);
+        return;
+      }
+      const result = await api.agents.forkSession(activeAgentId, entryId);
+      if (result?.cancelled) {
+        showToast(t("app.forkCancelled"), 3500);
+        return;
+      }
+      // 优先用 RPC 返回的原文；扩展取消/空 text 时回退到气泡正文。
+      const promptText =
+        typeof result?.text === "string" && result.text.length > 0
+          ? result.text
+          : message.text;
+      setPrompt(promptText);
+      pendingComposerCaretRef.current = promptText.length;
+      requestAnimationFrame(() => {
+        composerTextareaRef.current?.focus();
+      });
+      // 新会话文件会出现在项目会话列表；刷新侧栏避免用户误以为还在原会话。
+      if (activeProjectId) {
+        void refreshProjectSessions(activeProjectId).catch(() => undefined);
+      }
+      void api.agents.list().then(setAgents).catch(() => undefined);
+      showToast(t("app.forkDone"), 3500);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      showToast(t("app.forkFailed", { error: translateAgentErrorMessage(msg) }), 5000);
+    } finally {
+      setForkingMessageId(null);
+    }
   }
 
   /**
@@ -5682,7 +5793,23 @@ export function App() {
     const liveComposerPrompt = activeAgentIdRef.current
       ? (livePromptByAgentRef.current[activeAgentIdRef.current] ?? prompt)
       : prompt;
-    const refText = paths.map((p) => `@${p}`).join(" ");
+    // 含空格路径写成 @"C:\Users\a b\file.txt"；工作区目录追加尾斜杠，避免 @src 被当成智能体。
+    const refText = paths
+      .map((p) => {
+        const cleaned = p.replace(/[/\\]+$/, "");
+        const normalized = cleaned.replace(/\\/g, "/");
+        const isDir =
+          /[/\\]$/.test(p) ||
+          flatFiles.some(
+            (node) =>
+              node.type === "directory" &&
+              (node.path === cleaned ||
+                node.path === p ||
+                node.relativePath === normalized),
+          );
+        return formatFilePathRef(p, { isDirectory: isDir });
+      })
+      .join(" ");
     const spacer =
       cursor > 0 &&
       liveComposerPrompt[cursor - 1] !== " " &&
@@ -5737,33 +5864,58 @@ export function App() {
     //    需通过 preload 同步读取 Electron clipboard（FileNameW / CF_HDROP 等）
     const clipboardPaths = window.piDesktop.files.getClipboardPaths?.() ?? [];
     if (clipboardPaths.length > 0) {
-      // 图片文件路径不在此处处理：让它们走到下方 image items 分支，
-      // 保持截图/图片粘贴显示为图片而不是 @path 引用。
+      event.preventDefault();
+      const imagePaths = clipboardPaths.filter((p) => isImageExt(p));
       const nonImagePaths = clipboardPaths.filter((p) => !isImageExt(p));
-      if (nonImagePaths.length > 0) {
-        event.preventDefault();
-        insertFilePathRefs(nonImagePaths);
+      // 非图片：插入完整 @绝对路径 引用
+      if (nonImagePaths.length > 0) insertFilePathRefs(nonImagePaths);
+      // 图片文件：按附件附加（不是 @path 引用）；从磁盘读 base64，避免只拿到缩略图。
+      if (imagePaths.length > 0) {
+        void (async () => {
+          for (const path of imagePaths) {
+            try {
+              const dataUrl = await api.files.readBase64(path);
+              if (!dataUrl) continue;
+              setAttachedImages((prev) => [...prev, dataUrlToImageContent(dataUrl, "image/png")]);
+            } catch {
+              // 单张失败不阻断其余
+            }
+          }
+        })();
       }
-      // 如果全部是非图片文件，直接返回
-      if (clipboardPaths.length === nonImagePaths.length) return;
-      // 有图片文件，不返回，继续处理下面的 image items
-    } else {
-      // 2) 兜底：剪贴板里若有 File 对象（部分场景），用 webUtils 解析路径
-      const fileItems = items.filter((i) => i.kind === "file");
-      if (fileItems.length > 0) {
-        const files = fileItems
-          .map((i) => i.getAsFile())
-          .filter((f): f is File => Boolean(f));
-        const paths = resolveLocalPathsFromFiles(files);
-        if (paths.length > 0) {
-          event.preventDefault();
-          insertFilePathRefs(paths);
-          return;
+      return;
+    }
+
+    // 2) 兜底：剪贴板里若有 File 对象（部分场景），用 webUtils 解析路径
+    const fileItems = items.filter((i) => i.kind === "file");
+    if (fileItems.length > 0) {
+      const files = fileItems
+        .map((i) => i.getAsFile())
+        .filter((f): f is File => Boolean(f));
+      const paths = resolveLocalPathsFromFiles(files);
+      if (paths.length > 0) {
+        event.preventDefault();
+        const imagePaths = paths.filter((p) => isImageExt(p));
+        const nonImagePaths = paths.filter((p) => !isImageExt(p));
+        if (nonImagePaths.length > 0) insertFilePathRefs(nonImagePaths);
+        if (imagePaths.length > 0) {
+          void (async () => {
+            for (const path of imagePaths) {
+              try {
+                const dataUrl = await api.files.readBase64(path);
+                if (!dataUrl) continue;
+                setAttachedImages((prev) => [...prev, dataUrlToImageContent(dataUrl, "image/png")]);
+              } catch {
+                /* ignore */
+              }
+            }
+          })();
         }
+        return;
       }
     }
 
-    // 3) 图片粘贴（截图等位图数据，或资源管理器复制的图片文件）：读取并附加到消息
+    // 3) 纯位图粘贴（截图等，无本地文件路径）：读取并附加到消息
     const imageItems = items.filter((i) => i.type.startsWith("image/"));
     if (imageItems.length > 0) {
       event.preventDefault();
@@ -5882,6 +6034,18 @@ export function App() {
       }
       if ("useNativeTitleBar" in patch) {
         notice = t("app.titleBarSaved");
+      }
+      // Chromium 沙箱依赖启动参数与 webPreferences，保存后必须整应用重启才生效。
+      if ("electronChromiumSandbox" in patch) {
+        notice = t("app.electronSandboxSaved");
+      }
+      // 单实例锁在进程启动时申请，修改后需重启才切换多开/复用行为。
+      if ("singleInstance" in patch) {
+        notice = t("app.singleInstanceSaved");
+      }
+      // 启动窗口预设仅在下次 createWindow 时应用。
+      if ("startupWindowMode" in patch) {
+        notice = t("app.startupWindowModeSaved");
       }
       // WSL/Windows pi 源切换：重新检测 pi 环境、刷新项目和会话列表
       if ("wslEnabled" in patch || "wslDistro" in patch || "wslUser" in patch) {
@@ -6320,19 +6484,6 @@ export function App() {
         <div className="window-controls" aria-label={t("app.windowControls")}>
           <button
             type="button"
-            className={`window-control drawer-toggle${drawer && !drawerCollapsed ? " active" : ""}`}
-            aria-label={
-              drawer && !drawerCollapsed ? t("app.collapseDrawer") : t("app.expandDrawer")
-            }
-            title={
-              drawer && !drawerCollapsed ? t("app.collapseDrawer") : t("app.expandDrawer")
-            }
-            onClick={toggleRightDrawer}
-          >
-            <PanelRight size={13} strokeWidth={2.2} aria-hidden="true" />
-          </button>
-          <button
-            type="button"
             className={`window-control pin${windowAlwaysOnTop ? " active" : ""}`}
             aria-label={
               windowAlwaysOnTop ? t("app.windowUnpin") : t("app.windowPin")
@@ -6376,6 +6527,18 @@ export function App() {
           </button>
         </div>
       )}
+      {/* 侧栏折叠后的浮动恢复入口：与工具栏/会话头部分栏按钮同尺寸 */}
+      {listCollapsed && (
+        <IconButton
+          label={t("app.expandList")}
+          variant="outline"
+          buttonSize="sm"
+          className="list-toggle-native floating"
+          onClick={toggleListCollapsed}
+        >
+          <PanelLeft size={14} strokeWidth={2} aria-hidden="true" />
+        </IconButton>
+      )}
       <aside
         className="chat-list-pane v3-braun"
       >
@@ -6385,6 +6548,9 @@ export function App() {
               <div className="app-badge">
                 <BrandLockup replayToken={brandLogoReplayToken} />
               </div>
+              <IconButton label={t("app.collapseList")} variant="outline" buttonSize="sm" className="list-toggle-native" onClick={toggleListCollapsed}>
+                <PanelLeft size={14} strokeWidth={2} aria-hidden="true" />
+              </IconButton>
             </div>
           )}
         <button
@@ -7392,6 +7558,17 @@ export function App() {
                 </div>
               </div>
               </div>
+              {/* 右侧边栏开关：与左侧 list-toggle 同组件同尺寸，和「新会话」同一 outline 语言 */}
+              <IconButton
+                label={drawer && !drawerCollapsed ? t("app.collapseDrawer") : t("app.expandDrawer")}
+                variant="outline"
+                buttonSize="sm"
+                active={Boolean(drawer && !drawerCollapsed)}
+                className="header-drawer-toggle"
+                onClick={toggleRightDrawer}
+              >
+                <PanelRight size={14} strokeWidth={2} aria-hidden="true" />
+              </IconButton>
             </>
           </div>
         </header>
@@ -7499,11 +7676,11 @@ export function App() {
                       message={message}
                       onPreviewImage={setPreviewImage}
                       onOpenFile={openFilePath}
-                      onResendUserMessage={resendUserMessage}
                       onEditMessage={editMessage}
                       onDeleteMessage={deleteMessage}
+                      onForkMessage={forkFromUserMessage}
                       agentRunning={isAgentBusy}
-                      showResendButton={resendableMessageIds.has(message.id)}
+                      forking={forkingMessageId === message.id}
                       validCommandNames={validCommandNames}
                       validFilePaths={validFilePaths}
                       onEnterMultiSelect={() => setMultiSelectOpen(true)}
@@ -7518,13 +7695,22 @@ export function App() {
                 if (message.role === "system") {
                   const meta = message.meta as any;
                   if (meta?.type === "askQuestion") {
+                    // 正在用 composer 内联栏回答同一 request 时，隐藏时间线 pending 卡，避免双份 UI。
+                    // 已回答/取消的卡由 AskQuestionCard 内部 return null，最终结果看 ToolCard。
+                    const req = meta.uiRequest as { requestId?: string } | undefined;
+                    const isActivePending =
+                      meta.status === "pending" &&
+                      Boolean(req?.requestId) &&
+                      Boolean(activeUiAsk?.requestId) &&
+                      req?.requestId === activeUiAsk?.requestId;
+                    if (isActivePending) return null;
                     return (
                       <AskQuestionCard key={message.id} message={message} onRespond={(response) => {
-                        const req = meta.uiRequest;
-                        if (!req || !activeAgentId) return;
-                        // cancelled 通过 sendUiResponse 正常发送：pi 的 rpc-mode 对
-                        // select/input/editor 返回 undefined（卡片显示"已取消"），
-                        // confirm 返回 false（同"否"，pi 的 ctx.ui.confirm() 不区分取消和否）
+                        if (!req?.requestId || !activeAgentId) return;
+                        // cancelled 通过 sendUiResponse 正常发送。
+                        // select/input/editor：cancelled 或 value:null → undefined/null。
+                        // 原生 confirm：pi 会把 cancelled 解析成 false（与「否」同值）；
+                        // ask_question 扩展已把 confirm 改走 select，避免点叉误答成否。
                         if (response.cancelled) {
                           setCancellingUi(true);
                           api.agents.sendUiResponse(activeAgentId, req.requestId, response);
@@ -7851,6 +8037,8 @@ export function App() {
               activeAgentId={activeAgentId}
               onCancel={() => {
                 if (activeUiAsk.requestId && activeAgentId) {
+                  // 与单问一致：关闭问卷时给明确 toast，避免静默取消。
+                  showToast(t("ask.cancelBatchHint"));
                   setActiveUiRequest((current) => {
                     if (!current) return null;
                     const next = { ...current };
@@ -7876,79 +8064,180 @@ export function App() {
             />
           )}
           {/* 传统单问（select/confirm/input/editor） */}
-          {showAskDialog && activeUiAsk && activeUiAsk.method !== "batch_ask" && (
-            <div className="ask-inline-bar">
+          {showAskDialog && activeUiAsk && activeUiAsk.method !== "batch_ask" && (() => {
+            // Plan 结束后的「下一步」选单：关闭=退出计划模式，绝不是「默认第一项」。
+            // 扩展用标题前缀 [PI_DECK_PLAN_NEXT] 标记；选项用「标题|说明」编码，桌面端拆主副文案。
+            const PLAN_NEXT_MARKER = "[PI_DECK_PLAN_NEXT]";
+            const PLAN_REVISE_MARKER = "[PI_DECK_PLAN_REVISE]";
+            const rawTitle = activeUiAsk.title || "";
+            const isPlanNextSelect =
+              activeUiAsk.method === "select" && rawTitle.includes(PLAN_NEXT_MARKER);
+            // 「修改计划」二次编辑：取消应回到三选一，而不是退出计划模式。
+            const isPlanReviseEditor =
+              activeUiAsk.method === "editor" && rawTitle.includes(PLAN_REVISE_MARKER);
+            const displayTitle = isPlanNextSelect
+              ? rawTitle.replace(PLAN_NEXT_MARKER, "").trim()
+              : isPlanReviseEditor
+                ? rawTitle.replace(PLAN_REVISE_MARKER, "").trim()
+                : (rawTitle || t("ask.pending"));
+            const isSelectWithOptions =
+              activeUiAsk.method === "select" &&
+              Array.isArray(activeUiAsk.options) &&
+              activeUiAsk.options.length > 0;
+            // 扩展 confirm 实际走 select([是,否])：识别后只渲染是否按钮，不给自定义输入。
+            const isYesNoConfirm =
+              activeUiAsk.method === "confirm" ||
+              (activeUiAsk.method === "select" &&
+                !isPlanNextSelect &&
+                isYesNoConfirmOptions(activeUiAsk.options));
+            // 按提问类型给取消 toast/提示：select 已有；confirm/input/editor 之前点叉会静默取消。
+            const cancelHintKey = isPlanNextSelect
+              ? "ask.planNextCancelHint"
+              : isPlanReviseEditor
+                ? "ask.planReviseBackHint"
+                : isYesNoConfirm
+                  ? "ask.cancelConfirmHint"
+                  : activeUiAsk.method === "input"
+                    ? "ask.cancelInputHint"
+                    : activeUiAsk.method === "editor"
+                      ? "ask.cancelEditorHint"
+                      : "ask.cancelHint";
+
+            const dismissAsk = () => {
+              if (!activeUiAsk.requestId || !activeAgentId) return;
+              setActiveUiRequest((current) => {
+                if (!current) return null;
+                const next = { ...current };
+                delete next[activeUiAsk.requestId];
+                if (Object.keys(next).length === 0) return null;
+                return next;
+              });
+            };
+            const respondValue = (value: string) => {
+              if (!activeUiAsk.requestId || !activeAgentId) return;
+              dismissAsk();
+              api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { value });
+            };
+            const respondCancel = () => {
+              if (!activeUiAsk.requestId || !activeAgentId) return;
+              dismissAsk();
+              // 普通 select / 是否题 取消：必须发 value:null（select 协议），
+              // 不能发 cancelled:true —— 否则 pi 可能回 undefined，旧 ask 扩展会误选第一项。
+              // 扩展层 confirm 也是 select([是,否])，取消语义与 select 相同。
+              // Plan 下一步/修改计划仍用 cancelled（扩展自己解释返回）。
+              if ((activeUiAsk.method === "select" || isYesNoConfirm) && !isPlanNextSelect) {
+                api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, {
+                  value: null,
+                });
+                return;
+              }
+              api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { cancelled: true });
+            };
+
+            /** Plan 选项：优先匹配已知前缀 → i18n；否则按「标题|说明」拆分 */
+            const planOptionMeta = (raw: string): { title: string; desc?: string; tone?: "primary" | "secondary" | "muted" } => {
+              if (raw.startsWith("开始执行")) {
+                return { title: t("ask.planNextExecute"), desc: t("ask.planNextExecuteDesc"), tone: "primary" };
+              }
+              if (raw.startsWith("先不执行") || raw.startsWith("继续规划")) {
+                return { title: t("ask.planNextContinue"), desc: t("ask.planNextContinueDesc"), tone: "secondary" };
+              }
+              if (raw.startsWith("修改计划")) {
+                return { title: t("ask.planNextRevise"), desc: t("ask.planNextReviseDesc"), tone: "muted" };
+              }
+              const sep = raw.indexOf("|");
+              if (sep > 0) {
+                return { title: raw.slice(0, sep).trim(), desc: raw.slice(sep + 1).trim() || undefined };
+              }
+              const dash = raw.indexOf(" — ");
+              if (dash > 0) {
+                return { title: raw.slice(0, dash).trim(), desc: raw.slice(dash + 3).trim() || undefined };
+              }
+              return { title: raw };
+            };
+
+            return (
+            <div className={`ask-inline-bar${isPlanNextSelect ? " ask-inline-bar--plan-next" : ""}`}>
               <div className="ask-inline-bar-header">
                 <MessageCircle size={14} />
-                <span>{t("ask.toolName")}</span>
-                {/* select 类型取消提示 */}
-                {activeUiAsk.method === "select" && Array.isArray(activeUiAsk.options) && activeUiAsk.options.length > 0 && (
-                  <span className="ask-inline-bar-cancel-hint">{t("ask.cancelHint")}</span>
-                )}
+                <span>{(isPlanNextSelect || isPlanReviseEditor) ? t("app.composerModePlan") : t("ask.toolName")}</span>
+                {/* 所有单问类型都展示取消语义，避免只有 select 有提示。 */}
+                <span className="ask-inline-bar-cancel-hint">{t(cancelHintKey)}</span>
                 <button
                   className="ask-inline-bar-close"
-                  title={t("common.close")}
+                  title={isPlanReviseEditor ? t("ask.planReviseBack") : t("common.close")}
                   onClick={() => {
-                    const isSelect = activeUiAsk.method === "select" && Array.isArray(activeUiAsk.options) && activeUiAsk.options.length > 0;
-                    if (isSelect) {
-                      showToast(t("ask.cancelHint"));
-                    }
-                    if (activeUiAsk.requestId && activeAgentId) {
-                      /* 立即从本地 state 移除，同时通知 Pi */
-                      setActiveUiRequest((current) => {
-                        if (!current) return null;
-                        const next = { ...current };
-                        delete next[activeUiAsk.requestId];
-                        if (Object.keys(next).length === 0) return null;
-                        return next;
-                      });
-                      api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { cancelled: true });
-                    }
+                    // 点叉一律 toast：select/confirm/input/editor/plan 专用文案已由 cancelHintKey 区分。
+                    showToast(t(cancelHintKey));
+                    respondCancel();
                   }}
                 >
                   <X size={14} />
                 </button>
               </div>
-              <div className="ask-inline-bar-question">{activeUiAsk.title || t("ask.pending")}</div>
+              <div className="ask-inline-bar-question">{displayTitle}</div>
+              {isPlanNextSelect && (
+                <div className="ask-inline-bar-guide">{t("ask.planNextGuide")}</div>
+              )}
               <div className="ask-inline-bar-body">
-                {activeUiAsk.method === "confirm" ? (
+                {isYesNoConfirm ? (
                   <div className="ask-inline-bar-options ask-inline-bar-options-confirm">
+                    {/*
+                     * 仅 UI 收敛为是否两钮；协议仍是 select：
+                     * 选是/否 → value:"是"/"否"；点叉 → value:null。
+                     * 绝不能发 confirmed 字段，取消也不能走 cancelled:true。
+                     */}
                     <button
                       className="ask-inline-bar-option ask-inline-bar-option-yes"
-                      onClick={() => {
-                        if (activeUiAsk.requestId && activeAgentId) {
-                          setActiveUiRequest((current) => {
-                            if (!current) return null;
-                            const next = { ...current };
-                            delete next[activeUiAsk.requestId];
-                            if (Object.keys(next).length === 0) return null;
-                            return next;
-                          });
-                          api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { confirmed: true });
-                        }
-                      }}
+                      onClick={() => respondValue("是")}
                     >
                       {t("common.true")}
                     </button>
                     <button
                       className="ask-inline-bar-option ask-inline-bar-option-no"
-                      onClick={() => {
-                        if (activeUiAsk.requestId && activeAgentId) {
-                          setActiveUiRequest((current) => {
-                            if (!current) return null;
-                            const next = { ...current };
-                            delete next[activeUiAsk.requestId];
-                            if (Object.keys(next).length === 0) return null;
-                            return next;
-                          });
-                          api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { confirmed: false });
-                        }
-                      }}
+                      onClick={() => respondValue("否")}
                     >
                       {t("common.false")}
                     </button>
                   </div>
                 ) : activeUiAsk.options && activeUiAsk.options.length > 0 ? (
+                  isPlanNextSelect ? (
+                    <div className="ask-plan-next-options" role="listbox" aria-label={displayTitle}>
+                      {activeUiAsk.options.filter((opt) => {
+                        const label = typeof opt === "string" ? opt : String((opt as any).label ?? opt);
+                        return !label.startsWith("✎");
+                      }).map((opt, i) => {
+                        const val = typeof opt === "string" ? opt : String((opt as any).value ?? (opt as any).label ?? opt);
+                        const meta = planOptionMeta(val);
+                        return (
+                          <button
+                            key={i}
+                            type="button"
+                            role="option"
+                            className={`ask-plan-next-option${meta.tone ? ` tone-${meta.tone}` : ""}`}
+                            title={meta.desc ? `${meta.title}：${meta.desc}` : meta.title}
+                            onClick={() => respondValue(val)}
+                          >
+                            {/* 横排三钮：标题单行 + 说明最多两行；完整文案放 title 防截断看不清 */}
+                            <span className="ask-plan-next-option-title">{meta.title}</span>
+                            {meta.desc ? (
+                              <span className="ask-plan-next-option-desc">{meta.desc}</span>
+                            ) : null}
+                          </button>
+                        );
+                      })}
+                      <button
+                        type="button"
+                        className="ask-plan-next-dismiss"
+                        onClick={() => {
+                          showToast(t("ask.planNextCancelHint"));
+                          respondCancel();
+                        }}
+                      >
+                        {t("ask.planNextClose")}
+                      </button>
+                    </div>
+                  ) : (
                   <div className="ask-inline-bar-options">
                     {activeUiAsk.options.filter((opt) => {
                       const label = typeof opt === "string" ? opt : String((opt as any).label ?? opt);
@@ -7960,23 +8249,13 @@ export function App() {
                         <button
                           key={i}
                           className="ask-inline-bar-option"
-                          onClick={() => {
-                            if (activeUiAsk.requestId && activeAgentId) {
-                              setActiveUiRequest((current) => {
-                                if (!current) return null;
-                                const next = { ...current };
-                                delete next[activeUiAsk.requestId];
-                                if (Object.keys(next).length === 0) return null;
-                                return next;
-                              });
-                              api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { value: val });
-                            }
-                          }}
+                          onClick={() => respondValue(val)}
                         >
                           <span className="ask-inline-bar-option-marker">{label}</span>
                         </button>
                       );
                     })}
+                    {/* 仅普通 select 提供自定义输入；confirm/是否题不展示 */}
                     <div className="ask-inline-bar-custom-input">
                       <input
                         id="ask-inline-bar-custom-field"
@@ -7989,15 +8268,13 @@ export function App() {
                             const el = document.getElementById("ask-inline-bar-custom-field") as HTMLInputElement | null;
                             const val = el?.value?.trim() ?? "";
                             if (val && activeUiAsk.requestId && activeAgentId) {
-                              setActiveUiRequest((current) => {
-                                if (!current) return null;
-                                const next = { ...current };
-                                delete next[activeUiAsk.requestId];
-                                if (Object.keys(next).length === 0) return null;
-                                return next;
-                              });
+                              // 先缓存真实自定义文本，再回 OTHER_LABEL 触发扩展第二步 input。
+                              // 顺序不能反：onUiRequest(input) 可能很快到达，必须先写 pending。
                               pendingCustomInputRef.current = val;
-                              api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { value: "✎ 自行输入..." });
+                              dismissAsk();
+                              api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, {
+                                value: "✎ 自行输入...",
+                              });
                             }
                           }
                         }}
@@ -8009,15 +8286,11 @@ export function App() {
                           const el = document.getElementById("ask-inline-bar-custom-field") as HTMLInputElement | null;
                           const val = el?.value?.trim() ?? "";
                           if (val && activeUiAsk.requestId && activeAgentId) {
-                            setActiveUiRequest((current) => {
-                              if (!current) return null;
-                              const next = { ...current };
-                              delete next[activeUiAsk.requestId];
-                              if (Object.keys(next).length === 0) return null;
-                              return next;
-                            });
                             pendingCustomInputRef.current = val;
-                            api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { value: "✎ 自行输入..." });
+                            dismissAsk();
+                            api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, {
+                              value: "✎ 自行输入...",
+                            });
                           }
                         }}
                       >
@@ -8025,50 +8298,74 @@ export function App() {
                       </button>
                     </div>
                   </div>
+                  )
                 ) : activeUiAsk.method === "input" || activeUiAsk.method === "editor" ? (
-                  <div className="ask-inline-bar-input-area">
-                    <input
-                      id="ask-inline-bar-input"
-                      className="ask-inline-bar-input"
-                      placeholder={activeUiAsk.placeholder || ""}
-                      autoFocus
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && activeUiAsk.requestId && activeAgentId) {
-                          const value = (e.target as HTMLInputElement).value;
-                          setActiveUiRequest((current) => {
-                            if (!current) return null;
-                            const next = { ...current };
-                            delete next[activeUiAsk.requestId];
-                            if (Object.keys(next).length === 0) return null;
-                            return next;
-                          });
-                          api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { value });
-                        }
-                      }}
-                    />
-                    <button
-                      className="ask-inline-bar-submit-btn"
-                      onClick={() => {
-                        const value = (document.getElementById("ask-inline-bar-input") as HTMLInputElement)?.value ?? "";
-                        if (activeUiAsk.requestId && activeAgentId) {
-                          setActiveUiRequest((current) => {
-                            if (!current) return null;
-                            const next = { ...current };
-                            delete next[activeUiAsk.requestId];
-                            if (Object.keys(next).length === 0) return null;
-                            return next;
-                          });
-                          api.agents.sendUiResponse(activeAgentId, activeUiAsk.requestId, { value });
-                        }
-                      }}
-                    >
-                      {t("common.submit")}
-                    </button>
+                  <div className={`ask-inline-bar-input-area${isPlanReviseEditor ? " ask-inline-bar-input-area--plan-revise" : ""}`}>
+                    {isPlanReviseEditor ? (
+                      <textarea
+                        id="ask-inline-bar-input"
+                        className="ask-inline-bar-input ask-inline-bar-textarea"
+                        placeholder={activeUiAsk.placeholder || t("ask.planRevisePlaceholder")}
+                        rows={3}
+                        autoFocus
+                        defaultValue={activeUiAsk.prefill || ""}
+                      />
+                    ) : (
+                      <input
+                        id="ask-inline-bar-input"
+                        className="ask-inline-bar-input"
+                        placeholder={activeUiAsk.placeholder || ""}
+                        autoFocus
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && activeUiAsk.requestId && activeAgentId) {
+                            const value = (e.target as HTMLInputElement).value;
+                            respondValue(value);
+                          }
+                        }}
+                      />
+                    )}
+                    <div className="ask-inline-bar-input-actions">
+                      {isPlanReviseEditor && (
+                        <button
+                          type="button"
+                          className="ask-inline-bar-back-btn"
+                          title={t("ask.planReviseBackHint")}
+                          onClick={() => {
+                            showToast(t("ask.planReviseBackHint"));
+                            // cancelled → pi editor 返回 undefined → 扩展 while 循环回到三选一
+                            respondCancel();
+                          }}
+                        >
+                          {t("ask.planReviseBack")}
+                        </button>
+                      )}
+                      <button
+                        className="ask-inline-bar-submit-btn"
+                        onClick={() => {
+                          const el = document.getElementById("ask-inline-bar-input") as
+                            | HTMLInputElement
+                            | HTMLTextAreaElement
+                            | null;
+                          const value = el?.value ?? "";
+                          if (isPlanReviseEditor && !value.trim()) {
+                            // 空提交等价于返回，避免误发空修改意见
+                            showToast(t("ask.planReviseBackHint"));
+                            respondCancel();
+                            return;
+                          }
+                          respondValue(value);
+                        }}
+                      >
+                        {isPlanReviseEditor ? t("ask.planReviseSubmit") : t("common.submit")}
+                      </button>
+                    </div>
                   </div>
                 ) : null}
               </div>
             </div>
-          )}
+            );
+          })()}
+
           <div
             ref={composerBoxRef}
             className={`composer-box ${
@@ -8165,7 +8462,7 @@ export function App() {
                 setSuggestionsOpen(false);
               }}
               onChipClick={(chip: RichInputChip) => {
-                if (chip.kind === "file") { const path = chip.raw.slice(1); openFilePath(path); }
+                if (chip.kind === "file") { openFilePath(unwrapFileChipPath(chip.raw)); }
                 if (chip.kind === "session") {
                   const s = activeProjectSessions.find((x) => (x.name ?? x.filePath) === chip.label);
                   if (s) { setSessionRefPickerTarget(s); setSessionRefPickerOpen(true); }
@@ -8294,6 +8591,62 @@ export function App() {
                     })()}
                   </button>
                 )}
+                {/* 上下文压缩：与 /compact 同一路径。
+                    仅在占用达到阈值后显示，避免会话过小仍点压缩触发 Nothing to compact。
+                    阈值与旧 ComposerToolbar 一致（>30%）；压缩进行中始终保留入口。 */}
+                {(() => {
+                  const contextPercent =
+                    activeRuntimeState?.contextPercent != null
+                      ? Number(activeRuntimeState.contextPercent)
+                      : null;
+                  const isCompactingNow =
+                    compacting || Boolean(activeRuntimeState?.isCompacting);
+                  // 30% 以下几乎总会被 pi 拒绝；70%/90% 用色阶提示紧迫度，而不是常驻抢眼按钮。
+                  // 压缩进行中即使百分比短暂缺失也保留入口，避免状态闪断。
+                  const showCompactButton =
+                    Boolean(activeAgentId) &&
+                    !isPendingAgentId(activeAgentId) &&
+                    (isCompactingNow ||
+                      (contextPercent != null && contextPercent > 30));
+                  if (!showCompactButton) return null;
+                  const urgency =
+                    contextPercent != null && contextPercent >= 90
+                      ? " critical"
+                      : contextPercent != null && contextPercent >= 70
+                        ? " warn"
+                        : "";
+                  return (
+                    <button
+                      type="button"
+                      className={`composer-bar-btn compact${urgency}${isCompactingNow ? " compacting" : ""}`}
+                      disabled={
+                        isAgentStarting ||
+                        isCompactingNow ||
+                        Boolean(activeRuntimeState?.isStreaming)
+                      }
+                      onClick={() => void compactAgent()}
+                      title={
+                        contextPercent != null
+                          ? t("app.contextCompactTitle", {
+                              percent: contextPercent.toFixed(1),
+                            })
+                          : t("app.compact")
+                      }
+                      aria-label={t("app.compact")}
+                    >
+                      <FoldVertical size={13} strokeWidth={1.8} aria-hidden="true" />
+                      <span>
+                        {isCompactingNow
+                          ? t("app.compacting")
+                          : contextPercent != null
+                            ? t("app.compactUsage", {
+                                percent: contextPercent.toFixed(0),
+                              })
+                            : t("app.compact")}
+                      </span>
+                    </button>
+                  );
+                })()}
               </div>
               <div className="composer-bottom-right">
                 {/* 当前项目分支只读展示：放右侧发送区前，纯文本样式无边框阴影。 */}
@@ -8858,9 +9211,13 @@ export function App() {
             setFileMenu(null);
           }}
           onAttach={() => {
+            // 目录引用必须带尾斜杠，保证渲染为路径 chip 且模型不误判为智能体 mention。
+            const ref = formatFilePathRef(fileMenu.node.relativePath, {
+              isDirectory: fileMenu.node.type === "directory",
+            });
             setPrompt(
               (current) =>
-                `${current}${current.endsWith(" ") || current.length === 0 ? "" : " "}@${fileMenu.node.relativePath} `,
+                `${current}${current.endsWith(" ") || current.length === 0 ? "" : " "}${ref} `,
             );
             setFileMenu(null);
           }}

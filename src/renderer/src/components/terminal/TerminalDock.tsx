@@ -10,66 +10,25 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { showNotice } from "../../utils/notice";
 import { writeClipboard } from "../../utils/clipboard";
-import { ChevronDown, ChevronUp, MoreHorizontal, Plus, X } from "lucide-react";
+import { ChevronDown, ChevronUp, Plus, X } from "lucide-react";
 import type { PiDesktopApi } from "../../../../preload";
 import type { TerminalTab } from "../../../../shared/types";
 import { t } from "../../i18n";
 
-const TERMINAL_THEMES = {
-	"pi-soft": {
-		label: "Pi Soft",
-		xterm: {
-			background: "#ffffff",
-			foreground: "#243244",
-			cursor: "#16a34a",
-			selectionBackground: "#d9f0e0",
-		},
-		xtermDark: {
-			background: "#15191d",
-			foreground: "#d9e2dc",
-			cursor: "#35c45a",
-			selectionBackground: "#1f3f2b",
-		},
+const PI_SOFT_THEME = {
+	xterm: {
+		background: "#ffffff",
+		foreground: "#243244",
+		cursor: "#16a34a",
+		selectionBackground: "#d9f0e0",
 	},
-	"solarized-light": {
-		label: "Solarized Light",
-		xterm: {
-			background: "#fdf6e3",
-			foreground: "#657b83",
-			cursor: "#268bd2",
-			selectionBackground: "#eee8d5",
-		},
-	},
-	"solarized-dark": {
-		label: "Solarized Dark",
-		xterm: {
-			background: "#002b36",
-			foreground: "#839496",
-			cursor: "#2aa198",
-			selectionBackground: "#073642",
-		},
-	},
-	"one-dark": {
-		label: "One Dark",
-		xterm: {
-			background: "#282c34",
-			foreground: "#abb2bf",
-			cursor: "#98c379",
-			selectionBackground: "#3e4451",
-		},
-	},
-	monokai: {
-		label: "Monokai",
-		xterm: {
-			background: "#272822",
-			foreground: "#f8f8f2",
-			cursor: "#a6e22e",
-			selectionBackground: "#49483e",
-		},
+	xtermDark: {
+		background: "#0d0d0d",
+		foreground: "#ececf1",
+		cursor: "#ececf1",
+		selectionBackground: "#2a2a2a",
 	},
 } as const;
-
-type TerminalThemeId = keyof typeof TERMINAL_THEMES;
 
 const TERMINAL_OPEN_ANIMATION_MS = 300;
 
@@ -104,8 +63,6 @@ export function TerminalDock(props: {
 	/* copyNotice 已改用 toast (sonner) 实现 */
 	const [tabs, setTabs] = useState<TerminalTab[]>([]);
 	const [activeTabId, setActiveTabId] = useState("");
-	const [themeId, setThemeId] = useState<TerminalThemeId>("pi-soft");
-	const [themeMenuOpen, setThemeMenuOpen] = useState(false);
 	const [confirmCloseAllOpen, setConfirmCloseAllOpen] = useState(false);
 	/* copyNotice 已改用 toast (sonner) 实现 */
 	const [loading, setLoading] = useState(false);
@@ -120,11 +77,8 @@ export function TerminalDock(props: {
 	>([]);
 	const [shellMenuOpen, setShellMenuOpen] = useState(false);
 	const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? tabs[0];
-	const theme = TERMINAL_THEMES[themeId];
 	const xtermTheme =
-		themeId === "pi-soft" && appTheme === "dark" && "xtermDark" in theme
-			? theme.xtermDark
-			: theme.xterm;
+		appTheme === "dark" ? PI_SOFT_THEME.xtermDark : PI_SOFT_THEME.xterm;
 	const { open, collapsed } = props;
 
 	useEffect(() => {
@@ -419,7 +373,7 @@ export function TerminalDock(props: {
 	return (
 		<section
 			className={`terminal-dock${collapsed ? " collapsed" : ""}`}
-			data-theme={themeId}
+			data-theme="pi-soft"
 			data-open={open}
 			data-motion-state={props.closing || !motionOpen ? "hidden" : "visible"}
 			style={{ height: collapsed ? 34 : props.height }}
@@ -515,40 +469,6 @@ export function TerminalDock(props: {
 					</div>
 				</div>
 				<div className="terminal-actions">
-					<div
-						className="terminal-more-menu"
-						onBlur={() => window.setTimeout(() => setThemeMenuOpen(false), 80)}
-					>
-						<button
-							className="terminal-icon-btn"
-							onMouseDown={(event) => {
-								event.preventDefault();
-								setThemeMenuOpen((open) => !open);
-							}}
-							title={t("terminal.more")}
-						>
-							<MoreHorizontal size={14} />
-						</button>
-						{themeMenuOpen && (
-							<div className="terminal-theme-menu">
-								<strong>{t("terminal.theme")}</strong>
-								<span>{t("terminal.themeCurrent")}: {theme.label}</span>
-								{Object.entries(TERMINAL_THEMES).map(([id, item]) => (
-									<button
-										key={id}
-										className={id === themeId ? "active" : ""}
-										onMouseDown={(event) => {
-											event.preventDefault();
-											setThemeId(id as TerminalThemeId);
-											setThemeMenuOpen(false);
-										}}
-									>
-										{item.label}
-									</button>
-								))}
-							</div>
-						)}
-					</div>
 					<button
 						className="terminal-icon-btn"
 						onClick={() => {
