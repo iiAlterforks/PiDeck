@@ -6527,18 +6527,6 @@ export function App() {
           </button>
         </div>
       )}
-      {/* 侧栏折叠后的浮动恢复入口：与工具栏/会话头部分栏按钮同尺寸 */}
-      {listCollapsed && (
-        <IconButton
-          label={t("app.expandList")}
-          variant="outline"
-          buttonSize="sm"
-          className="list-toggle-native floating"
-          onClick={toggleListCollapsed}
-        >
-          <PanelLeft size={14} strokeWidth={2} aria-hidden="true" />
-        </IconButton>
-      )}
       <aside
         className="chat-list-pane v3-braun"
       >

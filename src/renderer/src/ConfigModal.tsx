@@ -366,7 +366,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 
 						fetchPromises.push(
 							api.config
-								.fetchModels(baseUrl, apiKey, apiType)
+								.fetchModels(baseUrl, apiKey, apiType, getProviderHeaders(modelsProvider?.headers))
 								.then((result) => {
 									if (result.success && result.models) {
 										discovered[providerName] = result.models;
@@ -658,6 +658,7 @@ function ConfigModalContent(props: ConfigModalProps) {
 				provider.baseUrl,
 				provider.apiKey,
 				provider.api as string | undefined,
+				getProviderHeaders(provider.headers),
 			);
 			if (result.success && result.models) {
 				setFetchedModels((prev) => ({
@@ -1766,4 +1767,3 @@ function ConfigModalContent(props: ConfigModalProps) {
 		</div>
 	);
 }
-

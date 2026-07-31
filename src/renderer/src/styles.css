@@ -3206,12 +3206,6 @@ body.is-terminal-resizing {
   flex: 0 0 auto;
 }
 /* 折叠后的浮动恢复入口：避开左侧 14px 折叠条 */
-.list-toggle-native.floating {
-  position: fixed;
-  top: 12px;
-  left: 22px;
-  z-index: 920;
-}
 .header-drawer-toggle {
   flex: 0 0 auto;
 }
