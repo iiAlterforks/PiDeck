@@ -1692,13 +1692,6 @@ export function EmptyState(props: { hasProject: boolean; onCreate: () => void })
 			<div className="empty-logo">
 				<img src={appIconUrl} alt="" aria-hidden="true" />
 			</div>
-			<div className="empty-tagline" aria-label={`${t("app.emptyTaglineLine1")} ${t("app.emptyTaglineLine2Prefix")}${t("app.emptyTaglineYours")}`}>
-				<span>{t("app.emptyTaglineLine1")}</span>
-				<span>
-					{t("app.emptyTaglineLine2Prefix")}
-					<em className="empty-tagline-yours">{t("app.emptyTaglineYours")}</em>
-				</span>
-			</div>
 			<p className="empty-subtitle">
 				{t("app.emptySubtitle").split("\n").map((line, i) => (
 					<Fragment key={i}>

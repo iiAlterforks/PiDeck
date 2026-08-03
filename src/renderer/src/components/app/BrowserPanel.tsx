@@ -138,6 +138,8 @@ export function BrowserPanel(props: {
 	const [device, setDevice] = useState<DeviceType>(() => moduleState.device);
 	const [deviceMenuOpen, setDeviceMenuOpen] = useState(false);
 	const deviceMenuRef = useRef<HTMLDivElement | null>(null);
+	const webviewReadyRef = useRef(false);
+	const deferredLoadRef = useRef<{ url: string; device: DeviceType } | null>(null);
 
 	const persistTabs = useCallback((nextTabs: TabEntry[], nextActiveId: string | null) => {
 		moduleState.tabs = nextTabs;
@@ -170,11 +172,18 @@ export function BrowserPanel(props: {
 	const loadUrl = useCallback(
 		(targetUrl: string, nextDevice = moduleState.device) => {
 			const wv = webviewRef.current;
-			if (!wv) return;
-			applyDeviceUserAgent(wv, nextDevice);
 			setUrl(targetUrl);
 			setInputValue(targetUrl);
-			wv.loadURL(targetUrl);
+			// Electron 会在 webview 附着前拒绝 GuestView 调用。保留最后一次导航，
+			// 等 dom-ready 后再执行，避免地址栏输入触发未处理的 remote-method 异常。
+			if (!wv || !webviewReadyRef.current) {
+				deferredLoadRef.current = { url: targetUrl, device: nextDevice };
+				return;
+			}
+			applyDeviceUserAgent(wv, nextDevice);
+			void wv.loadURL(targetUrl).catch(() => {
+				// 网络/GuestView 错误由 webview 自身的加载状态处理，不能冒泡为应用错误提示。
+			});
 		},
 		[applyDeviceUserAgent],
 	);
@@ -194,6 +203,11 @@ export function BrowserPanel(props: {
 
 		const onDomReady = () => {
 			webviewReadyRef.current = true;
+			const deferred = deferredLoadRef.current;
+			if (deferred) {
+				deferredLoadRef.current = null;
+				loadUrl(deferred.url, deferred.device);
+			}
 		};
 		wv.addEventListener("dom-ready", onDomReady);
 
@@ -263,7 +277,7 @@ export function BrowserPanel(props: {
 			wv.removeEventListener("new-window", onNewWindow);
 			webviewReadyRef.current = false;
 		};
-	}, [applyDeviceUserAgent, updateActiveTab, url]);
+	}, [applyDeviceUserAgent, loadUrl, updateActiveTab]);
 
 	// 不再在卸载时清空 moduleState：折叠抽屉、切换面板后重新打开仍保留之前的 tab 状态。
 	// 关闭最后一个 tab 时 closeTab 已处理 moduleState 清理并调用 onClose。
@@ -299,9 +313,6 @@ export function BrowserPanel(props: {
 		loadUrl(DEFAULT_HOME);
 	}, [loadUrl, persistTabs]);
 
-	// webview 是否已触发 dom-ready，用于延迟外部导航直到 webview 就绪。
-	const webviewReadyRef = useRef(false);
-
 	// 轮询检测 navigateTo 设置的 pendingNavigateUrl（module 变量不触发 React 重渲染）
 	useEffect(() => {
 		const interval = window.setInterval(() => {
@@ -317,14 +328,13 @@ export function BrowserPanel(props: {
 			pendingNavigateUrl = null;
 			const activeTab = moduleState.tabs.find((t) => t.id === moduleState.activeTabId);
 			if (activeTab) {
-				applyDeviceUserAgent(wv, moduleState.device);
 				setTabs([...moduleState.tabs]);
 				setActiveTabId(moduleState.activeTabId);
-				wv.loadURL(url).catch(() => {});
+				loadUrl(url);
 			}
 		}, 50);
 		return () => window.clearInterval(interval);
-	}, [applyDeviceUserAgent]);
+	}, [loadUrl]);
 
 	const closeTab = useCallback(
 		(tabId: string, event: React.MouseEvent) => {
